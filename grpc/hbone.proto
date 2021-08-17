@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package _hbone;
+
+option go_package="github.com/costinm/hbone/grpc";
+
+
+message Frame {
+  bytes data = 1;
+  uint32 status = 2;
+}
+
+// Experimental Stream service, to use with gRPC proxyless infrastructure and to handle
+// TCP plain-text 'server close' issues with some stacks.
+// It will be an alternate TCP transport - still H2 and mTLS based, but with additional framing.
+service Stream {
+  rpc StreamAggregatedResources(stream Frame) returns (stream Frame) {}
+}
+
