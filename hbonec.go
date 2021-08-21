@@ -34,6 +34,7 @@ type Endpoint struct {
 
 	// URL used to reach the H2 endpoint providing the proxy.
 	URL string
+
 	// use mTLS over H2 with this config. If nil, use TCP over H2.
 	MTLSConfig *tls.Config
 
@@ -122,6 +123,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	if hc.SNIGate != "" {
 		return hc.sniProxy(ctx, stdin, stdout)
 	}
+
 	// It is usually possible to pass stdin directly to NewRequest.
 	// Using a pipe allows getting stats.
 	i, o := io.Pipe()
@@ -133,6 +135,14 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	}
 
 	var rt = hc.rt
+
+	if hc.hb.TokenCallback != nil {
+		t, err := hc.hb.TokenCallback("https://" + r.URL.Host)
+		if err != nil {
+			return err
+		}
+		r.Header.Set("Authorization", t)
+	}
 
 	if hc.rt == nil {
 		/* Alternative, using http.Client.

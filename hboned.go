@@ -46,6 +46,7 @@ type HBone struct {
 	HTTPClientMesh   *http.Client
 	TcpAddr          string
 
+	TokenCallback    func(host string) (string, error)
 	Mux              http.ServeMux
 
 	// Timeout used for TLS handshakes. If not set, 3 seconds is used.
@@ -253,6 +254,7 @@ func (hb *HBone) HandleTCPProxy(w io.Writer, r io.Reader, hostPort string) error
 
 	return nil
 }
+
 
 
 

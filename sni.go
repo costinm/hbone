@@ -53,6 +53,14 @@ func (hb *HBone) HandleSNIConn(conn net.Conn) {
 		return
 	}
 
+	ok, err := hb.handleH2R(conn, s, sni)
+	if err != nil {
+		log.Println("SNI-H2R 500", sni, err)
+	}
+	if ok {
+		// Handled as h2r
+		return
+	}
 
 	// Based on SNI, make a hbone request, using JWT auth.
 	if hb.EndpointResolver != nil {
@@ -61,8 +69,6 @@ func (hb *HBone) HandleSNIConn(conn net.Conn) {
 			dst.Proxy(context.Background(), s, conn)
 		}
 	}
-
-
 }
 
 

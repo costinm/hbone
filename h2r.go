@@ -53,15 +53,28 @@ func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 		return
 	}
 
+	ok, err := hb.handleH2R(conn, s, sni)
+	if err != nil {
+		log.Println("SNI-H2R 500", sni, err)
+		return
+	}
+	if !ok {
+		log.Println("SNI-H2R 404", sni)
+		return
+	}
+}
 
+func (hb *HBone) handleH2R(conn net.Conn, s *BufferReader, sni string) (bool, error) {
 	rt := hb.H2R[sni]
-	if rt != nil {
+	if rt == nil {
+		return false, nil
+	}
 		// WIP: send over the established connection
 		i, o := io.Pipe()
 
 		r, err := http.NewRequest("POST", "http:///_hbone/mtls", i)
 		if err != nil {
-			return
+			return false, err
 		}
 		res, err := rt.RoundTrip(r)
 
@@ -82,15 +95,20 @@ func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 
 		<- ch
 
+		if s1.Err != nil {
+			return false, s1.Err
+		}
+		if s2.Err != nil {
+			return false, s2.Err
+		}
+
 		// TODO: wait for first copy to finish
 		if Debug {
 			log.Println("H2RSNI done ", s1.Err, s2.Err)
 		}
-		return
-	}
 
-	log.Println("SNI-H2R 404", sni)
-	return
+		return true, nil
+
 }
 
 // GetClientConn is called by http2.Transport, if Transport.RoundTrip is called (
