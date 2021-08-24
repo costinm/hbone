@@ -43,13 +43,13 @@ func (hc *Endpoint) sniProxy(ctx context.Context, stdin io.Reader, stdout io.Wri
 }
 
 func (hb *HBone) HandleSNIConn(conn net.Conn) {
-
 	s := NewBufferReader(conn)
 	// will also close the conn ( which is the reader )
 	defer s.Close()
 
 	sni, err := ParseTLS(s)
 	if err != nil {
+		log.Println("SNI invalid TLS", sni, err)
 		return
 	}
 
@@ -66,7 +66,10 @@ func (hb *HBone) HandleSNIConn(conn net.Conn) {
 	if hb.EndpointResolver != nil {
 		dst := hb.EndpointResolver(sni)
 		if dst != nil {
-			dst.Proxy(context.Background(), s, conn)
+			err = dst.Proxy(context.Background(), s, conn)
+			if err != nil {
+				log.Println("SNI: error connecting to proxy", sni, err)
+			}
 		}
 	}
 }

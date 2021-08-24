@@ -3,6 +3,7 @@ package hbone
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -137,11 +138,11 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	var rt = hc.rt
 
 	if hc.hb.TokenCallback != nil {
-		t, err := hc.hb.TokenCallback("https://" + r.URL.Host)
+		t, err := hc.hb.TokenCallback(ctx, "https://" + r.URL.Host)
 		if err != nil {
 			return err
 		}
-		r.Header.Set("Authorization", t)
+		r.Header.Set("Authorization", "Bearer " + t)
 	}
 
 	if hc.rt == nil {
@@ -163,10 +164,16 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 		// Expect system certificates.
 		if port == "443" || port == "" {
 			d := tls.Dialer{
-				Config:    nil,
+				Config:    &tls.Config{
+					NextProtos: []string{"h2"},
+				},
 				NetDialer: &net.Dialer{},
 			}
-			nConn, err := d.DialContext(ctx, "tcp", r.URL.Host)
+			h := r.URL.Host
+			if port == "" {
+				h = net.JoinHostPort(h, "443")
+			}
+			nConn, err := d.DialContext(ctx, "tcp", h)
 			if err != nil {
 				return err
 			}
@@ -176,6 +183,10 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 
 			if err != nil {
 				return err
+			}
+			if tlsCon.ConnectionState().NegotiatedProtocol != "h2" {
+				log.Println("Failed to negotiate h2", tlsCon.ConnectionState().NegotiatedProtocol)
+				return errors.New("invalid ALPN protocol")
 			}
 			hc.tlsCon = tlsCon
 		} else {
@@ -200,6 +211,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	}
 
 	//rt = hb.HTTPClientSystem.Transport
+
 	res, err := rt.RoundTrip(r)
 	if err != nil {
 		return err

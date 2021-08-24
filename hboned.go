@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -46,13 +47,17 @@ type HBone struct {
 	HTTPClientMesh   *http.Client
 	TcpAddr          string
 
-	TokenCallback    func(host string) (string, error)
-	Mux              http.ServeMux
+	TokenCallback func(ctx context.Context, host string) (string, error)
+	Mux           http.ServeMux
 
 	// Timeout used for TLS handshakes. If not set, 3 seconds is used.
 	HandsahakeTimeout time.Duration
 
 	EndpointResolver func(sni string) *Endpoint
+
+	m           sync.RWMutex
+	H2RConn     map[*http2.ClientConn]string
+	H2RCallback func(string, *http2.ClientConn)
 }
 
 // New creates a new HBone node. It requires a workload identity, including mTLS certificates.
@@ -61,6 +66,7 @@ func New(auth *Auth) *HBone {
 		Auth: auth,
 		Endpoints: map[string]*Endpoint{},
 		H2R:       map[string]http.RoundTripper{},
+		H2RConn: map[*http2.ClientConn]string{},
 		TcpAddr:   "127.0.0.1:8080",
 		h2t: &http2.Transport{
 			ReadIdleTimeout: 10000 * time.Second,
@@ -143,7 +149,7 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}()
 
 	// TODO: parse Envoy / hbone headers.
-	log.Println("Hboned ", r.RequestURI)
+	log.Println("HBD: ", r.RequestURI)
 	w.(http.Flusher).Flush()
 
 	// TCP proxy for SSH ( no mTLS, SSH has its own equivalent)
@@ -171,9 +177,10 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		// TODO: replace with handshake with context
 		err := HandshakeTimeout(tls, hac.hb.HandsahakeTimeout, nil)
 		if err != nil {
+			log.Println("HBD-MTLS: error inner mTLS ", err)
 			return
 		}
-		log.Println("hbone-mtls-tun", tls.ConnectionState())
+		log.Println("HBD-MTLS:", tls.ConnectionState())
 
 		// TODO: All Istio checks go here. The TLS handshake doesn't check
 		// root cert or anything - this is proof of concept only, to eval

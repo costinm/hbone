@@ -65,7 +65,9 @@ func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 }
 
 func (hb *HBone) handleH2R(conn net.Conn, s *BufferReader, sni string) (bool, error) {
+	hb.m.RLock()
 	rt := hb.H2R[sni]
+	hb.m.RUnlock()
 	if rt == nil {
 		return false, nil
 	}
@@ -119,7 +121,16 @@ func (hb *HBone) GetClientConn(req *http.Request, addr string) (*http2.ClientCon
 }
 
 func (hb *HBone) MarkDead(conn *http2.ClientConn) {
-	log.Println("H2C Client con terminated")
+	hb.m.Lock()
+	sni := hb.H2RConn[conn]
+	if sni != "" {
+		delete(hb.H2R, sni)
+	}
+	hb.m.Unlock()
+	if hb.H2RCallback != nil {
+		hb.H2RCallback(sni, nil)
+	}
+	log.Println("H2RSNI: close ", sni)
 }
 
 
@@ -162,8 +173,14 @@ func (hb *HBone) HandlerH2RConn(conn net.Conn) {
 	}
 	h2rc.hc = rt
 
+	hb.m.Lock()
 	hb.H2R[sni] = rt
+	hb.H2RConn[rt] = sni
+	hb.m.Unlock()
 
+	if hb.H2RCallback != nil {
+		hb.H2RCallback(sni, rt)
+	}
 	// TODO: track the active connections in hb, for close purpose.
 
 	// Conn remains open

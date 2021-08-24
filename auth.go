@@ -100,6 +100,24 @@ func (hb *Auth) InitKeys() error {
 				hb.TrustedCertPool.AddCert(c)
 			}
 		}
+		// If the certificate has a chain, use the last cert - similar with Istio
+		if len(hb.Cert.Certificate) > 1 {
+			last := hb.Cert.Certificate[len(hb.Cert.Certificate) - 1]
+			block, rest := pem.Decode(last)
+			var blockBytes []byte
+			for block != nil {
+				blockBytes = append(blockBytes, block.Bytes...)
+				block, rest = pem.Decode(rest)
+			}
+
+			rootCAs, err := x509.ParseCertificates(blockBytes)
+			if err == nil {
+				for _, c := range rootCAs {
+					log.Println("Adding root CA: ", c.Subject)
+					hb.TrustedCertPool.AddCert(c)
+				}
+			}
+		}
 	}
 
 	cert, err := x509.ParseCertificate(hb.Cert.Certificate[0])
@@ -140,10 +158,12 @@ func (hb *Auth) initTLS() {
 
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
+				log.Println("MTLS: missing client cert")
 				return errors.New("client certificate required")
 			}
 			var peerCert *x509.Certificate
 			intCertPool := x509.NewCertPool()
+
 			for id, rawCert := range rawCerts {
 				cert, err := x509.ParseCertificate(rawCert)
 				if err != nil {
@@ -156,12 +176,16 @@ func (hb *Auth) initTLS() {
 				}
 			}
 			if peerCert == nil || len(peerCert.URIs) == 0 {
+				log.Println("MTLS: missing URIs in Istio cert", peerCert)
 				return errors.New("peer certificate does not contain URI type SAN")
 			}
 			trustDomain := peerCert.URIs[0].Host
 			if trustDomain != hb.TrustDomain {
+				log.Println("MTLS: invalid trust domain", trustDomain, peerCert.URIs)
 				return errors.New("invalid trust domain " + trustDomain + " " + hb.TrustDomain)
 			}
+
+			// TODO: also validate namespace is same with this workload or in list of namespaces ?
 
 			_, err := peerCert.Verify(x509.VerifyOptions{
 				Roots:         hb.TrustedCertPool,
