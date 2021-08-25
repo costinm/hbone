@@ -119,7 +119,7 @@ func ParseTLS(acc *BufferReader) (string,error) {
 	}
 
 	rlen := int(buf[3])<<8 | int(buf[4])
-	if rlen > 4096 {
+	if rlen > 16 * 1024 {
 		log.Println("RLen ", rlen)
 		return "", sniErr
 	}

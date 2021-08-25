@@ -81,41 +81,41 @@ func (hb *Auth) InitKeys() error {
 
 	if hb.TrustedCertPool == nil {
 		hb.TrustedCertPool = x509.NewCertPool()
-		// TODO: multiple roots
-		rootCert, _ := ioutil.ReadFile(filepath.Join(hb.CertDir, "root-cert.pem"))
-		if rootCert != nil {
-			block, rest := pem.Decode(rootCert)
-			var blockBytes []byte
-			for block != nil {
-				blockBytes = append(blockBytes, block.Bytes...)
-				block, rest = pem.Decode(rest)
-			}
-
-			rootCAs, err := x509.ParseCertificates(blockBytes)
-			if err != nil {
-				return err
-			}
-			for _, c := range rootCAs {
-				log.Println("Adding root CA: ", c.Subject)
-				hb.TrustedCertPool.AddCert(c)
-			}
+	}
+	// TODO: multiple roots
+	rootCert, _ := ioutil.ReadFile(filepath.Join(hb.CertDir, "root-cert.pem"))
+	if rootCert != nil {
+		err2 := hb.AddRoots(rootCert)
+		if err2 != nil {
+			return err2
 		}
-		// If the certificate has a chain, use the last cert - similar with Istio
-		if len(hb.Cert.Certificate) > 1 {
-			last := hb.Cert.Certificate[len(hb.Cert.Certificate) - 1]
-			block, rest := pem.Decode(last)
-			var blockBytes []byte
-			for block != nil {
-				blockBytes = append(blockBytes, block.Bytes...)
-				block, rest = pem.Decode(rest)
-			}
+	}
 
-			rootCAs, err := x509.ParseCertificates(blockBytes)
-			if err == nil {
-				for _, c := range rootCAs {
-					log.Println("Adding root CA: ", c.Subject)
-					hb.TrustedCertPool.AddCert(c)
-				}
+	istioCert, _ := ioutil.ReadFile("./var/run/secrets/istio/root-cert.pem")
+	if istioCert != nil {
+		err2 := hb.AddRoots(istioCert)
+		if err2 != nil {
+			return err2
+		}
+	}
+
+	// Similar with /etc/ssl/certs/ca-certificates.crt - the concatenated list of PEM certs.
+	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(hb.CertDir, "ca-certificates.crt"))
+	if rootCertExtra != nil {
+		err2 := hb.AddRoots(rootCertExtra)
+		if err2 != nil {
+			return err2
+		}
+	}
+	// If the certificate has a chain, use the last cert - similar with Istio
+	if len(hb.Cert.Certificate) > 1 {
+		last := hb.Cert.Certificate[len(hb.Cert.Certificate)-1]
+
+		rootCAs, err := x509.ParseCertificates(last)
+		if err == nil {
+			for _, c := range rootCAs {
+				log.Println("Adding root CA from cert chain: ", c.Subject)
+				hb.TrustedCertPool.AddCert(c)
 			}
 		}
 	}
@@ -144,6 +144,25 @@ func (hb *Auth) InitKeys() error {
 		log.Println("Cert: ", cert.Subject.Organization, cert.NotAfter)
 	}
 	hb.initTLS()
+	return nil
+}
+
+func (hb *Auth) AddRoots(rootCertPEM []byte) error {
+	block, rest := pem.Decode(rootCertPEM)
+	var blockBytes []byte
+	for block != nil {
+		blockBytes = append(blockBytes, block.Bytes...)
+		block, rest = pem.Decode(rest)
+	}
+
+	rootCAs, err := x509.ParseCertificates(blockBytes)
+	if err != nil {
+		return err
+	}
+	for _, c := range rootCAs {
+		log.Println("Adding root CA: ", c.Subject)
+		hb.TrustedCertPool.AddCert(c)
+	}
 	return nil
 }
 
