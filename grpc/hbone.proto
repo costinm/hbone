@@ -4,6 +4,11 @@ package _hbone;
 
 option go_package="github.com/costinm/hbone/grpc";
 
+// WIP: using gRPC stack for TCP-over-HTTP/2.
+// This avoids the server-CLOSE problem and allows using the GRPC XDS integration
+// and all the other features. It might have a small performance cost due to
+// the extra framing and copy - needs to be evaluated.
+
 
 message Frame {
   bytes data = 1;
