@@ -16,6 +16,7 @@ import (
 
 // TODO: benchmark different sizes.
 var bufSize = 32 * 1024
+var Debug = false
 
 var (
 	// createBuffer to get a buffer. io.Copy uses 32k.
@@ -159,7 +160,6 @@ func (s Stream) CopyBuffered(ch chan int, close bool) {
 	}
 }
 
-var Debug = true
 
 func closeWriter(dst io.Writer) error {
 	if cw, ok := dst.(CloseWriter); ok {

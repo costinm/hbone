@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"strings"
 
 	"golang.org/x/net/http2"
@@ -144,6 +145,9 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 		}
 		r.Header.Set("Authorization", "Bearer " + t)
 	}
+
+	rd, _ := httputil.DumpRequest(r, false)
+	log.Println( "HB req: ", string(rd))
 
 	if hc.rt == nil {
 		/* Alternative, using http.Client.
