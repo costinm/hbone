@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -20,72 +21,172 @@ import (
 	"time"
 )
 
-type Auth struct {
-	CertDir   string
-	Cert      *tls.Certificate
-	TLSConfig *tls.Config
+const (
+	blockTypeECPrivateKey    = "EC PRIVATE KEY"
+	blockTypeRSAPrivateKey   = "RSA PRIVATE KEY" // PKCS#1 private key
+	blockTypePKCS8PrivateKey = "PRIVATE KEY"     // PKCS#8 plain private key
+)
 
-	// Namespace and SA are extracted from the certificate.
+type Auth struct {
+	// Will attempt to load certificates from this directory, defaults to
+	// "./var/run/secrets/istio.io/"
+	CertDir   string
+
+	// Current certificate, after calling GetCertificate("")
+	Cert          *tls.Certificate
+
+	// MeshTLSConfig is a tls.Config that requires mTLS with a spiffee identity,
+	// using the configured roots, trustdomains.
+	//
+	// By default only same namespace or istio-system are allowed - can be changed by
+	// setting AllowedNamespaces. A "*" will allow all.
+	MeshTLSConfig *tls.Config
+
+	// TrustDomain is extracted from the cert or set by user, used to verify
+	// peer certificates.
+	TrustDomain string
+
+	// Namespace and SA are extracted from the certificate or set by user.
+	// Namespace is used to verify peer certificates
 	Namespace   string
 	SA          string
-	TrustDomain string
+
+	AllowedNamespaces []string
 
 	// Trusted roots
 	// TODO: copy Istiod multiple trust domains code. This will be a map[trustDomain]roots and a
 	// list of TrustDomains. XDS will return the info via ProxyConfig.
 	// This can also be done by krun - loading a config map with same info.
 	TrustedCertPool *x509.CertPool
+
+	GetCertificateHook func(host string) (*tls.Certificate, error)
 }
 
+// NewAuthFromDir will load the credentials and create an Auth object.
+//
+// This uses pilot-agent or some other platform tool creating ./var/run/secrets/istio.io/{key,cert-chain}.pem
+//
+//
 // TODO: ./etc/certs support: krun should copy the files, for consistency (simper code for frameworks).
 // TODO: periodic reload
-func LoadAuth(dir string) (*Auth, error) {
-	a := &Auth{
-		CertDir: dir,
-	}
-	err := a.InitKeys()
+func NewAuthFromDir(dir string) (*Auth, error){
+	a := NewAuth()
+	a.CertDir = dir
+	err := a.waitAndInitFromDir()
 	if err != nil {
 		return nil, err
 	}
 	return a, nil
 }
 
-func (hb *Auth) InitKeys() error {
-	if hb.CertDir == "" {
-		hb.CertDir = "./var/run/secrets/istio.io/"
+func NewAuth() (*Auth){
+	a := &Auth{
+		TrustedCertPool: x509.NewCertPool(),
 	}
-	if hb.Cert == nil {
-		keyFile := filepath.Join(hb.CertDir, "key.pem")
-		err := WaitFile(keyFile, 5*time.Second)
-		if err != nil {
-			return err
-		}
+	return a
+}
 
-		keyBytes, err := ioutil.ReadFile(keyFile)
-		if err != nil {
-			return err
-		}
-		certBytes, err := ioutil.ReadFile(filepath.Join(hb.CertDir, "cert-chain.pem"))
-		if err != nil {
-			return err
-		}
-		tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
-		if err != nil {
-			return err
-		}
-		hb.Cert = &tlsCert
-		if tlsCert.Certificate == nil || len(tlsCert.Certificate) == 0 {
-			return errors.New("missing certificate")
-		}
+func (a *Auth) SetKeysPEM(privatePEM []byte, chainPEM []string) error {
+	chainPEMCat := strings.Join(chainPEM, "\n")
+	tlsCert, err := tls.X509KeyPair([]byte(chainPEMCat), privatePEM)
+	if err != nil {
+		return err
+	}
+	a.Cert = &tlsCert
+	if tlsCert.Certificate == nil || len(tlsCert.Certificate) == 0 {
+		return errors.New("missing certificate")
 	}
 
-	if hb.TrustedCertPool == nil {
-		hb.TrustedCertPool = x509.NewCertPool()
+	a.initTLS()
+	return nil
+}
+func (a *Auth) leaf() *x509.Certificate {
+	if a.Cert == nil {
+		return nil
 	}
-	// TODO: multiple roots
-	rootCert, _ := ioutil.ReadFile(filepath.Join(hb.CertDir, "root-cert.pem"))
+	if a.Cert.Leaf == nil {
+		a.Cert.Leaf, _ = x509.ParseCertificate(a.Cert.Certificate[0])
+	}
+	return a.Cert.Leaf
+}
+
+func (a *Auth) GetCertificate(host string) (*tls.Certificate, error) {
+	// TODO: if host != "", allow returning DNS certs for the host.
+	// Default (and currently only impl) is to return the spiffe cert
+	// May refresh.
+
+	// Have cert, not expired
+	if a.Cert != nil {
+		if !a.leaf().NotAfter.Before(time.Now()) {
+			return a.Cert, nil
+		}
+	}
+
+	if a.CertDir != "" {
+		c, err := a.loadCertFromDir(a.CertDir)
+		if err == nil {
+			if !c.Leaf.NotAfter.Before(time.Now()) {
+				a.Cert = c
+			}
+		} else {
+			log.Println("Cert from dir failed", err)
+		}
+	}
+
+	if a.GetCertificateHook != nil {
+		c, err := a.GetCertificateHook(host)
+		if err != nil {
+			return nil, err
+		}
+		a.Cert = c
+	}
+
+	return a.Cert, nil
+}
+
+func (a *Auth) loadCertFromDir(dir string) (*tls.Certificate, error) {
+	// Load cert from file
+	keyFile := filepath.Join(dir, "key.pem")
+	keyBytes, err := ioutil.ReadFile(keyFile)
+	if err != nil {
+		return nil, err
+	}
+	certBytes, err := ioutil.ReadFile(filepath.Join(dir, "cert-chain.pem"))
+	if err != nil {
+		return nil, err
+	}
+
+	tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
+	if err != nil {
+		return nil, err
+	}
+	if tlsCert.Certificate == nil || len(tlsCert.Certificate) == 0 {
+		return nil, errors.New("missing certificate")
+	}
+	tlsCert.Leaf, _ = x509.ParseCertificate(tlsCert.Certificate[0])
+
+	return &tlsCert, nil
+}
+
+func (a *Auth) waitAndInitFromDir() error {
+	if a.CertDir == "" {
+		a.CertDir = "./var/run/secrets/istio.io/"
+	}
+	keyFile := filepath.Join(a.CertDir, "key.pem")
+	err := WaitFile(keyFile, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if a.Cert == nil {
+		_, err := a.GetCertificate("")
+		if err != nil {
+			return err
+		}
+	}
+
+	rootCert, _ := ioutil.ReadFile(filepath.Join(a.CertDir, "root-cert.pem"))
 	if rootCert != nil {
-		err2 := hb.AddRoots(rootCert)
+		err2 := a.AddRoots(rootCert)
 		if err2 != nil {
 			return err2
 		}
@@ -93,61 +194,126 @@ func (hb *Auth) InitKeys() error {
 
 	istioCert, _ := ioutil.ReadFile("./var/run/secrets/istio/root-cert.pem")
 	if istioCert != nil {
-		err2 := hb.AddRoots(istioCert)
+		err2 := a.AddRoots(istioCert)
 		if err2 != nil {
 			return err2
 		}
 	}
 
 	// Similar with /etc/ssl/certs/ca-certificates.crt - the concatenated list of PEM certs.
-	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(hb.CertDir, "ca-certificates.crt"))
+	rootCertExtra, _ := ioutil.ReadFile(filepath.Join(a.CertDir, "ca-certificates.crt"))
 	if rootCertExtra != nil {
-		err2 := hb.AddRoots(rootCertExtra)
+		err2 := a.AddRoots(rootCertExtra)
 		if err2 != nil {
 			return err2
 		}
 	}
 	// If the certificate has a chain, use the last cert - similar with Istio
-	if len(hb.Cert.Certificate) > 1 {
-		last := hb.Cert.Certificate[len(hb.Cert.Certificate)-1]
+	if len(a.Cert.Certificate) > 1 {
+		last := a.Cert.Certificate[len(a.Cert.Certificate)-1]
 
 		rootCAs, err := x509.ParseCertificates(last)
 		if err == nil {
 			for _, c := range rootCAs {
 				log.Println("Adding root CA from cert chain: ", c.Subject)
-				hb.TrustedCertPool.AddCert(c)
+				a.TrustedCertPool.AddCert(c)
 			}
 		}
 	}
 
-	cert, err := x509.ParseCertificate(hb.Cert.Certificate[0])
+	a.initTLS()
+	return nil
+}
+
+func (a *Auth) Spiffee() (*url.URL, string, string, string) {
+	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
 	if err != nil {
-		return err
+		return nil, "","",""
 	}
 	if len(cert.URIs) > 0 {
 		c0 := cert.URIs[0]
 		pathComponetns := strings.Split(c0.Path, "/")
 		if c0.Scheme == "spiffe" && pathComponetns[1] == "ns" && pathComponetns[3] == "sa" {
-			hb.Namespace = pathComponetns[2]
-			hb.SA = pathComponetns[4]
-			hb.TrustDomain = cert.URIs[0].Host
-		} else {
-			//log.Println("Cert: ", cert)
-			// TODO: extract domain, ns, name
-			log.Println("Unexpected ID ", c0, cert.Issuer, cert.NotAfter)
+			return c0, c0.Host, pathComponetns[2], pathComponetns[4]
 		}
-		//log.Println("Cert: ", cert)
-		// TODO: extract domain, ns, name
-		log.Println("ID ", c0, cert.Issuer, cert.NotAfter)
-	} else {
-		// org and name are set
-		log.Println("Cert: ", cert.Subject.Organization, cert.NotAfter)
 	}
-	hb.initTLS()
-	return nil
+	return nil,"","",""
 }
 
-func (hb *Auth) AddRoots(rootCertPEM []byte) error {
+func (a *Auth) ID() string {
+	su, _, _, _ := a.Spiffee()
+	return su.String()
+}
+
+func (a *Auth) setSpiffe()  {
+	_, a.TrustDomain, a.Namespace, a.SA = a.Spiffee()
+}
+
+func (a *Auth) String() string {
+	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
+	if err != nil {
+		return ""
+	}
+	id := ""
+	if len(cert.URIs) > 0 {
+		id = cert.URIs[0].String()
+	}
+	return fmt.Sprintf("ID=%s,iss=%s,exp=%v,org=%s", id, cert.Issuer,
+		cert.NotAfter, cert.Subject.Organization)
+}
+
+func (a *Auth) NewCSR(kty string, trustDomain, san string) (privPEM []byte, csrPEM []byte, err error) {
+	var priv crypto.PrivateKey
+
+	if kty == "ec256" {
+		// TODO
+	}
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	priv = rsaKey
+
+	csr := GenCSRTemplate(trustDomain, san)
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
+
+	encodeMsg := "CERTIFICATE REQUEST"
+
+	csrPEM = pem.EncodeToMemory(&pem.Block{Type: encodeMsg, Bytes: csrBytes})
+
+	var encodedKey []byte
+	//if pkcs8 {
+	//	if encodedKey, err = x509.MarshalPKCS8PrivateKey(priv); err != nil {
+	//		return nil, nil, err
+	//	}
+	//	privPem = pem.EncodeToMemory(&pem.Block{Type: blockTypePKCS8PrivateKey, Bytes: encodedKey})
+	//} else {
+		switch k := priv.(type) {
+		case *rsa.PrivateKey:
+			encodedKey = x509.MarshalPKCS1PrivateKey(k)
+			privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
+		case *ecdsa.PrivateKey:
+			encodedKey, err = x509.MarshalECPrivateKey(k)
+			if err != nil {
+				return nil, nil, err
+			}
+			privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
+		}
+	//}
+
+	return
+}
+
+func GenCSRTemplate(trustDomain, san string) (*x509.CertificateRequest) {
+	template := &x509.CertificateRequest{
+		Subject: pkix.Name{
+			Organization: []string{trustDomain},
+		},
+	}
+
+	// TODO: add the SAN, it is not required, server will fill up
+
+	return template
+}
+
+func (a *Auth) AddRoots(rootCertPEM []byte) error {
 	block, rest := pem.Decode(rootCertPEM)
 	var blockBytes []byte
 	for block != nil {
@@ -161,19 +327,26 @@ func (hb *Auth) AddRoots(rootCertPEM []byte) error {
 	}
 	for _, c := range rootCAs {
 		log.Println("Adding root CA: ", c.Subject)
-		hb.TrustedCertPool.AddCert(c)
+		a.TrustedCertPool.AddCert(c)
 	}
 	return nil
 }
 
-func (hb *Auth) initTLS() {
-	hb.TLSConfig = &tls.Config{
+func (a *Auth) initTLS() {
+	a.setSpiffe()
+	a.MeshTLSConfig = &tls.Config{
 		//MinVersion: tls.VersionTLS13,
 		//PreferServerCipherSuites: ugate.preferServerCipherSuites(),
 		InsecureSkipVerify: true,                  // This is not insecure here. We will verify the cert chain ourselves.
 		ClientAuth:         tls.RequestClientCert, // not require - we'll fallback to JWT
 
-		Certificates: []tls.Certificate{*hb.Cert}, // a.TlsCerts,
+		GetCertificate: func(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return a.GetCertificate(ch.ServerName)
+		},
+
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return a.GetCertificate("")
+		},
 
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
@@ -198,26 +371,54 @@ func (hb *Auth) initTLS() {
 				log.Println("MTLS: missing URIs in Istio cert", peerCert)
 				return errors.New("peer certificate does not contain URI type SAN")
 			}
-			trustDomain := peerCert.URIs[0].Host
-			if trustDomain != hb.TrustDomain {
+			c0 := peerCert.URIs[0]
+			trustDomain := c0.Host
+			if trustDomain != a.TrustDomain {
 				log.Println("MTLS: invalid trust domain", trustDomain, peerCert.URIs)
-				return errors.New("invalid trust domain " + trustDomain + " " + hb.TrustDomain)
+				return errors.New("invalid trust domain " + trustDomain + " " + a.TrustDomain)
+			}
+
+			_, err := peerCert.Verify(x509.VerifyOptions{
+				Roots:         a.TrustedCertPool,
+				Intermediates: intCertPool,
+			})
+			if err != nil {
+				return err
+			}
+
+			parts := strings.Split(c0.Path, "/")
+			if len(parts) < 4 {
+				log.Println("MTLS: invalid path", peerCert.URIs)
+				return errors.New("invalid path " + c0.String())
+			}
+
+			ns := parts[2]
+			if ns == "istio-system" || ns == a.Namespace {
+				return nil
 			}
 
 			// TODO: also validate namespace is same with this workload or in list of namespaces ?
+			if len(a.AllowedNamespaces) == 0 {
+				log.Println("MTLS: namespace not allowed", peerCert.URIs)
+				return errors.New("Namespace not allowed")
+			}
 
-			_, err := peerCert.Verify(x509.VerifyOptions{
-				Roots:         hb.TrustedCertPool,
-				Intermediates: intCertPool,
-			})
-			return err
+			if a.AllowedNamespaces[0] == "*" {
+				return nil
+			}
+
+			for _, ans := range a.AllowedNamespaces {
+				if ns == ans {
+					return nil
+				}
+			}
+
+			log.Println("MTLS: namespace not allowed", peerCert.URIs)
+			return errors.New("Namespace not allowed")
 		},
 		NextProtos: []string{"istio", "h2"},
-		GetCertificate: func(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return hb.Cert, nil
-		},
-	}
 
+	}
 }
 
 // WaitFile will check for the file to show up - the agent is running in a separate process.
@@ -305,6 +506,7 @@ func CertTemplate(org string, sans ...string) *x509.Certificate {
 	return &template
 }
 
+// CA is used as an internal CA, mainly for testing.
 type CA struct {
 	ca          *rsa.PrivateKey
 	CACert      *x509.Certificate

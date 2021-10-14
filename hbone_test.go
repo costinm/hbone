@@ -53,7 +53,7 @@ func TestHBone(t *testing.T) {
 		rin, lout := io.Pipe()
 		lin, rout := io.Pipe()
 		go func() {
-			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.TLSConfig)
+			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.MeshTLSConfig)
 
 			//err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/tcp", rin, rout, nil)
 			if err != nil {
@@ -147,7 +147,7 @@ func TestHBone(t *testing.T) {
 		rin, lout := io.Pipe()
 		lin, rout := io.Pipe()
 		go func() {
-			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.TLSConfig)
+			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.MeshTLSConfig)
 			if err != nil {
 				t.Fatal(err)
 			}

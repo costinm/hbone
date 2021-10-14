@@ -104,7 +104,7 @@ type HBoneAcceptedConn struct {
 //
 
 func (hb *HBone) HandleAcceptedH2(conn net.Conn) {
-	conf := hb.Auth.TLSConfig
+	conf := hb.Auth.MeshTLSConfig
 	defer conn.Close()
 	tls := tls.Server(conn, conf)
 
@@ -166,7 +166,7 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	if r.RequestURI == "/_hbone/mtls" {
 		// Create a stream, used for proxy with caching.
-		conf := hac.hb.Auth.TLSConfig
+		conf := hac.hb.Auth.MeshTLSConfig
 
 		tls := tls.Server(&HTTPConn{r: r.Body, w: w, acceptedConn: hac.conn}, conf)
 

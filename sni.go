@@ -27,7 +27,7 @@ func (hc *Endpoint) sniProxy(ctx context.Context, stdin io.Reader, stdout io.Wri
 	}
 
 	// Using the low-level interface, to keep control over TLS.
-	conf := hc.hb.Auth.TLSConfig.Clone()
+	conf := hc.hb.Auth.MeshTLSConfig.Clone()
 
 	conf.ServerName = hc.SNI
 

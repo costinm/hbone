@@ -37,8 +37,11 @@ type Endpoint struct {
 	// URL used to reach the H2 endpoint providing the proxy.
 	URL string
 
-	// use mTLS over H2 with this config. If nil, use TCP over H2.
+	// MTLSConfig is a custom config to use for the inner connection - will enable mTLS over H2
+	// If nil, it's regular TCP over H2.
 	MTLSConfig *tls.Config
+
+	ExternalMTLSConfig *tls.Config
 
 	// SNI name to use - defaults to service name
 	SNI string
@@ -48,6 +51,11 @@ type Endpoint struct {
 	// If empty, the endpoint will use the URL and HBone protocol directly.
 	// If set, the endpoint will use the nomal in-cluster Istio protocol.
 	SNIGate string
+
+	// H2Gate is the endpoint of a HTTP/2 gateway. Will be used to dial.
+	// It is expected to have a spiffee identity, and request client certs -
+	// similar with an egress gateway.
+	H2Gate string
 
 	// TODO: multiple per endpoint
 	tlsCon *tls.Conn
@@ -99,7 +107,7 @@ func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error)
 	}
 
 	// Using the low-level interface, to keep control over TLS.
-	conf := hc.hb.Auth.TLSConfig.Clone()
+	conf := hc.hb.Auth.MeshTLSConfig.Clone()
 
 	if hc.SNI != "" {
 		conf.ServerName = hc.SNI
@@ -163,7 +171,11 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 				},
 			}
 		*/
-		host, port, _ := net.SplitHostPort(r.URL.Host)
+		h := r.URL.Host
+		if hc.H2Gate != "" {
+			h = hc.H2Gate
+		}
+		host, port, _ := net.SplitHostPort(h)
 
 		// Expect system certificates.
 		if port == "443" || port == "" {
@@ -176,6 +188,9 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 			h := r.URL.Host
 			if port == "" {
 				h = net.JoinHostPort(h, "443")
+			}
+			if hc.H2Gate != "" {
+				h = hc.H2Gate
 			}
 			nConn, err := d.DialContext(ctx, "tcp", h)
 			if err != nil {
@@ -194,7 +209,8 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 			}
 			hc.tlsCon = tlsCon
 		} else {
-			tlsCon, err := hc.dialTLS(ctx, r.URL.Host)
+
+			tlsCon, err := hc.dialTLS(ctx, h)
 			if err != nil {
 				return err
 			}
@@ -215,9 +231,11 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	}
 
 	//rt = hb.HTTPClientSystem.Transport
+	// TODO: cancel if it gets stuck
 
 	res, err := rt.RoundTrip(r)
 	if err != nil {
+		log.Println("Failed to connect", err)
 		return err
 	}
 

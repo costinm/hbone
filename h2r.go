@@ -129,11 +129,11 @@ func (hb *HBone) MarkDead(conn *http2.ClientConn) {
 	if hb.H2RCallback != nil {
 		hb.H2RCallback(sni, nil)
 	}
-	log.Println("H2RSNI: close ", sni)
+	log.Println("H2RSNI: MarkDead ", sni, conn)
 }
 
 func (hb *HBone) HandlerH2RConn(conn net.Conn) {
-	conf := hb.Auth.TLSConfig
+	conf := hb.Auth.MeshTLSConfig
 
 	tls := tls.Server(conn, conf)
 
