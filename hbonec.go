@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -134,6 +135,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 		return hc.sniProxy(ctx, stdin, stdout)
 	}
 
+	t0 := time.Now()
 	// It is usually possible to pass stdin directly to NewRequest.
 	// Using a pipe allows getting stats.
 	i, o := io.Pipe()
@@ -147,15 +149,18 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	var rt = hc.rt
 
 	if hc.hb.TokenCallback != nil {
-		t, err := hc.hb.TokenCallback(ctx, "https://"+r.URL.Host)
-		if err != nil {
-			return err
+		h := r.URL.Host
+		if strings.Contains(h, ":") && h[0] != '[' {
+			hn, _, _ := net.SplitHostPort(h)
+			h = hn
 		}
-		r.Header.Set("Authorization", "Bearer "+t)
+		t, err := hc.hb.TokenCallback(ctx, "https://"+h)
+		if err != nil {
+			log.Println("Failed to get token, attempt unauthenticated", err)
+		} else {
+			r.Header.Set("Authorization", "Bearer "+t)
+		}
 	}
-
-	rd, _ := httputil.DumpRequest(r, false)
-	log.Println("HB req: ", string(rd))
 
 	if hc.rt == nil {
 		/* Alternative, using http.Client.
@@ -174,6 +179,10 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 		h := r.URL.Host
 		if hc.H2Gate != "" {
 			h = hc.H2Gate
+		}
+		if Debug {
+			rd, _ := httputil.DumpRequest(r, false)
+			log.Println("HB req: ", h, string(rd))
 		}
 		host, port, _ := net.SplitHostPort(h)
 
@@ -230,16 +239,15 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 		hc.rt = rt
 	}
 
-	//rt = hb.HTTPClientSystem.Transport
-	// TODO: cancel if it gets stuck
+	// This might be useful to make sure auth works - but it doesn't seem to help with the deadlock/canceling send.
+	//r.Header.Add("Expect", "100-continue")
 
 	res, err := rt.RoundTrip(r)
 	if err != nil {
-		log.Println("Failed to connect", err)
 		return err
 	}
 
-	log.Println("client-rt", res.Status, res.Header)
+	t1 := time.Now()
 	ch := make(chan int)
 	var s1, s2 Stream
 
@@ -280,5 +288,6 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 
 	<-ch
 
+	log.Println("hbc-done", "status", res.Status, "conTime", t1.Sub(t0), "dur", time.Since(t1), "err", s2.Err, s1.Err, s2.InError, s1.InError)
 	return s2.Err
 }

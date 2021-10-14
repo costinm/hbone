@@ -18,9 +18,10 @@ func TestHBone(t *testing.T) {
 	ca := NewCA("cluster.local")
 
 	alice := New(ca.NewID("alice", "default"))
+	alice.Auth.AllowedNamespaces = []string{"*"}
 
 	bob := New(ca.NewID("bob", "default"))
-
+	bob.Auth.AllowedNamespaces = []string{"*"}
 	l, err := ListenAndServeTCP(":0", bob.HandleAcceptedH2)
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +158,7 @@ func TestHBone(t *testing.T) {
 
 	// SNI and H2R gate
 	gate := New(ca.NewID("gate", "default"))
+	gate.Auth.AllowedNamespaces = []string{"*"}
 
 	t.Run("sni-alice-gate-bob", func(t *testing.T) {
 		gateSNIL, err := ListenAndServeTCP(":0", gate.HandleSNIConn)

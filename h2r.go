@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -26,15 +27,36 @@ func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error)
 	}
 
 	go func() {
-		hc.hb.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
-			Context:    ctx,
-			Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.hb},
-			BaseConfig: &http.Server{},
-		})
-		if Debug {
-			log.Println("H2RClient closed")
+		backoff := 50 * time.Millisecond
+		for {
+			t0 := time.Now()
+			hc.hb.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
+				Context:    ctx,
+				Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.hb},
+				BaseConfig: &http.Server{},
+			})
+			if Debug {
+				log.Println("H2RClient closed, redial", time.Since(t0))
+			}
+			for {
+				if ctx.Err() != nil {
+					log.Println("H2RClient canceled")
+					return
+				}
+				tlsCon, err = hc.dialTLS(ctx, addr)
+				if err != nil {
+					time.Sleep(backoff)
+					backoff = backoff * 2
+				}
+				backoff = 50 * time.Millisecond
+				break
+			}
+			if Debug {
+				log.Println("H2RClient reconnected", time.Since(t0))
+			}
 		}
 	}()
+
 	if Debug {
 		log.Println("H2RClient started ", tlsCon.ConnectionState().ServerName,
 			tlsCon.ConnectionState().PeerCertificates[0].URIs)
@@ -124,12 +146,13 @@ func (hb *HBone) MarkDead(conn *http2.ClientConn) {
 	sni := hb.H2RConn[conn]
 	if sni != "" {
 		delete(hb.H2R, sni)
+		log.Println("H2RSNI: MarkDead ", sni)
 	}
 	hb.m.Unlock()
-	if hb.H2RCallback != nil {
+
+	if sni != "" && hb.H2RCallback != nil {
 		hb.H2RCallback(sni, nil)
 	}
-	log.Println("H2RSNI: MarkDead ", sni, conn)
 }
 
 func (hb *HBone) HandlerH2RConn(conn net.Conn) {

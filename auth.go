@@ -326,7 +326,6 @@ func (a *Auth) AddRoots(rootCertPEM []byte) error {
 		return err
 	}
 	for _, c := range rootCAs {
-		log.Println("Adding root CA: ", c.Subject)
 		a.TrustedCertPool.AddCert(c)
 	}
 	return nil
