@@ -37,8 +37,8 @@ func TestHBone(t *testing.T) {
 
 	// Alice opens hbone to TCP connection to bob's echo server.
 	t.Run("plain-alice-bob", func(t *testing.T) {
-		rin, lout:= io.Pipe()
-		lin, rout:= io.Pipe()
+		rin, lout := io.Pipe()
+		lin, rout := io.Pipe()
 		go func() {
 			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/tcp", rin, rout, nil)
 			if err != nil {
@@ -50,8 +50,8 @@ func TestHBone(t *testing.T) {
 	})
 
 	t.Run("server-close", func(t *testing.T) {
-		rin, lout:= io.Pipe()
-		lin, rout:= io.Pipe()
+		rin, lout := io.Pipe()
+		lin, rout := io.Pipe()
 		go func() {
 			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.TLSConfig)
 
@@ -68,7 +68,7 @@ func TestHBone(t *testing.T) {
 
 		data := make([]byte, 1024)
 		r, err := lin.Read(data)
-		log.Println("Read: ",r, err)
+		log.Println("Read: ", r, err)
 
 		lout.Write([]byte("PostClose"))
 		log.Println(eh.Received)
@@ -80,8 +80,8 @@ func TestHBone(t *testing.T) {
 
 		evie := New(evieca.NewID("alice", "default"))
 
-		rin, _:= io.Pipe()
-		_, rout:= io.Pipe()
+		rin, _ := io.Pipe()
+		_, rout := io.Pipe()
 		err = evie.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/tcp", rin, rout, nil)
 		if err == nil {
 			t.Fatal("Expecting error")
@@ -97,8 +97,8 @@ func TestHBone(t *testing.T) {
 
 		evie := New(evieca.NewID("alice", "default"))
 
-		rin, _:= io.Pipe()
-		_, rout:= io.Pipe()
+		rin, _ := io.Pipe()
+		_, rout := io.Pipe()
 		err = evie.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/tcp", rin, rout, nil)
 		if err == nil {
 			t.Fatal("Expecting error")
@@ -109,7 +109,7 @@ func TestHBone(t *testing.T) {
 	// Verify server first protocols work
 	t.Run("plain-alice-bob-serverFirst", func(t *testing.T) {
 		ehServerFirst := &echo.EchoHandler{ServerFirst: true, Debug: Debug}
-		ehSFL, err := ehServerFirst.Start( ":0")
+		ehSFL, err := ehServerFirst.Start(":0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -118,8 +118,8 @@ func TestHBone(t *testing.T) {
 			log.Println("hbone serverFirst proxy done ", r.RequestURI, err)
 		})
 
-		rin, lout:= io.Pipe()
-		lin, rout:= io.Pipe()
+		rin, lout := io.Pipe()
+		lin, rout := io.Pipe()
 		go func() {
 			err = alice.Proxy("default.bob:6000", "https://"+bobHBAddr+"/_hbone/serverFirst", rin, rout, nil)
 			if err != nil {
@@ -144,8 +144,8 @@ func TestHBone(t *testing.T) {
 	})
 
 	t.Run("mtls-alice-bob", func(t *testing.T) {
-		rin, lout:= io.Pipe()
-		lin, rout:= io.Pipe()
+		rin, lout := io.Pipe()
+		lin, rout := io.Pipe()
 		go func() {
 			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.TLSConfig)
 			if err != nil {
@@ -158,15 +158,14 @@ func TestHBone(t *testing.T) {
 	// SNI and H2R gate
 	gate := New(ca.NewID("gate", "default"))
 
-
 	t.Run("sni-alice-gate-bob", func(t *testing.T) {
 		gateSNIL, err := ListenAndServeTCP(":0", gate.HandleSNIConn)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		rin, lout:= io.Pipe()
-		lin, rout:= io.Pipe()
+		rin, lout := io.Pipe()
+		lin, rout := io.Pipe()
 		gate.EndpointResolver = func(sni string) *Endpoint {
 			gc := gate.NewEndpoint("https://" + bobHBAddr + "/_hbone/mtls")
 
@@ -186,7 +185,6 @@ func TestHBone(t *testing.T) {
 
 		EchoClient(t, lout, lin)
 	})
-
 
 	t.Run("sni-h2r-alice-gate-bob", func(t *testing.T) {
 		gateH2RL, err := ListenAndServeTCP(":0", gate.HandlerH2RConn)
@@ -225,8 +223,8 @@ func TestHBone(t *testing.T) {
 			}
 		}
 
-		rin, lout:= io.Pipe()
-		lin, rout:= io.Pipe()
+		rin, lout := io.Pipe()
+		lin, rout := io.Pipe()
 		go func() {
 			// The endpoint looks like an Istio endpoint.
 			//
@@ -251,7 +249,7 @@ func TestHBone(t *testing.T) {
 
 func EchoClient(t *testing.T, lout *io.PipeWriter, lin *io.PipeReader) {
 	b := make([]byte, 1024)
-	timer := time.AfterFunc(3 * time.Second, func() {
+	timer := time.AfterFunc(3*time.Second, func() {
 		log.Println("timeout")
 		lin.CloseWithError(errors.New("timeout"))
 		lout.CloseWithError(errors.New("timeout"))
@@ -263,4 +261,3 @@ func EchoClient(t *testing.T, lout *io.PipeWriter, lin *io.PipeReader) {
 	}
 	timer.Stop()
 }
-

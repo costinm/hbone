@@ -63,16 +63,15 @@ type HBone struct {
 // New creates a new HBone node. It requires a workload identity, including mTLS certificates.
 func New(auth *Auth) *HBone {
 	hb := &HBone{
-		Auth: auth,
+		Auth:      auth,
 		Endpoints: map[string]*Endpoint{},
 		H2R:       map[string]http.RoundTripper{},
-		H2RConn: map[*http2.ClientConn]string{},
+		H2RConn:   map[*http2.ClientConn]string{},
 		TcpAddr:   "127.0.0.1:8080",
 		h2t: &http2.Transport{
-			ReadIdleTimeout: 10000 * time.Second,
+			ReadIdleTimeout:            10000 * time.Second,
 			StrictMaxConcurrentStreams: false,
-			AllowHTTP: true,
-
+			AllowHTTP:                  true,
 		},
 
 		HTTPClientSystem: http.DefaultClient,
@@ -104,8 +103,6 @@ type HBoneAcceptedConn struct {
 // debugging with ssh.
 //
 
-
-
 func (hb *HBone) HandleAcceptedH2(conn net.Conn) {
 	conf := hb.Auth.TLSConfig
 	defer conn.Close()
@@ -119,7 +116,6 @@ func (hb *HBone) HandleAcceptedH2(conn net.Conn) {
 
 	hb.HandleAcceptedH2C(tls)
 }
-
 
 func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t0 := time.Now()
@@ -153,13 +149,13 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	w.(http.Flusher).Flush()
 
 	// TCP proxy for SSH ( no mTLS, SSH has its own equivalent)
-	if r.RequestURI ==  "/_hbone/22" {
+	if r.RequestURI == "/_hbone/22" {
 		err := hac.hb.HandleTCPProxy(w, r.Body, "localhost:15022")
 		log.Println("hbone proxy done ", r.RequestURI, err)
 
 		return
 	}
-	if r.RequestURI ==  "/_hbone/tcp" {
+	if r.RequestURI == "/_hbone/tcp" {
 		//w.Write([]byte{1})
 		//w.(http.Flusher).Flush()
 
@@ -168,11 +164,11 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 		return
 	}
-	if r.RequestURI ==  "/_hbone/mtls" {
+	if r.RequestURI == "/_hbone/mtls" {
 		// Create a stream, used for proxy with caching.
 		conf := hac.hb.Auth.TLSConfig
 
-		tls := tls.Server(&HTTPConn{r: r.Body, w: w,  acceptedConn: hac.conn}, conf)
+		tls := tls.Server(&HTTPConn{r: r.Body, w: w, acceptedConn: hac.conn}, conf)
 
 		// TODO: replace with handshake with context
 		err := HandshakeTimeout(tls, hac.hb.HandsahakeTimeout, nil)
@@ -206,7 +202,7 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	rh, pat := hac.hb.Mux.Handler(r)
 	if pat != "" {
-		rh.ServeHTTP(w,r)
+		rh.ServeHTTP(w, r)
 		return
 	}
 
@@ -215,13 +211,12 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	hac.hb.rp.ServeHTTP(w, r)
 }
 
-
 func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
 	hc := &HBoneAcceptedConn{hb: hb, conn: conn}
 	hb.h2Server.ServeConn(
 		conn,
 		&http2.ServeConnOpts{
-			Handler: hc,                   // Also plain text, needs to be upgraded
+			Handler: hc, // Also plain text, needs to be upgraded
 			Context: context.Background(),
 			//Context can be used to cancel, pass meta.
 			// h2 adds http.LocalAddrContextKey(NetAddr), ServerContextKey (*Server)
@@ -232,36 +227,32 @@ func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
 func (hb *HBone) HandleTCPProxy(w io.Writer, r io.Reader, hostPort string) error {
 	nc, err := net.Dial("tcp", hostPort)
 	if err != nil {
-		log.Println("Error dialing ", hostPort,err)
+		log.Println("Error dialing ", hostPort, err)
 		return err
 	}
 
 	s1 := Stream{
-		ID: "TCP-o",
+		ID:  "TCP-o",
 		Dst: nc,
 		Src: r,
 	}
 	ch := make(chan int)
-	go s1.CopyBuffered(ch,true)
+	go s1.CopyBuffered(ch, true)
 
 	s2 := Stream{
-		ID: "TCP-i",
+		ID:  "TCP-i",
 		Dst: w,
 		Src: nc,
 	}
 	s2.CopyBuffered(nil, true)
-	<- ch
+	<-ch
 
 	if s1.Err != nil {
 		return s1.Err
 	}
-	if s2.Err != nil  {
+	if s2.Err != nil {
 		return s2.Err
 	}
 
 	return nil
 }
-
-
-
-

@@ -27,8 +27,8 @@ func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error)
 
 	go func() {
 		hc.hb.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
-			Context: ctx,
-			Handler: &HBoneAcceptedConn{conn: tlsCon, hb: hc.hb},
+			Context:    ctx,
+			Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.hb},
 			BaseConfig: &http.Server{},
 		})
 		if Debug {
@@ -41,7 +41,6 @@ func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error)
 	}
 	return tlsCon, nil
 }
-
 
 func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 	s := NewBufferReader(conn)
@@ -71,45 +70,45 @@ func (hb *HBone) handleH2R(conn net.Conn, s *BufferReader, sni string) (bool, er
 	if rt == nil {
 		return false, nil
 	}
-		// WIP: send over the established connection
-		i, o := io.Pipe()
+	// WIP: send over the established connection
+	i, o := io.Pipe()
 
-		r, err := http.NewRequest("POST", "http:///_hbone/mtls", i)
-		if err != nil {
-			return false, err
-		}
-		res, err := rt.RoundTrip(r)
+	r, err := http.NewRequest("POST", "http:///_hbone/mtls", i)
+	if err != nil {
+		return false, err
+	}
+	res, err := rt.RoundTrip(r)
 
-		s1 := Stream{
-			ID: "sni-o",
-			Dst: o,
-			Src: s, // The SNI reader, including the initial buffer
-		}
-		ch := make(chan int)
-		go s1.CopyBuffered(ch, true)
+	s1 := Stream{
+		ID:  "sni-o",
+		Dst: o,
+		Src: s, // The SNI reader, including the initial buffer
+	}
+	ch := make(chan int)
+	go s1.CopyBuffered(ch, true)
 
-		s2 := Stream {
-			ID: "sni-i",
-			Src: res.Body,
-			Dst: conn,
-		}
-		s2.CopyBuffered(nil, true)
+	s2 := Stream{
+		ID:  "sni-i",
+		Src: res.Body,
+		Dst: conn,
+	}
+	s2.CopyBuffered(nil, true)
 
-		<- ch
+	<-ch
 
-		if s1.Err != nil {
-			return false, s1.Err
-		}
-		if s2.Err != nil {
-			return false, s2.Err
-		}
+	if s1.Err != nil {
+		return false, s1.Err
+	}
+	if s2.Err != nil {
+		return false, s2.Err
+	}
 
-		// TODO: wait for first copy to finish
-		if Debug {
-			log.Println("H2RSNI done ", s1.Err, s2.Err)
-		}
+	// TODO: wait for first copy to finish
+	if Debug {
+		log.Println("H2RSNI done ", s1.Err, s2.Err)
+	}
 
-		return true, nil
+	return true, nil
 
 }
 
@@ -132,7 +131,6 @@ func (hb *HBone) MarkDead(conn *http2.ClientConn) {
 	}
 	log.Println("H2RSNI: close ", sni)
 }
-
 
 func (hb *HBone) HandlerH2RConn(conn net.Conn) {
 	conf := hb.Auth.TLSConfig
@@ -158,9 +156,7 @@ func (hb *HBone) HandlerH2RConn(conn net.Conn) {
 	}
 	h2rc := &H2RConn{
 		SNI: sni,
-		h2t: &http2.Transport{
-
-		},
+		h2t: &http2.Transport{},
 	}
 	h2rc.h2t.ConnPool = h2rc
 

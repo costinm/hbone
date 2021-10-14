@@ -39,7 +39,7 @@ type Auth struct {
 
 // TODO: ./etc/certs support: krun should copy the files, for consistency (simper code for frameworks).
 // TODO: periodic reload
-func LoadAuth(dir string) (*Auth, error){
+func LoadAuth(dir string) (*Auth, error) {
 	a := &Auth{
 		CertDir: dir,
 	}
@@ -253,7 +253,6 @@ func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
 	return nil
 }
 
-
 // SignCertDER uses caPrivate to sign a cert, returns the DER format.
 // Used primarily for tests with self-signed cert.
 func SignCertDER(template *x509.Certificate, pub crypto.PublicKey, caPrivate crypto.PrivateKey, parent *x509.Certificate) ([]byte, error) {
@@ -315,7 +314,7 @@ type CA struct {
 
 func NewCA(trust string) *CA {
 	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
-	caCert, _ := rootCert(trust, "rootCA",	ca, ca)
+	caCert, _ := rootCert(trust, "rootCA", ca, ca)
 	return &CA{ca: ca, CACert: caCert, TrustDomain: trust,
 		prefix: "spiffe://" + trust + "/ns/",
 	}
@@ -324,8 +323,8 @@ func NewCA(trust string) *CA {
 func (ca *CA) NewID(ns, sa string) *Auth {
 	nodeID := &Auth{
 		TrustDomain: ca.TrustDomain,
-		Namespace: ns,
-		SA: sa,
+		Namespace:   ns,
+		SA:          sa,
 	}
 	caCert := ca.CACert
 	nodeID.Cert = ca.NewTLSCert(ns, sa)
@@ -339,7 +338,7 @@ func (ca *CA) NewID(ns, sa string) *Auth {
 
 func (ca *CA) NewTLSCert(ns, sa string) *tls.Certificate {
 	nodeKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	csr := CertTemplate(ca.TrustDomain, ca.prefix  + ns + "/sa/" + sa)
+	csr := CertTemplate(ca.TrustDomain, ca.prefix+ns+"/sa/"+sa)
 	cert, _, _ := newTLSCertAndKey(csr, nodeKey, ca.ca, ca.CACert)
 	return cert
 }
@@ -378,9 +377,9 @@ func rootCert(org, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey) (*x5
 			CommonName:   cn,
 			Organization: []string{org},
 		},
-		NotBefore: notBefore,
-		NotAfter:  notAfter,
-		IsCA: true,
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 	}
@@ -391,4 +390,3 @@ func rootCert(org, cn string, priv crypto.PrivateKey, ca crypto.PrivateKey) (*x5
 	rootCA, _ := x509.ParseCertificates(certDER)
 	return rootCA[0], certDER
 }
-

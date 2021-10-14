@@ -40,7 +40,7 @@ type Endpoint struct {
 	MTLSConfig *tls.Config
 
 	// SNI name to use - defaults to service name
-	SNI     string
+	SNI string
 
 	// SNIGate is the endpoint address of a SNI gate. It can be a normal Istio SNI, a SNI to HBone or other protocols,
 	// or a H2R gate.
@@ -52,6 +52,7 @@ type Endpoint struct {
 	tlsCon *tls.Conn
 	rt     *http2.ClientConn // http.RoundTripper
 }
+
 func (hb *HBone) NewClient(service string) *HBoneClient {
 	return &HBoneClient{hb: hb, ServiceAddr: service}
 }
@@ -87,7 +88,6 @@ func (hb *HBone) Proxy(svc string, hbURL string, stdin io.ReadCloser, stdout io.
 	c.MTLSConfig = innerTLS
 	return c.Proxy(context.Background(), stdin, stdout)
 }
-
 
 func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error) {
 	d := net.Dialer{} // TODO: customizations
@@ -138,11 +138,11 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	var rt = hc.rt
 
 	if hc.hb.TokenCallback != nil {
-		t, err := hc.hb.TokenCallback(ctx, "https://" + r.URL.Host)
+		t, err := hc.hb.TokenCallback(ctx, "https://"+r.URL.Host)
 		if err != nil {
 			return err
 		}
-		r.Header.Set("Authorization", "Bearer " + t)
+		r.Header.Set("Authorization", "Bearer "+t)
 	}
 
 	if hc.rt == nil {
@@ -164,7 +164,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 		// Expect system certificates.
 		if port == "443" || port == "" {
 			d := tls.Dialer{
-				Config:    &tls.Config{
+				Config: &tls.Config{
 					NextProtos: []string{"h2"},
 				},
 				NetDialer: &net.Dialer{},
