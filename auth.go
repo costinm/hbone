@@ -30,10 +30,10 @@ const (
 type Auth struct {
 	// Will attempt to load certificates from this directory, defaults to
 	// "./var/run/secrets/istio.io/"
-	CertDir   string
+	CertDir string
 
 	// Current certificate, after calling GetCertificate("")
-	Cert          *tls.Certificate
+	Cert *tls.Certificate
 
 	// MeshTLSConfig is a tls.Config that requires mTLS with a spiffee identity,
 	// using the configured roots, trustdomains.
@@ -48,8 +48,8 @@ type Auth struct {
 
 	// Namespace and SA are extracted from the certificate or set by user.
 	// Namespace is used to verify peer certificates
-	Namespace   string
-	SA          string
+	Namespace string
+	SA        string
 
 	AllowedNamespaces []string
 
@@ -69,7 +69,7 @@ type Auth struct {
 //
 // TODO: ./etc/certs support: krun should copy the files, for consistency (simper code for frameworks).
 // TODO: periodic reload
-func NewAuthFromDir(dir string) (*Auth, error){
+func NewAuthFromDir(dir string) (*Auth, error) {
 	a := NewAuth()
 	a.CertDir = dir
 	err := a.waitAndInitFromDir()
@@ -79,7 +79,7 @@ func NewAuthFromDir(dir string) (*Auth, error){
 	return a, nil
 }
 
-func NewAuth() (*Auth){
+func NewAuth() *Auth {
 	a := &Auth{
 		TrustedCertPool: x509.NewCertPool(),
 	}
@@ -228,7 +228,7 @@ func (a *Auth) waitAndInitFromDir() error {
 func (a *Auth) Spiffee() (*url.URL, string, string, string) {
 	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
 	if err != nil {
-		return nil, "","",""
+		return nil, "", "", ""
 	}
 	if len(cert.URIs) > 0 {
 		c0 := cert.URIs[0]
@@ -237,7 +237,7 @@ func (a *Auth) Spiffee() (*url.URL, string, string, string) {
 			return c0, c0.Host, pathComponetns[2], pathComponetns[4]
 		}
 	}
-	return nil,"","",""
+	return nil, "", "", ""
 }
 
 func (a *Auth) ID() string {
@@ -245,7 +245,7 @@ func (a *Auth) ID() string {
 	return su.String()
 }
 
-func (a *Auth) setSpiffe()  {
+func (a *Auth) setSpiffe() {
 	_, a.TrustDomain, a.Namespace, a.SA = a.Spiffee()
 }
 
@@ -285,23 +285,23 @@ func (a *Auth) NewCSR(kty string, trustDomain, san string) (privPEM []byte, csrP
 	//	}
 	//	privPem = pem.EncodeToMemory(&pem.Block{Type: blockTypePKCS8PrivateKey, Bytes: encodedKey})
 	//} else {
-		switch k := priv.(type) {
-		case *rsa.PrivateKey:
-			encodedKey = x509.MarshalPKCS1PrivateKey(k)
-			privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
-		case *ecdsa.PrivateKey:
-			encodedKey, err = x509.MarshalECPrivateKey(k)
-			if err != nil {
-				return nil, nil, err
-			}
-			privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
+	switch k := priv.(type) {
+	case *rsa.PrivateKey:
+		encodedKey = x509.MarshalPKCS1PrivateKey(k)
+		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeRSAPrivateKey, Bytes: encodedKey})
+	case *ecdsa.PrivateKey:
+		encodedKey, err = x509.MarshalECPrivateKey(k)
+		if err != nil {
+			return nil, nil, err
 		}
+		privPEM = pem.EncodeToMemory(&pem.Block{Type: blockTypeECPrivateKey, Bytes: encodedKey})
+	}
 	//}
 
 	return
 }
 
-func GenCSRTemplate(trustDomain, san string) (*x509.CertificateRequest) {
+func GenCSRTemplate(trustDomain, san string) *x509.CertificateRequest {
 	template := &x509.CertificateRequest{
 		Subject: pkix.Name{
 			Organization: []string{trustDomain},
@@ -417,7 +417,6 @@ func (a *Auth) initTLS() {
 			return errors.New("Namespace not allowed")
 		},
 		NextProtos: []string{"istio", "h2"},
-
 	}
 }
 

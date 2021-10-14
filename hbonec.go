@@ -155,7 +155,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	}
 
 	rd, _ := httputil.DumpRequest(r, false)
-	log.Println( "HB req: ", string(rd))
+	log.Println("HB req: ", string(rd))
 
 	if hc.rt == nil {
 		/* Alternative, using http.Client.

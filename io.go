@@ -161,7 +161,6 @@ func (s Stream) CopyBuffered(ch chan int, close bool) {
 	}
 }
 
-
 func closeWriter(dst io.Writer) error {
 	if cw, ok := dst.(CloseWriter); ok {
 		return cw.CloseWrite()
