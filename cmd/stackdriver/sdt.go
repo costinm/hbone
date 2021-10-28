@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -32,13 +33,16 @@ var (
 	ns = flag.String("n", "", "Namespace")
 	metric = flag.String("m", "istio.io/service/client/request_count", "Metric name")
 	extra = flag.String("x", "", "Extra query parameters")
+
+	includeZero = flag.Bool("zero", false, "Include metrics with zero value")
+	jsonF = flag.Bool("json", false, "json output")
 )
 
 func main() {
 	flag.Parse()
 	projectID := *p
 	if *p == "" {
-		projectID = "dmeshgate"
+		projectID = "wlhe-cr"
 		//panic("Missing PROJECT_ID")
 		//return
 	}
@@ -84,10 +88,16 @@ func main() {
 	}
 
 	for _, tsr := range ts {
-		log.Println(tsr.Metric.Labels)
 		v := tsr.Points[0].Value
-		log.Println(*v.DoubleValue)
-
+		if ! *includeZero && *v.DoubleValue == 0 {
+			continue
+		}
+		if *jsonF {
+			d, _ := json.Marshal(tsr)
+			fmt.Println(string(d))
+		} else {
+			fmt.Printf("%v %v\n", *v.DoubleValue, tsr.Metric.Labels)
+		}
 	}
 }
 

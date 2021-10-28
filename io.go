@@ -34,6 +34,8 @@ type CloseWriter interface {
 
 var streamIDs int64 = 0
 
+// Stream wraps a reader/writer.
+// It is used to proxy.
 type Stream struct {
 	Written int64
 	Err     error
@@ -42,6 +44,18 @@ type Stream struct {
 	Src io.Reader
 	Dst io.Writer
 	ID  string
+
+	// Dest is set to the proxy destination.
+	Dest string
+	// DestAddr is set if the address has been resolved.
+	// For SOCKS5 - it's set if the caller resolved the IP.
+	// For Iptables or TUN - it's the VIP or IP from the network.
+	// nil if the protocol is only using Dest.
+	DestAddr        *net.TCPAddr
+
+	// If the stream is proxied, this method should be called after
+	// 'Dial' or equivalent is called.
+	PostDialHandler func(conn net.Conn, err error)
 }
 
 func proxy(ctx context.Context, cin io.Reader, cout io.WriteCloser, sin io.Reader, sout io.WriteCloser) error {
@@ -300,9 +314,9 @@ func ServeListener(l net.Listener, f func(conn net.Conn)) error {
 }
 
 // BufferReader wraps a buffer and a Reader.
-// The Fill method will populate the buffer.
-// Read will first return data from the buffer, and if buffer is empty will
-// read directly from the source reader.
+// The Fill method will populate the buffer by doing one or more Read() operations, up to buffer size.
+// Read will first return data from the buffer, and if buffer is empty will read directly from the source reader.
+// The buffer can be used for parsing.
 type BufferReader struct {
 	buf        []byte
 	roff, rend int
@@ -328,6 +342,46 @@ func (s *BufferReader) Fill(i int) ([]byte, error) {
 		if s.rend >= i {
 			return s.buf[0:s.rend], nil
 		}
+	}
+}
+
+func (b *BufferReader) Size() int {
+	if b== nil {
+		return 0
+	}
+	return b.rend - b.roff
+}
+
+func (b *BufferReader) Skip(n int) {
+	if n > b.Size() {
+		n -= b.Size()
+		b.roff = 0
+		b.rend = 0
+		// Now need to read and skip n
+		for {
+			bb, err := b.Fill(0)
+			if err != nil {
+				return
+			}
+			if len(bb) < n {
+				n -= len(bb)
+				b.roff = 0
+				b.rend = 0
+				continue
+			} else if len(bb) == n {
+				b.roff = 0
+				b.rend = 0
+				return
+			} else {
+				b.roff = n
+				return
+			}
+		}
+	}
+	b.roff += n
+	if b.roff == b.rend {
+		b.roff = 0
+		b.rend = 0
 	}
 }
 

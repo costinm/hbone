@@ -43,9 +43,7 @@ type HBone struct {
 
 	SNIAddr string
 
-	HTTPClientSystem *http.Client
-	HTTPClientMesh   *http.Client
-	TcpAddr          string
+	TcpAddr string
 
 	// Ports is the equivalent of container ports in k8s.
 	// Name follows the same conventions as Istio and should match the port name in the Service.
@@ -66,6 +64,10 @@ type HBone struct {
 	m           sync.RWMutex
 	H2RConn     map[*http2.ClientConn]string
 	H2RCallback func(string, *http2.ClientConn)
+
+	// Transport returns a wrapper for the h2c RoundTripper.
+	Transport      func(tripper http.RoundTripper) http.RoundTripper
+	HandlerWrapper func(h http.Handler) http.Handler
 }
 
 // New creates a new HBone node. It requires a workload identity, including mTLS certificates.
@@ -92,7 +94,6 @@ func New(auth *Auth) *HBone {
 		//	AllowHTTP: true,
 		//},
 
-		HTTPClientSystem: http.DefaultClient,
 	}
 	hb.h2t.ConnPool = hb
 	hb.h2Server = &http2.Server{}
@@ -228,7 +229,13 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 }
 
 func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
-	hc := &HBoneAcceptedConn{hb: hb, conn: conn}
+	var hc http.Handler
+	hc = &HBoneAcceptedConn{hb: hb, conn: conn}
+
+	if hb.HandlerWrapper != nil {
+		hc = hb.HandlerWrapper(hc)
+	}
+
 	hb.h2Server.ServeConn(
 		conn,
 		&http2.ServeConnOpts{
