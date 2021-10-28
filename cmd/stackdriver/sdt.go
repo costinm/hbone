@@ -28,8 +28,12 @@ import (
 
 var (
 	p = flag.String("p", os.Getenv("PROJECT_ID"), "Project ID")
-	r = flag.String("r", "", "Resource type")
-	ns = flag.String("n", "", "Namespace")
+
+	r = flag.String("r", "", "Resource type.")
+
+	ns = flag.String("n", os.Getenv("WORKLOAD_NAMESPACE"), "Namespace")
+	wname = flag.String("s", os.Getenv("WORKLOAD_NAME"), "Service name")
+	rev = flag.String("v", "", "Version/revision")
 	metric = flag.String("m", "istio.io/service/client/request_count", "Metric name")
 	extra = flag.String("x", "", "Extra query parameters")
 )
@@ -71,7 +75,8 @@ func main() {
 	// source_workload_name:fortio
 	// source_workload_namespace:fortio
 
-	// TODO: retry, set a limit on how big of a delay is ok
+
+
 
 	// Verify client side metrics (in pod) reflect the CloudrRun server properties
 	ts, err := sd.ListTimeSeries(context.Background(),
@@ -168,4 +173,35 @@ func (s *Stackdriver) ListTimeSeries(ctx context.Context, namespace, resourceTyp
 	return resp.TimeSeries, nil
 }
 
+// For a metric, list resource types that generated the metric and the names.
+func (s *Stackdriver) ListResources(ctx context.Context, namespace, metricName, extra string) ([]*monitoring.TimeSeries, error) {
+	endTime := time.Now()
+	startTime := endTime.Add(queryInterval)
+
+	f := fmt.Sprintf("metric.type = %q ", metricName)
+	if namespace != "" {
+		f = f + fmt.Sprintf(" AND resource.labels.namespace_name = %q", namespace)
+	}
+	if extra != "" {
+		f = f + extra
+	}
+
+	lr := s.monitoringService.Projects.TimeSeries.List(fmt.Sprintf("projects/%v", s.projectID)).
+		IntervalStartTime(startTime.Format(time.RFC3339)).
+		IntervalEndTime(endTime.Format(time.RFC3339)).
+		AggregationCrossSeriesReducer("REDUCE_NONE").
+		AggregationAlignmentPeriod("60s").
+		AggregationPerSeriesAligner("ALIGN_RATE").
+		Filter(f).//, destCanonical
+		Context(ctx)
+	resp, err := lr.Do()
+	if err != nil {
+		return nil, err
+	}
+	if resp.HTTPStatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get expected status code from monitoring service, got: %d", resp.HTTPStatusCode)
+	}
+
+	return resp.TimeSeries, nil
+}
 
