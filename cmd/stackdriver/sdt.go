@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,9 +26,18 @@ import (
 	"google.golang.org/api/monitoring/v3"
 )
 
+var (
+	p = flag.String("p", os.Getenv("PROJECT_ID"), "Project ID")
+	r = flag.String("r", "", "Resource type")
+	ns = flag.String("n", "", "Namespace")
+	metric = flag.String("m", "istio.io/service/client/request_count", "Metric name")
+	extra = flag.String("x", "", "Extra query parameters")
+)
+
 func main() {
-	projectID := os.Getenv("PROJECT_ID")
-	if projectID == "" {
+	flag.Parse()
+	projectID := *p
+	if *p == "" {
 		projectID = "dmeshgate"
 		//panic("Missing PROJECT_ID")
 		//return
@@ -64,10 +74,11 @@ func main() {
 	// TODO: retry, set a limit on how big of a delay is ok
 
 	// Verify client side metrics (in pod) reflect the CloudrRun server properties
-	ts, err := sd.ListTimeSeries(context.Background(), "fortio", "istio_canonical_service",
-		"istio.io/service/client/request_count",
-		" AND metric.labels.source_canonical_service_name = \"fortio\"" +
-				" AND metric.labels.response_code = \"200\"")
+	ts, err := sd.ListTimeSeries(context.Background(),
+		*ns, *r,
+		*metric, *extra)
+		//" AND metric.labels.source_canonical_service_name = \"fortio\"" +
+		//		" AND metric.labels.response_code = \"200\"")
 	if err != nil {
 		log.Fatalf("Error %v", err)
 	}
@@ -126,10 +137,14 @@ func (s *Stackdriver) ListTimeSeries(ctx context.Context, namespace, resourceTyp
 	endTime := time.Now()
 	startTime := endTime.Add(queryInterval)
 
-	f := fmt.Sprintf("metric.type = %q AND resource.type = %q AND resource.labels.namespace_name = %q",
-		metricName,
-		resourceType,
-		namespace)
+	f := fmt.Sprintf("metric.type = %q ",
+		metricName)
+	if resourceType != "" {
+		f = f + fmt.Sprintf(" AND resource.type = %q", resourceType)
+	}
+	if namespace != "" {
+		f = f + fmt.Sprintf(" AND resource.labels.namespace_name = %q", namespace)
+	}
 	if extra != "" {
 		f = f + extra
 	}
