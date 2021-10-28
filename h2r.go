@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -31,7 +32,7 @@ func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error)
 		for {
 			t0 := time.Now()
 			hc.hb.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
-				Context:    ctx,
+				//Context:    ctx,
 				Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.hb},
 				BaseConfig: &http.Server{},
 			})
@@ -86,6 +87,9 @@ func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 }
 
 func (hb *HBone) handleH2R(conn net.Conn, s *BufferReader, sni string) (bool, error) {
+	if strings.HasPrefix(sni, "outbound_.") {
+
+	}
 	hb.m.RLock()
 	rt := hb.H2R[sni]
 	hb.m.RUnlock()

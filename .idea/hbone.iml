@@ -5,5 +5,9 @@
     <content url="file://$MODULE_DIR$" />
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
+    <orderEntry type="module" module-name="krun" />
+    <orderEntry type="module" module-name="cert-ssh" />
+    <orderEntry type="module" module-name="ugate" />
+    <orderEntry type="module" module-name="konfig" />
   </component>
 </module>

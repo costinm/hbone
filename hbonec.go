@@ -11,8 +11,6 @@ import (
 	"net/http/httputil"
 	"strings"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
 type HBoneClient struct {
@@ -60,7 +58,7 @@ type Endpoint struct {
 
 	// TODO: multiple per endpoint
 	tlsCon *tls.Conn
-	rt     *http2.ClientConn // http.RoundTripper
+	rt     http.RoundTripper // *http2.ClientConn //
 }
 
 func (hb *HBone) NewClient(service string) *HBoneClient {
@@ -236,12 +234,14 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 			return err
 		}
 
+		if hc.hb.Transport != nil {
+			rt = hc.hb.Transport(rt)
+		}
 		hc.rt = rt
 	}
 
 	// This might be useful to make sure auth works - but it doesn't seem to help with the deadlock/canceling send.
 	//r.Header.Add("Expect", "100-continue")
-
 	res, err := rt.RoundTrip(r)
 	if err != nil {
 		return err

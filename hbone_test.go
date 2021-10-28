@@ -205,7 +205,7 @@ func TestHBone(t *testing.T) {
 		// May have multiple h2r endpoints, to different instances (or all instances, if the gate is a stateful
 		// set).
 		h2re := h2rc.NewEndpoint("")
-		h2re.SNI = "default.bob.svc"
+		h2re.SNI = "default.bob.svc.cluster.local"
 
 		h2rCtx, h2rCancel := context.WithCancel(context.Background())
 
@@ -225,22 +225,40 @@ func TestHBone(t *testing.T) {
 			}
 		}
 
-		rin, lout := io.Pipe()
-		lin, rout := io.Pipe()
-		go func() {
-			// The endpoint looks like an Istio endpoint.
-			//
-			c := alice.NewEndpoint("https://" + gateH2RSNIL.Addr().String() + "/_hbone/tcp")
-			c.SNI = "default.bob.svc"
-			c.SNIGate = gateH2RSNIL.Addr().String()
+		t.Run("ReverseProxySAN", func(t *testing.T) {
+			rin, lout := io.Pipe()
+			lin, rout := io.Pipe()
+			go func() {
+				c := alice.NewEndpoint("https://" + gateH2RSNIL.Addr().String() + "/_hbone/tcp")
+				c.SNI = "default.bob.svc.cluster.local"
+				c.SNIGate = gateH2RSNIL.Addr().String()
 
-			err = c.Proxy(context.Background(), rin, rout)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}()
+				err = c.Proxy(context.Background(), rin, rout)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}()
 
-		EchoClient(t, lout, lin)
+			EchoClient(t, lout, lin)
+		})
+
+		t.Run("ReverseProxyIstio", func(t *testing.T) {
+			rin, lout := io.Pipe()
+			lin, rout := io.Pipe()
+			go func() {
+				c := alice.NewEndpoint("https://" + gateH2RSNIL.Addr().String() + "/_hbone/tcp")
+				// The endpoint looks like an Istio endpoint.
+				c.SNI = "outbound_.8080._.default.bob.svc.cluster.local"
+				c.SNIGate = gateH2RSNIL.Addr().String()
+
+				err = c.Proxy(context.Background(), rin, rout)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}()
+
+			EchoClient(t, lout, lin)
+		})
 
 		// Force close the tls con - server should terminate
 		h2rCon.Close()

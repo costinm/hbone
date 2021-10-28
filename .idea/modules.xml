@@ -2,7 +2,11 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/../cert-ssh/.idea/cert-ssh.iml" filepath="$PROJECT_DIR$/../cert-ssh/.idea/cert-ssh.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/hbone.iml" filepath="$PROJECT_DIR$/.idea/hbone.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../konfig/.idea/konfig.iml" filepath="$PROJECT_DIR$/../konfig/.idea/konfig.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../krun/.idea/krun.iml" filepath="$PROJECT_DIR$/../krun/.idea/krun.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../ugate/.idea/ugate.iml" filepath="$PROJECT_DIR$/../ugate/.idea/ugate.iml" />
     </modules>
   </component>
 </project>
