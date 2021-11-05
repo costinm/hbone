@@ -29,13 +29,17 @@ import (
 
 var (
 	p = flag.String("p", os.Getenv("PROJECT_ID"), "Project ID")
-	r = flag.String("r", "", "Resource type")
-	ns = flag.String("n", "", "Namespace")
+
+	r = flag.String("r", "", "Resource type.")
+
+	ns     = flag.String("n", os.Getenv("WORKLOAD_NAMESPACE"), "Namespace")
+	wname  = flag.String("s", os.Getenv("WORKLOAD_NAME"), "Service name")
+	rev    = flag.String("v", "", "Version/revision")
 	metric = flag.String("m", "istio.io/service/client/request_count", "Metric name")
-	extra = flag.String("x", "", "Extra query parameters")
+	extra  = flag.String("x", "", "Extra query parameters")
 
 	includeZero = flag.Bool("zero", false, "Include metrics with zero value")
-	jsonF = flag.Bool("json", false, "json output")
+	jsonF       = flag.Bool("json", false, "json output")
 )
 
 func main() {
@@ -47,49 +51,38 @@ func main() {
 		//return
 	}
 
+	ctx, cf := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cf()
+
 	sd, err := NewStackdriver(projectID)
 	if err != nil {
 		panic(err)
 	}
-	// Typical metric:
-	// destination_canonical_revision:latest
-	// destination_canonical_service_name:fortio-cr
-	// destination_canonical_service_namespace:fortio
-	// destination_owner:unknown
-	// destination_port:15442
-	// destination_principal:spiffe://wlhe-cr.svc.id.goog/ns/fortio/sa/default
-	// destination_service_name:fortio-cr-icq63pqnqq-uc
-	// destination_service_namespace:fortio
-	// destination_workload_name:fortio-cr-sni
-	// destination_workload_namespace:fortio
-	// mesh_uid:proj-601426346923
-	// request_operation:GET
-	// request_protocol:http
-	// response_code:200
-	// service_authentication_policy:unknown
-	// source_canonical_revision:v1
-	// source_canonical_service_name:fortio
-	// source_canonical_service_namespace:fortio
-	// source_owner:kubernetes://apis/apps/v1/namespaces/fortio/deployments/fortio
-	// source_principal:spiffe://wlhe-cr.svc.id.goog/ns/fortio/sa/default
-	// source_workload_name:fortio
-	// source_workload_namespace:fortio
 
-	// TODO: retry, set a limit on how big of a delay is ok
+	if *r == "-" {
+		rl, err := sd.ListResources(ctx, *ns, *metric, *extra)
+		if err != nil {
+			log.Fatalf("Error %v", err)
+		}
+		for _, tsr := range rl {
+			log.Println(tsr)
+		}
+		return
+	}
 
 	// Verify client side metrics (in pod) reflect the CloudrRun server properties
-	ts, err := sd.ListTimeSeries(context.Background(),
+	ts, err := sd.ListTimeSeries(ctx,
 		*ns, *r,
 		*metric, *extra)
-		//" AND metric.labels.source_canonical_service_name = \"fortio\"" +
-		//		" AND metric.labels.response_code = \"200\"")
+	//" AND metric.labels.source_canonical_service_name = \"fortio\"" +
+	//		" AND metric.labels.response_code = \"200\"")
 	if err != nil {
 		log.Fatalf("Error %v", err)
 	}
 
 	for _, tsr := range ts {
 		v := tsr.Points[0].Value
-		if ! *includeZero && *v.DoubleValue == 0 {
+		if !*includeZero && *v.DoubleValue == 0 {
 			continue
 		}
 		if *jsonF {
@@ -101,30 +94,6 @@ func main() {
 	}
 }
 
-
-// WIP.
-//
-// Integration and testing with stackdriver for 'proxyless' modes.
-//
-// With Envoy, this is implemented using WASM or native filters.
-//
-// For proxyless (gRPC or generic hbone / uProxy) we need to:
-// - decode and generate the Istio header containing client info
-// - generate the expected istio metrics.
-//
-
-// Request can also use the REST API:
-// monitoring.googleapis.com/v3/projects/NAME/timeSeries
-//   ?aggregation.alignmentPeriod=60s
-//   &aggregation.crossSeriesReducer=REDUCE_NONE
-//   &aggregation.perSeriesAligner=ALIGN_RATE
-//   &alt=json
-//   &filter=metric.type+%3D+%22istio.io%2Fservice%2Fclient%2Frequest_count%22+AND+resource.type+%3D+%22istio_canonical_service%22+AND+resource.labels.namespace_name+%3D+%22fortio%22
-//  &interval.endTime=2021-09-30T14%3A32%3A51-07%3A00
-//  &interval.startTime=2021-09-30T14%3A27%3A51-07%3A00
-//  &prettyPrint=false
-
-
 type Stackdriver struct {
 	projectID         string
 	monitoringService *monitoring.Service
@@ -134,7 +103,7 @@ var (
 	queryInterval = -5 * time.Minute
 )
 
-func NewStackdriver(projectID string) (*Stackdriver, error){
+func NewStackdriver(projectID string) (*Stackdriver, error) {
 	monitoringService, err := monitoring.NewService(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get monitoring service: %v", err)
@@ -159,13 +128,17 @@ func (s *Stackdriver) ListTimeSeries(ctx context.Context, namespace, resourceTyp
 		f = f + extra
 	}
 
+	// Alternative: use REDUCE_MEAN
+	// Aligh on 5m
+
+	// ALIGN_NONE to see the raw data points - how many samples where sent
 	lr := s.monitoringService.Projects.TimeSeries.List(fmt.Sprintf("projects/%v", s.projectID)).
 		IntervalStartTime(startTime.Format(time.RFC3339)).
 		IntervalEndTime(endTime.Format(time.RFC3339)).
 		AggregationCrossSeriesReducer("REDUCE_NONE").
 		AggregationAlignmentPeriod("60s").
 		AggregationPerSeriesAligner("ALIGN_RATE").
-		Filter(f).//, destCanonical
+		Filter(f). //, destCanonical
 		Context(ctx)
 	resp, err := lr.Do()
 	if err != nil {
@@ -178,4 +151,57 @@ func (s *Stackdriver) ListTimeSeries(ctx context.Context, namespace, resourceTyp
 	return resp.TimeSeries, nil
 }
 
+// For a metric, list resource types that generated the metric and the names.
+func (s *Stackdriver) ListResources(ctx context.Context, namespace, metricName, extra string) ([]*monitoring.TimeSeries, error) {
+	endTime := time.Now()
+	startTime := endTime.Add(queryInterval)
 
+	f := fmt.Sprintf("metric.type = %q ", metricName)
+	if namespace != "" {
+		f = f + fmt.Sprintf(" AND resource.labels.namespace_name = %q", namespace)
+	}
+	if extra != "" {
+		f = f + extra
+	}
+
+	lr := s.monitoringService.Projects.TimeSeries.
+		List(fmt.Sprintf("projects/%v", s.projectID)).
+		IntervalStartTime(startTime.Format(time.RFC3339)).
+		IntervalEndTime(endTime.Format(time.RFC3339)).
+		AggregationCrossSeriesReducer("REDUCE_NONE").
+		AggregationAlignmentPeriod("60s").
+		AggregationPerSeriesAligner("ALIGN_RATE").
+		Filter(f). //, destCanonical
+		Context(ctx)
+	resp, err := lr.Do()
+	if err != nil {
+		return nil, err
+	}
+	if resp.HTTPStatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get expected status code from monitoring service, got: %d", resp.HTTPStatusCode)
+	}
+
+	rtype := map[string]map[string]string{}
+
+	for _, t := range resp.TimeSeries {
+		log.Println(t)
+		rtm := rtype[t.Resource.Type]
+		if rtm == nil {
+			rtype[t.Resource.Type] = t.Resource.Labels
+		} else {
+			// Check if any label is different, log
+			for k, _ := range t.Resource.Labels {
+				if rtm[k] == "" {
+					log.Println(t.Resource.Type, k, rtm, t.Resource.Labels)
+				}
+			}
+			for k, _ := range rtm {
+				if t.Resource.Labels[k] == "" {
+					log.Println(t.Resource.Type, k, rtm, t.Resource.Labels)
+				}
+			}
+		}
+	}
+
+	return resp.TimeSeries, nil
+}

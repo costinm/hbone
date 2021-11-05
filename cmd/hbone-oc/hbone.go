@@ -23,17 +23,15 @@ import (
 	"github.com/costinm/hbone"
 	"github.com/costinm/hbone/tcpproxy"
 
+	ocprom "contrib.go.opencensus.io/exporter/prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	ocprom "contrib.go.opencensus.io/exporter/prometheus"
 
 	"go.opencensus.io/plugin/ochttp"
 	"go.opencensus.io/plugin/runmetrics"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/zpages"
-
 )
-
 
 func init() {
 	if err := view.Register(ochttp.DefaultServerViews...); err != nil {
@@ -57,7 +55,6 @@ func init() {
 	}
 	view.RegisterExporter(exporter)
 }
-
 
 // Same as hbone-min, plus OpenCensus instrumentation
 // Used for testing size impact of OC as well as perf testing, as client (-L )
@@ -83,7 +80,7 @@ func main() {
 	connectorAddr := "127.0.0.1:15009"
 	lp := ":12001"
 	rp := ":12002"
-	if len(os.Args) > 1  {
+	if len(os.Args) > 1 {
 		dest = os.Args[0]
 	}
 	go func() {
