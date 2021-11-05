@@ -26,30 +26,13 @@ import (
 	"github.com/costinm/hbone"
 	"github.com/costinm/hbone/tcpproxy"
 
-	"github.com/costinm/krun/pkg/gcp"
 	"github.com/costinm/krun/pkg/mesh"
 	"github.com/costinm/krun/pkg/sts"
-	"github.com/costinm/krun/third_party/istio/istioca"
-	"github.com/costinm/krun/third_party/istio/meshca"
 )
 
 var (
-	//localForwards arrayFlags
-	localForward  = flag.String("L", "", "Local port, if set connections to this port will be forwarded to the mesh service")
-
-	//mesh  = flag.String("mesh", "", "Mesh Environment - URL or path to mesh environment spec. If empty, mesh will be autodetected")
+	localForward = flag.String("L", "", "Local port, if set connections to this port will be forwarded to the mesh service")
 )
-
-type arrayFlags []string
-
-func (i *arrayFlags) String() string {
-	return strings.Join(*i, ",")
-}
-
-func (i *arrayFlags) Set(value string) error {
-	*i = append(*i, value)
-	return nil
-}
 
 // Create a HBONE tunnel, using K8S credentials and config.
 //
@@ -68,8 +51,6 @@ func main() {
 	flag.Parse()
 
 	kr := mesh.New("")
-
-	kr.VendorInit = gcp.InitGCP
 
 	ctx, cf := context.WithTimeout(context.Background(), 10000*time.Second)
 	defer cf()
@@ -95,14 +76,6 @@ func main() {
 	// fmt.Fprintln(os.Stderr, "Starting ", kr)
 	// TODO: move to library, possibly to separate CLI (authtool ?)
 	// Hbone 'base' should just use the mesh cert files, call tool or expect cron to renew
-	if false {
-		priv, csr, err := auth.NewCSR("rsa", kr.TrustDomain, "spiffe://"+kr.TrustDomain+"/ns/"+kr.Namespace+"/sa/"+kr.KSA)
-		if err != nil {
-			log.Fatal("Failed to find mesh certificates ", err)
-		}
-
-		InitMeshCert(kr, auth, csr, priv, tokenProvider)
-	}
 
 	hb := hbone.New(auth)
 
@@ -111,7 +84,7 @@ func main() {
 	hb.TokenCallback = tcache.Token
 
 	if kr.MeshConnectorAddr != "" {
-		go tcpproxy.RemoteForwardPort("", hb, kr.MeshConnectorAddr + ":15441", kr.Namespace, kr.Name)
+		go tcpproxy.RemoteForwardPort("", hb, kr.MeshConnectorAddr+":15441", kr.Namespace, kr.Name)
 	}
 	if *localForward != "" {
 		parts := strings.SplitN(*localForward, ":", 2)
@@ -119,7 +92,7 @@ func main() {
 			log.Fatal("Expecting 2 parts" + *localForward)
 		}
 		dest := parts[1]
-		go tcpproxy.LocalForwardPort("127.0.0.1:"+ parts[0], dest, hb, kr.MeshConnectorAddr, auth)
+		go tcpproxy.LocalForwardPort("127.0.0.1:"+parts[0], dest, hb, kr.MeshConnectorAddr, auth)
 
 		select {}
 	}
@@ -134,42 +107,5 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error forwarding ", err)
 		log.Fatal(err)
-	}
-}
-
-func InitMeshCert(kr *mesh.KRun, auth *hbone.Auth, csr []byte, priv []byte, tokenProvider *sts.STS) {
-	if kr.CitadelRoot != "" && kr.MeshConnectorAddr != "" {
-		auth.AddRoots([]byte(kr.CitadelRoot))
-
-		cca, err := istioca.NewCitadelClient(&istioca.Options{
-			TokenProvider: &mesh.IstiodCredentialsProvider{KRun: kr},
-			CAEndpoint:    kr.MeshConnectorAddr + ":15012",
-			TrustedRoots:  auth.TrustedCertPool,
-			CAEndpointSAN: "istiod.istio-system.svc",
-		})
-		if err != nil {
-			log.Fatal(err)
-		}
-		chain, err := cca.CSRSign(csr, 24*3600)
-
-		//log.Println(chain, err)
-		err = auth.SetKeysPEM(priv, chain)
-		if err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		// TODO: Use MeshCA if citadel is not in cluster
-
-		mca, err := meshca.NewGoogleCAClient("", tokenProvider)
-		chain, err := mca.CSRSign(csr, 24*3600)
-
-		if err != nil {
-			log.Fatal(err)
-		}
-		//log.Println(chain, priv)
-		err = auth.SetKeysPEM(priv, chain)
-		if err != nil {
-			log.Fatal(err)
-		}
 	}
 }

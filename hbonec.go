@@ -57,7 +57,7 @@ type Endpoint struct {
 	H2Gate string
 
 	// TODO: multiple per endpoint
-	tlsCon *tls.Conn
+	tlsCon net.Conn
 	rt     http.RoundTripper // *http2.ClientConn //
 }
 
@@ -185,7 +185,21 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 		host, port, _ := net.SplitHostPort(h)
 
 		// Expect system certificates.
-		if port == "443" || port == "" {
+		if r.URL.Scheme == "http" {
+			d := &net.Dialer{}
+
+			dialHost := r.URL.Host
+			if port == "" {
+				dialHost = net.JoinHostPort(dialHost, "80")
+			}
+			nConn, err := d.DialContext(ctx, "tcp", dialHost)
+			if err != nil {
+				return err
+			}
+
+			hc.tlsCon = nConn
+
+		} else if port == "443" || port == "" {
 			d := tls.Dialer{
 				Config: &tls.Config{
 					NextProtos: []string{"h2"},
