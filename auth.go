@@ -1,6 +1,7 @@
 package hbone
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -27,6 +28,7 @@ const (
 	blockTypePKCS8PrivateKey = "PRIVATE KEY"     // PKCS#8 plain private key
 )
 
+// Auth represents a workload identity and associated info required for minimal Istio-compatible security.
 type Auth struct {
 	// Will attempt to load certificates from this directory, defaults to
 	// "./var/run/secrets/istio.io/"
@@ -51,6 +53,7 @@ type Auth struct {
 	Namespace string
 	SA        string
 
+	// Additional namespaces to allow access from. By default 'same namespace' and 'istio-system' are allowed.
 	AllowedNamespaces []string
 
 	// Trusted roots
@@ -59,31 +62,33 @@ type Auth struct {
 	// This can also be done by krun - loading a config map with same info.
 	TrustedCertPool *x509.CertPool
 
+	// GetCertificateHook allows plugging in an alternative certificate provider. By default files are used.
 	GetCertificateHook func(host string) (*tls.Certificate, error)
 }
 
-// NewAuthFromDir will load the credentials and create an Auth object.
+// NewAuth creates the auth object.
+// SetKeyPEM
+func NewAuth() *Auth {
+	a := &Auth{
+		TrustedCertPool: x509.NewCertPool(),
+	}
+	return a
+}
+
+// Will load the credentials and create an Auth object.
 //
 // This uses pilot-agent or some other platform tool creating ./var/run/secrets/istio.io/{key,cert-chain}.pem
 //
 //
 // TODO: ./etc/certs support: krun should copy the files, for consistency (simper code for frameworks).
 // TODO: periodic reload
-func NewAuthFromDir(dir string) (*Auth, error) {
-	a := NewAuth()
+func (a *Auth) SetKeysDir(dir string) error {
 	a.CertDir = dir
 	err := a.waitAndInitFromDir()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return a, nil
-}
-
-func NewAuth() *Auth {
-	a := &Auth{
-		TrustedCertPool: x509.NewCertPool(),
-	}
-	return a
+	return nil
 }
 
 func (a *Auth) SetKeysPEM(privatePEM []byte, chainPEM []string) error {
@@ -92,14 +97,19 @@ func (a *Auth) SetKeysPEM(privatePEM []byte, chainPEM []string) error {
 	if err != nil {
 		return err
 	}
-	a.Cert = &tlsCert
 	if tlsCert.Certificate == nil || len(tlsCert.Certificate) == 0 {
 		return errors.New("missing certificate")
 	}
 
+	return a.SetTLSCertificate(&tlsCert)
+}
+
+func (a *Auth) SetTLSCertificate(cert *tls.Certificate) error {
+	a.Cert = cert
 	a.initTLS()
 	return nil
 }
+
 func (a *Auth) leaf() *x509.Certificate {
 	if a.Cert == nil {
 		return nil
@@ -110,7 +120,11 @@ func (a *Auth) leaf() *x509.Certificate {
 	return a.Cert.Leaf
 }
 
-func (a *Auth) GetCertificate(host string) (*tls.Certificate, error) {
+// GetCertificate is typically called during handshake, both server and client.
+// "sni" will be empty for client certificates, and set for server certificates - if not set, workload id is returned.
+//
+// ctx is the handshake context - may include additional metadata about the operation.
+func (a *Auth) GetCertificate(ctx context.Context, sni string) (*tls.Certificate, error) {
 	// TODO: if host != "", allow returning DNS certs for the host.
 	// Default (and currently only impl) is to return the spiffe cert
 	// May refresh.
@@ -134,7 +148,7 @@ func (a *Auth) GetCertificate(host string) (*tls.Certificate, error) {
 	}
 
 	if a.GetCertificateHook != nil {
-		c, err := a.GetCertificateHook(host)
+		c, err := a.GetCertificateHook(sni)
 		if err != nil {
 			return nil, err
 		}
@@ -177,8 +191,28 @@ func (a *Auth) waitAndInitFromDir() error {
 	if err != nil {
 		return err
 	}
+
+	err = a.initFromDir()
+	if err != nil {
+		return err
+	}
+
+	time.AfterFunc(30*time.Minute, a.initFromDirPeriodic)
+	return nil
+}
+
+func (a *Auth) initFromDirPeriodic() {
+	err := a.initFromDir()
+	if err != nil {
+		log.Println("certRefresh", err)
+	}
+	time.AfterFunc(30*time.Minute, a.initFromDirPeriodic)
+}
+
+func (a *Auth) initFromDir() error {
+
 	if a.Cert == nil {
-		_, err := a.GetCertificate("")
+		_, err := a.GetCertificate(context.Background(), "")
 		if err != nil {
 			return err
 		}
@@ -225,6 +259,7 @@ func (a *Auth) waitAndInitFromDir() error {
 	return nil
 }
 
+// Extract the trustDomain, namespace and SA from a spiffee certificate
 func (a *Auth) Spiffee() (*url.URL, string, string, string) {
 	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
 	if err != nil {
@@ -243,10 +278,6 @@ func (a *Auth) Spiffee() (*url.URL, string, string, string) {
 func (a *Auth) ID() string {
 	su, _, _, _ := a.Spiffee()
 	return su.String()
-}
-
-func (a *Auth) setSpiffe() {
-	_, a.TrustDomain, a.Namespace, a.SA = a.Spiffee()
 }
 
 func (a *Auth) String() string {
@@ -331,8 +362,9 @@ func (a *Auth) AddRoots(rootCertPEM []byte) error {
 	return nil
 }
 
+// initTLS initializes the MeshTLSConfig with the workload certificate
 func (a *Auth) initTLS() {
-	a.setSpiffe()
+	_, a.TrustDomain, a.Namespace, a.SA = a.Spiffee()
 	a.MeshTLSConfig = &tls.Config{
 		//MinVersion: tls.VersionTLS13,
 		//PreferServerCipherSuites: ugate.preferServerCipherSuites(),
@@ -340,11 +372,11 @@ func (a *Auth) initTLS() {
 		ClientAuth:         tls.RequestClientCert, // not require - we'll fallback to JWT
 
 		GetCertificate: func(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return a.GetCertificate(ch.ServerName)
+			return a.GetCertificate(ch.Context(), ch.ServerName)
 		},
 
-		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			return a.GetCertificate("")
+		GetClientCertificate: func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return a.GetCertificate(cri.Context(), "")
 		},
 
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -505,6 +537,7 @@ func CertTemplate(org string, sans ...string) *x509.Certificate {
 }
 
 // CA is used as an internal CA, mainly for testing.
+// Roughly equivalent with a simplified Istio Citadel.
 type CA struct {
 	ca          *rsa.PrivateKey
 	CACert      *x509.Certificate
@@ -521,17 +554,12 @@ func NewCA(trust string) *CA {
 }
 
 func (ca *CA) NewID(ns, sa string) *Auth {
-	nodeID := &Auth{
-		TrustDomain: ca.TrustDomain,
-		Namespace:   ns,
-		SA:          sa,
-	}
+	nodeID := NewAuth()
 	caCert := ca.CACert
-	nodeID.Cert = ca.NewTLSCert(ns, sa)
+	crt := ca.NewTLSCert(ns, sa)
 
-	nodeID.TrustedCertPool = x509.NewCertPool()
 	nodeID.TrustedCertPool.AddCert(caCert)
-	nodeID.initTLS()
+	nodeID.SetTLSCertificate(crt)
 
 	return nodeID
 }
