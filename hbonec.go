@@ -28,12 +28,12 @@ func (c HBoneClient) NewEndpoint(url string) *Endpoint {
 
 // Endpoint is a client for a specific destination.
 type Endpoint struct {
-	hb *HBone
+	HBone *HBone
 
 	// Service addr - using the service name.
 	ServiceAddr string
 
-	// URL used to reach the H2 endpoint providing the proxy.
+	// URL used to reach the H2 endpoint providing the Proxy.
 	URL string
 
 	// MTLSConfig is a custom config to use for the inner connection - will enable mTLS over H2
@@ -48,7 +48,7 @@ type Endpoint struct {
 	// SNIGate is the endpoint address of a SNI gate. It can be a normal Istio SNI, a SNI to HBone or other protocols,
 	// or a H2R gate.
 	// If empty, the endpoint will use the URL and HBone protocol directly.
-	// If set, the endpoint will use the nomal in-cluster Istio protocol.
+	// If set, the endpoint will use the normal in-cluster Istio protocol.
 	SNIGate string
 
 	// H2Gate is the endpoint of a HTTP/2 gateway. Will be used to dial.
@@ -71,7 +71,7 @@ func (hb *HBone) NewClient(service string) *HBoneClient {
 // to isolate XDS or discovery dependency.
 //
 func (hb *HBone) NewEndpoint(urlOrHost string) *Endpoint {
-	hc := &Endpoint{hb: hb}
+	hc := &Endpoint{HBone: hb}
 
 	if !strings.HasPrefix(urlOrHost, "https://") {
 
@@ -89,7 +89,7 @@ func (hb *HBone) NewEndpoint(urlOrHost string) *Endpoint {
 	return hc
 }
 
-// Proxy will proxy in/out (plain text) to a remote service, using mTLS tunnel over H2 POST.
+// Proxy will Proxy in/out (plain text) to a remote service, using mTLS tunnel over H2 POST.
 // used for testing.
 func (hb *HBone) Proxy(svc string, hbURL string, stdin io.ReadCloser, stdout io.WriteCloser, innerTLS *tls.Config) error {
 	c := hb.NewEndpoint(hbURL)
@@ -106,7 +106,7 @@ func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error)
 	}
 
 	// Using the low-level interface, to keep control over TLS.
-	conf := hc.hb.Auth.MeshTLSConfig.Clone()
+	conf := hc.HBone.Auth.GenerateTLSConfigClient(addr) //MeshTLSConfig.Clone()
 
 	if hc.SNI != "" {
 		conf.ServerName = hc.SNI
@@ -120,7 +120,7 @@ func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error)
 
 	tlsCon := tls.Client(conn, conf)
 
-	err = HandshakeTimeout(tlsCon, hc.hb.HandsahakeTimeout, conn)
+	err = HandshakeTimeout(tlsCon, hc.HBone.HandsahakeTimeout, conn)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +130,7 @@ func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error)
 
 func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteCloser) error {
 	if hc.SNIGate != "" {
-		return hc.sniProxy(ctx, stdin, stdout)
+		return SNIProxy(ctx, hc, stdin, stdout)
 	}
 
 	t0 := time.Now()
@@ -146,13 +146,13 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 
 	var rt = hc.rt
 
-	if hc.hb.TokenCallback != nil {
+	if hc.HBone.TokenCallback != nil {
 		h := r.URL.Host
 		if strings.Contains(h, ":") && h[0] != '[' {
 			hn, _, _ := net.SplitHostPort(h)
 			h = hn
 		}
-		t, err := hc.hb.TokenCallback(ctx, "https://"+h)
+		t, err := hc.HBone.TokenCallback(ctx, "https://"+h)
 		if err != nil {
 			log.Println("Failed to get token, attempt unauthenticated", err)
 		} else {
@@ -168,7 +168,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 					AllowHTTP: true,
 					// Pretend we are dialing a TLS endpoint.
 					// Note, we ignore the passed tls.Config
-					DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+					DialTLS: func(network, addr string, cfg *tls.Config) (net.Stream, error) {
 						return net.Dial(network, addr)
 					},
 				},
@@ -243,13 +243,13 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 			// TODO: check the SANs have been verified by TLSConfig call.
 		}
 
-		rt, err = hc.hb.h2t.NewClientConn(hc.tlsCon)
+		rt, err = hc.HBone.h2t.NewClientConn(hc.tlsCon)
 		if err != nil {
 			return err
 		}
 
-		if hc.hb.Transport != nil {
-			rt = hc.hb.Transport(rt)
+		if hc.HBone.Transport != nil {
+			rt = hc.HBone.Transport(rt)
 		}
 		hc.rt = rt
 	}
@@ -282,7 +282,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 	} else {
 		// Do the mTLS handshake for the tunneled connection
 		tlsTun := tls.Client(&HTTPConn{acceptedConn: hc.tlsCon, r: res.Body, w: o}, hc.MTLSConfig)
-		err = HandshakeTimeout(tlsTun, hc.hb.HandsahakeTimeout, nil)
+		err = HandshakeTimeout(tlsTun, hc.HBone.HandsahakeTimeout, nil)
 		if err != nil {
 			return err
 		}

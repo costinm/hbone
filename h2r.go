@@ -31,9 +31,9 @@ func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error)
 		backoff := 50 * time.Millisecond
 		for {
 			t0 := time.Now()
-			hc.hb.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
+			hc.HBone.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
 				//Context:    ctx,
-				Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.hb},
+				Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.HBone},
 				BaseConfig: &http.Server{},
 			})
 			if Debug {
@@ -75,7 +75,7 @@ func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 		return
 	}
 
-	ok, err := hb.handleH2R(conn, s, sni)
+	ok, err := hb.HandleH2R(conn, s, sni)
 	if err != nil {
 		log.Println("SNI-H2R 500", sni, err)
 		return
@@ -86,7 +86,7 @@ func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 	}
 }
 
-func (hb *HBone) handleH2R(conn net.Conn, s *BufferReader, sni string) (bool, error) {
+func (hb *HBone) HandleH2R(conn net.Conn, s *BufferReader, sni string) (bool, error) {
 	if strings.HasPrefix(sni, "outbound_.") {
 
 	}
@@ -160,7 +160,7 @@ func (hb *HBone) MarkDead(conn *http2.ClientConn) {
 }
 
 func (hb *HBone) HandlerH2RConn(conn net.Conn) {
-	conf := hb.Auth.MeshTLSConfig
+	conf := hb.Auth.GenerateTLSConfigServer()
 
 	tls := tls.Server(conn, conf)
 
@@ -206,7 +206,7 @@ func (hb *HBone) HandlerH2RConn(conn net.Conn) {
 	}
 	// TODO: track the active connections in hb, for close purpose.
 
-	// Conn remains open
+	// Stream remains open
 }
 
 type H2RConn struct {

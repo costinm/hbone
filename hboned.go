@@ -18,13 +18,18 @@ import (
 	"golang.org/x/net/http2"
 )
 
+type Auth interface {
+	GenerateTLSConfigServer() *tls.Config
+	GenerateTLSConfigClient(name string) *tls.Config
+}
+
 // HBone represents a node using a HTTP/2 or HTTP/3 based overlay network environment.
 //
 // Each HBone node has a Istio (spiffee) certificate.
 //
 // HBone can be used as a client, server or gateway.
 type HBone struct {
-	Auth *Auth
+	Auth Auth
 
 	h2Server *http2.Server
 	Cert     *tls.Certificate
@@ -71,7 +76,7 @@ type HBone struct {
 }
 
 // New creates a new HBone node. It requires a workload identity, including mTLS certificates.
-func New(auth *Auth) *HBone {
+func New(auth Auth) *HBone {
 	// Need to set this to allow timeout on the read header
 	h1 := &http.Transport{
 		ExpectContinueTimeout: 3 * time.Second,
@@ -87,7 +92,7 @@ func New(auth *Auth) *HBone {
 		H2RConn:   map[*http2.ClientConn]string{},
 		TcpAddr:   "127.0.0.1:8080",
 		h2t:       h2,
-		Ports: 		 map[string]string{},
+		Ports:     map[string]string{},
 		//&http2.Transport{
 		//	ReadIdleTimeout: 10000 * time.Second,
 		//	StrictMaxConcurrentStreams: false,
@@ -123,7 +128,7 @@ type HBoneAcceptedConn struct {
 //
 
 func (hb *HBone) HandleAcceptedH2(conn net.Conn) {
-	conf := hb.Auth.MeshTLSConfig
+	conf := hb.Auth.GenerateTLSConfigServer()
 	defer conn.Close()
 	tls := tls.Server(conn, conf)
 
@@ -167,7 +172,7 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// TODO: parse Envoy / hbone headers.
 	w.(http.Flusher).Flush()
 
-	// TCP proxy for SSH ( no mTLS, SSH has its own equivalent)
+	// TCP Proxy for SSH ( no mTLS, SSH has its own equivalent)
 	if r.RequestURI == "/_hbone/22" {
 		proxyErr = hac.hb.HandleTCPProxy(w, r.Body, "localhost:15022")
 		return
@@ -182,8 +187,8 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if r.RequestURI == "/_hbone/mtls" {
-		// Create a stream, used for proxy with caching.
-		conf := hac.hb.Auth.MeshTLSConfig
+		// Create a stream, used for Proxy with caching.
+		conf := hac.hb.Auth.GenerateTLSConfigServer()
 
 		tls := tls.Server(&HTTPConn{r: r.Body, w: w, acceptedConn: hac.conn}, conf)
 
@@ -204,7 +209,7 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		hac.hb.HandleTCPProxy(tls, tls, hac.hb.TcpAddr)
 		//if tls.ConnectionState().NegotiatedProtocol == "h2" {
 		//	// http2 and http expect a net.Listener, and do their own accept()
-		//	hb.proxy.ServeConn(
+		//	hb.Proxy.ServeConn(
 		//		tls,
 		//		&http2.ServeConnOpts{
 		//			Handler: http.HandlerFunc(l.ug.H2Handler.httpHandleHboneCHTTP),
@@ -223,8 +228,8 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// This is not a tunnel, but regular request. For test only - should be off once mTLS
-	// works properly.
+	// Make sure xfcc header is removed
+	r.Header.Del("x-forwarded-client-cert")
 	hac.hb.rp.ServeHTTP(w, r)
 }
 

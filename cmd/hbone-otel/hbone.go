@@ -17,12 +17,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 
 	"github.com/costinm/hbone"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"github.com/costinm/hbone/tcpproxy"
+	"github.com/costinm/hbone/otel"
 )
 
 // Same as hbone-min, plus OpenCensus instrumentation
@@ -30,12 +29,8 @@ import (
 func main() {
 	auth := hbone.NewAuth()
 	hb := hbone.New(auth)
-	hb.Transport = func(t http.RoundTripper) http.RoundTripper {
-		return otelhttp.NewTransport(t)
-	}
-	hb.HandlerWrapper = func(h http.Handler) http.Handler {
-		return otelhttp.NewHandler(h, "/hbone")
-	}
+
+	otel.OTelEnable(hb)
 
 	dest := "127.0.0.1:15008"
 	connectorAddr := "127.0.0.1:15009"

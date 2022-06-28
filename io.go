@@ -34,8 +34,7 @@ type CloseWriter interface {
 
 var streamIDs int64 = 0
 
-// Stream wraps a reader/writer.
-// It is used to proxy.
+// Stream wraps a reader/writer
 type Stream struct {
 	Written int64
 	Err     error
@@ -45,20 +44,20 @@ type Stream struct {
 	Dst io.Writer
 	ID  string
 
-	// Dest is set to the proxy destination.
+	// Dest is set to the Proxy destination.
 	Dest string
 	// DestAddr is set if the address has been resolved.
 	// For SOCKS5 - it's set if the caller resolved the IP.
 	// For Iptables or TUN - it's the VIP or IP from the network.
 	// nil if the protocol is only using Dest.
-	DestAddr        *net.TCPAddr
+	DestAddr *net.TCPAddr
 
 	// If the stream is proxied, this method should be called after
 	// 'Dial' or equivalent is called.
 	PostDialHandler func(conn net.Conn, err error)
 }
 
-func proxy(ctx context.Context, cin io.Reader, cout io.WriteCloser, sin io.Reader, sout io.WriteCloser) error {
+func Proxy(ctx context.Context, cin io.Reader, cout io.WriteCloser, sin io.Reader, sout io.WriteCloser) error {
 	ch := make(chan int)
 	s1 := Stream{
 		ID:  "client-o",
@@ -95,7 +94,7 @@ func (s Stream) CopyBuffered(ch chan int, close bool) {
 
 	//st := Stream{}
 
-	// For netstack: src is a gonet.Conn, doesn't implement WriterTo. Dst is a net.TcpConn - and implements ReadFrom.
+	// For netstack: src is a gonet.Stream, doesn't implement WriterTo. Dst is a net.TcpConn - and implements ReadFrom.
 	// CopyBuffered is the actual implementation of Copy and CopyBuffer.
 	// if buf is nil, one is allocated.
 	// Duplicated from io
@@ -284,16 +283,6 @@ func HandshakeTimeout(tlsConn *tls.Conn, d time.Duration, plainConn net.Conn) er
 	return nil
 }
 
-func ListenAndServeTCP(addr string, f func(conn net.Conn)) (net.Listener, error) {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
-	go ServeListener(listener, f)
-	return listener, nil
-}
-
 func ServeListener(l net.Listener, f func(conn net.Conn)) error {
 	for {
 		remoteConn, err := l.Accept()
@@ -346,7 +335,7 @@ func (s *BufferReader) Fill(i int) ([]byte, error) {
 }
 
 func (b *BufferReader) Size() int {
-	if b== nil {
+	if b == nil {
 		return 0
 	}
 	return b.rend - b.roff

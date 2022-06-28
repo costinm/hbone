@@ -8,14 +8,14 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 )
 
 // Will start a SNI proxy, similar with Istio East-West or Gateway SNI router.
 // Accepted connections will decode the ServerName header, and use it to forward to either a HBONE
 // mTLS service or a H2R connection.
-//
 
-func (hc *Endpoint) sniProxy(ctx context.Context, stdin io.Reader, stdout io.WriteCloser) error {
+func SNIProxy(ctx context.Context, hc *Endpoint, stdin io.Reader, stdout io.WriteCloser) error {
 	d := net.Dialer{} // TODO: customizations
 
 	conn, err := d.DialContext(ctx, "tcp", hc.SNIGate)
@@ -27,22 +27,22 @@ func (hc *Endpoint) sniProxy(ctx context.Context, stdin io.Reader, stdout io.Wri
 	}
 
 	// Using the low-level interface, to keep control over TLS.
-	conf := hc.hb.Auth.MeshTLSConfig.Clone()
+	conf := hc.HBone.Auth.GenerateTLSConfigClient(hc.SNI)
 
 	conf.ServerName = hc.SNI
 
 	defer conn.Close()
 
 	tlsCon := tls.Client(conn, conf)
-	err = HandshakeTimeout(tlsCon, hc.hb.HandsahakeTimeout, nil)
+	err = HandshakeTimeout(tlsCon, hc.HBone.HandsahakeTimeout, nil)
 	if err != nil {
 		return err
 	}
 
-	return proxy(ctx, stdin, stdout, tlsCon, tlsCon)
+	return Proxy(ctx, stdin, stdout, tlsCon, tlsCon)
 }
 
-func (hb *HBone) HandleSNIConn(conn net.Conn) {
+func HandleSNIConn(hb *HBone, conn net.Conn) {
 	s := NewBufferReader(conn)
 	// will also close the conn ( which is the reader )
 	defer s.Close()
@@ -53,7 +53,7 @@ func (hb *HBone) HandleSNIConn(conn net.Conn) {
 		return
 	}
 
-	ok, err := hb.handleH2R(conn, s, sni)
+	ok, err := hb.HandleH2R(conn, s, sni)
 	if err != nil {
 		log.Println("SNI-H2R 500", sni, err)
 	}
@@ -66,11 +66,21 @@ func (hb *HBone) HandleSNIConn(conn net.Conn) {
 	if hb.EndpointResolver != nil {
 		dst := hb.EndpointResolver(sni)
 		if dst != nil {
+			if Debug {
+				log.Println("SNI: start proxy", "sni", sni, "URL", dst.URL)
+			}
+			t0 := time.Now()
 			err = dst.Proxy(context.Background(), s, conn)
 			if err != nil {
-				log.Println("SNI: error connecting to proxy", sni, err)
+				log.Println("SNI: error connecting to proxy", "sni", sni, "error", err, "URL", dst.URL)
+			} else {
+				log.Println("SNI:done", "sni", sni, "URL", dst.URL, "dur", time.Since(t0))
 			}
+		} else {
+			log.Println("SNI: Missing destination", "sni", sni)
 		}
+	} else {
+		log.Println("SNI: Missing EndpointResolver", "sni", sni)
 	}
 }
 

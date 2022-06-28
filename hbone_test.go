@@ -5,24 +5,38 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/costinm/hbone/auth"
 	"github.com/costinm/hbone/echo"
 )
+
+func listenAndServeTCP(addr string, f func(conn net.Conn)) (net.Listener, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	go ServeListener(listener, f)
+	return listener, nil
+}
 
 // WIP
 func TestHBone(t *testing.T) {
 	// New self-signed root CA
-	ca := NewCA("cluster.local")
+	ca := auth.NewCA("cluster.local")
 
-	alice := New(ca.NewID("alice", "default"))
-	alice.Auth.AllowedNamespaces = []string{"*"}
+	aliceID := ca.NewID("alice", "default")
+	alice := New(aliceID)
+	aliceID.AllowedNamespaces = []string{"*"}
 
-	bob := New(ca.NewID("bob", "default"))
-	bob.Auth.AllowedNamespaces = []string{"*"}
-	l, err := ListenAndServeTCP(":0", bob.HandleAcceptedH2)
+	bobID := ca.NewID("bob", "default")
+	bob := New(bobID)
+	bobID.AllowedNamespaces = []string{"*"}
+	l, err := listenAndServeTCP(":0", bob.HandleAcceptedH2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +68,7 @@ func TestHBone(t *testing.T) {
 		rin, lout := io.Pipe()
 		lin, rout := io.Pipe()
 		go func() {
-			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.MeshTLSConfig)
+			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.GenerateTLSConfigServer())
 
 			//err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/tcp", rin, rout, nil)
 			if err != nil {
@@ -77,7 +91,7 @@ func TestHBone(t *testing.T) {
 
 	// Evie opens hbone to TCP connection to bob's echo server.
 	t.Run("invalid-root", func(t *testing.T) {
-		evieca := NewCA("cluster.local")
+		evieca := auth.NewCA("cluster.local")
 
 		evie := New(evieca.NewID("alice", "default"))
 
@@ -91,9 +105,9 @@ func TestHBone(t *testing.T) {
 	})
 
 	t.Run("invalid-trust", func(t *testing.T) {
-		evieca := NewCA("notcluster.local")
+		evieca := auth.NewCA("notcluster.local")
 		// Using the same root CA as bob/alice
-		evieca.ca = ca.ca
+		evieca.Private = ca.Private
 		evieca.CACert = ca.CACert
 
 		evie := New(evieca.NewID("alice", "default"))
@@ -116,7 +130,7 @@ func TestHBone(t *testing.T) {
 		}
 		bob.Mux.HandleFunc("/_hbone/serverFirst", func(w http.ResponseWriter, r *http.Request) {
 			err := bob.HandleTCPProxy(w, r.Body, ehSFL.Addr().String())
-			log.Println("hbone serverFirst proxy done ", r.RequestURI, err)
+			log.Println("hbone serverFirst Proxy done ", r.RequestURI, err)
 		})
 
 		rin, lout := io.Pipe()
@@ -148,7 +162,7 @@ func TestHBone(t *testing.T) {
 		rin, lout := io.Pipe()
 		lin, rout := io.Pipe()
 		go func() {
-			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.MeshTLSConfig)
+			err = alice.Proxy("default.bob:8080", "https://"+bobHBAddr+"/_hbone/mtls", rin, rout, alice.Auth.GenerateTLSConfigServer())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -157,11 +171,14 @@ func TestHBone(t *testing.T) {
 	})
 
 	// SNI and H2R gate
-	gate := New(ca.NewID("gate", "default"))
-	gate.Auth.AllowedNamespaces = []string{"*"}
+	gateID := ca.NewID("gate", "default")
+	gate := New(gateID)
+	gateID.AllowedNamespaces = []string{"*"}
 
 	t.Run("sni-alice-gate-bob", func(t *testing.T) {
-		gateSNIL, err := ListenAndServeTCP(":0", gate.HandleSNIConn)
+		gateSNIL, err := listenAndServeTCP(":0", func(conn net.Conn) {
+			HandleSNIConn(gate, conn)
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -189,11 +206,11 @@ func TestHBone(t *testing.T) {
 	})
 
 	t.Run("sni-h2r-alice-gate-bob", func(t *testing.T) {
-		gateH2RL, err := ListenAndServeTCP(":0", gate.HandlerH2RConn)
+		gateH2RL, err := listenAndServeTCP(":0", gate.HandlerH2RConn)
 		if err != nil {
 			t.Fatal(err)
 		}
-		gateH2RSNIL, err := ListenAndServeTCP(":0", gate.HandleH2RSNIConn)
+		gateH2RSNIL, err := listenAndServeTCP(":0", gate.HandleH2RSNIConn)
 		if err != nil {
 			t.Fatal(err)
 		}

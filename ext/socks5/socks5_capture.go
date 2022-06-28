@@ -1,4 +1,4 @@
-package hbone
+package socks5
 
 import (
 	"encoding/binary"
@@ -75,8 +75,7 @@ const (
 type Socks struct {
 }
 
-
-func  HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err error) {
+func HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err error) {
 	// Fill the read buffer with one Read.
 	// Typically 3-4 bytes unless client is eager.
 
@@ -93,8 +92,8 @@ func  HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err
 	// Server: 0x05 0x00
 	off := 1
 	sz := int(head[off])
-	off++ // 2
-	if len(head) < off + sz{ // if it only read 2, probably malicious - 2 < 2 + 1
+	off++                   // 2
+	if len(head) < off+sz { // if it only read 2, probably malicious - 2 < 2 + 1
 		head, err = br.Fill(off + sz)
 		if err != nil {
 			return false, err
@@ -105,7 +104,7 @@ func  HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err
 	w.Write([]byte{5, 0})
 
 	// We may have bytes in the buffer, in case sender didn't wait
-	if len(head) <= off  + 6 {
+	if len(head) <= off+6 {
 		head, err = br.Fill(off + sz)
 		if err != nil {
 			return false, err
@@ -122,37 +121,37 @@ func  HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err
 	off++
 	off++ // rsvd
 
-	atyp := head[off + 3]
+	atyp := head[off+3]
 	off++
 
-	destName :=  ""
+	destName := ""
 	var destIP []byte
 	// off should be 3 or 4
 	switch atyp {
-		case 1:
-			if len(head) <= off + 6 {
-				head, err = br.Fill(off + 6)
-			}
-			destIP = 	make([]byte, 4)
-			copy(destIP, head[off:off+4])
-			off += 4
-	case 4:
-			if len(head) <= off + 18 {
-				head, err = br.Fill(off + 18)
-			}
-			destIP = 	make([]byte, 16)
-			copy(destIP, head[off:off+16])
-			off += 16
-
-		case 3:
-			dlen := int(head[off])
-			off++
-			if len(head) <= off + dlen + 2 {
-				head, err = br.Fill(off + dlen + 2)
-			}
-			destName = string(head[off:off+dlen])
-			off += dlen
+	case 1:
+		if len(head) <= off+6 {
+			head, err = br.Fill(off + 6)
 		}
+		destIP = make([]byte, 4)
+		copy(destIP, head[off:off+4])
+		off += 4
+	case 4:
+		if len(head) <= off+18 {
+			head, err = br.Fill(off + 18)
+		}
+		destIP = make([]byte, 16)
+		copy(destIP, head[off:off+16])
+		off += 16
+
+	case 3:
+		dlen := int(head[off])
+		off++
+		if len(head) <= off+dlen+2 {
+			head, err = br.Fill(off + dlen + 2)
+		}
+		destName = string(head[off : off+dlen])
+		off += dlen
+	}
 	if err != nil {
 		return false, err
 	}
@@ -165,7 +164,7 @@ func  HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err
 	if atyp == 3 {
 		s.Dest = net.JoinHostPort(destName, strconv.Itoa(int(port)))
 	} else {
-		s.DestAddr= &net.TCPAddr{IP: destIP, Port: int(port)}
+		s.DestAddr = &net.TCPAddr{IP: destIP, Port: int(port)}
 		s.Dest = s.DestAddr.String()
 	}
 
@@ -181,7 +180,7 @@ func  HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err
 
 		localAddr := conn.LocalAddr()
 		tcpAddr := localAddr.(*net.TCPAddr)
-		r := make([]byte, len(tcpAddr.IP) + 6)
+		r := make([]byte, len(tcpAddr.IP)+6)
 		r[0] = 5
 		r[1] = 0 // success
 		r[2] = 0 // rsv
