@@ -22,9 +22,9 @@ import (
 	"testing"
 
 	"github.com/costinm/hbone"
+	"github.com/costinm/hbone/ext/gcp"
 	"github.com/costinm/hbone/ext/grpc"
-	"github.com/costinm/hbone/urest/gcp"
-	"github.com/costinm/hbone/urest/k8s"
+	"github.com/costinm/hbone/ext/k8s"
 	"github.com/costinm/ugate/auth"
 	istioca "github.com/costinm/ugate/gen/proto/istio/v1/auth"
 	"github.com/costinm/ugate/gen/proto/xds"

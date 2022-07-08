@@ -20,14 +20,15 @@ import (
 	"os"
 
 	"github.com/costinm/hbone"
-	"github.com/costinm/hbone/tcpproxy"
+	"github.com/costinm/hbone/auth"
+	"github.com/costinm/hbone/ext/tcpproxy"
 )
 
 // Redirect stdin/stdout to a TCP-over-Http2 destination, minimal auth.
 // This command is intended to find the binary size, compared with an empty go binary and
 // variants with more dependencies.
 func main() {
-	auth := hbone.NewAuth()
+	auth := auth.NewMeshAuth()
 	hb := hbone.New(auth)
 
 	dest := os.Args[0]
