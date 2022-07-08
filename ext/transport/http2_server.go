@@ -31,16 +31,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/costinm/hbone/ext/transport/grpcrand"
+	"github.com/costinm/hbone/ext/transport/grpcutil"
+	"github.com/costinm/hbone/ext/transport/syscall"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
-	"google.golang.org/grpc/internal/grpcutil"
-	"google.golang.org/grpc/internal/syscall"
+
+	//"google.golang.org/grpc/internal/syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/internal/channelz"
-	"google.golang.org/grpc/internal/grpcrand"
+	//"google.golang.org/grpc/internal/channelz"
+	//"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -117,7 +120,7 @@ type http2Server struct {
 	idle time.Time
 
 	// Fields below are for channelz metric collection.
-	channelzID *channelz.Identifier
+	//channelzID *channelz.Identifier
 	czData     *channelzData
 	bufferPool *bufferPool
 
@@ -280,7 +283,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		connBegin := &stats.ConnBegin{}
 		t.stats.HandleConn(t.ctx, connBegin)
 	}
-	t.channelzID, err = channelz.RegisterNormalSocket(t, config.ChannelzParentID, fmt.Sprintf("%s -> %s", t.remoteAddr, t.localAddr))
+	// t.channelzID, err = channelz.RegisterNormalSocket(t, config.ChannelzParentID, fmt.Sprintf("%s -> %s", t.remoteAddr, t.localAddr))
 	if err != nil {
 		return nil, err
 	}
@@ -562,10 +565,10 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		t.idle = time.Time{}
 	}
 	t.mu.Unlock()
-	if channelz.IsOn() {
-		atomic.AddInt64(&t.czData.streamsStarted, 1)
-		atomic.StoreInt64(&t.czData.lastStreamCreatedTime, time.Now().UnixNano())
-	}
+	//if channelz.IsOn() {
+	//	atomic.AddInt64(&t.czData.streamsStarted, 1)
+	//	atomic.StoreInt64(&t.czData.lastStreamCreatedTime, time.Now().UnixNano())
+	//}
 	s.requestRead = func(n int) {
 		t.adjustWindow(s, uint32(n))
 	}
@@ -1179,9 +1182,9 @@ func (t *http2Server) keepalive() {
 				return
 			}
 			if !outstandingPing {
-				if channelz.IsOn() {
-					atomic.AddInt64(&t.czData.kpCount, 1)
-				}
+				//if channelz.IsOn() {
+				//	atomic.AddInt64(&t.czData.kpCount, 1)
+				//}
 				t.controlBuf.put(p)
 				kpTimeoutLeft = t.kp.Timeout
 				outstandingPing = true
@@ -1217,7 +1220,7 @@ func (t *http2Server) Close() {
 	if err := t.conn.Close(); err != nil && logger.V(logLevel) {
 		logger.Infof("transport: error closing conn during Close: %v", err)
 	}
-	channelz.RemoveEntry(t.channelzID)
+	//channelz.RemoveEntry(t.channelzID)
 	// Cancel all active streams.
 	for _, s := range streams {
 		s.cancel()
@@ -1240,13 +1243,13 @@ func (t *http2Server) deleteStream(s *Stream, eosReceived bool) {
 	}
 	t.mu.Unlock()
 
-	if channelz.IsOn() {
-		if eosReceived {
-			atomic.AddInt64(&t.czData.streamsSucceeded, 1)
-		} else {
-			atomic.AddInt64(&t.czData.streamsFailed, 1)
-		}
-	}
+	//if channelz.IsOn() {
+	//	if eosReceived {
+	//		atomic.AddInt64(&t.czData.streamsSucceeded, 1)
+	//	} else {
+	//		atomic.AddInt64(&t.czData.streamsFailed, 1)
+	//	}
+	//}
 }
 
 // finishStream closes the stream and puts the trailing headerFrame into controlbuf.
@@ -1366,29 +1369,29 @@ func (t *http2Server) outgoingGoAwayHandler(g *goAway) (bool, error) {
 	return false, nil
 }
 
-func (t *http2Server) ChannelzMetric() *channelz.SocketInternalMetric {
-	s := channelz.SocketInternalMetric{
-		StreamsStarted:                   atomic.LoadInt64(&t.czData.streamsStarted),
-		StreamsSucceeded:                 atomic.LoadInt64(&t.czData.streamsSucceeded),
-		StreamsFailed:                    atomic.LoadInt64(&t.czData.streamsFailed),
-		MessagesSent:                     atomic.LoadInt64(&t.czData.msgSent),
-		MessagesReceived:                 atomic.LoadInt64(&t.czData.msgRecv),
-		KeepAlivesSent:                   atomic.LoadInt64(&t.czData.kpCount),
-		LastRemoteStreamCreatedTimestamp: time.Unix(0, atomic.LoadInt64(&t.czData.lastStreamCreatedTime)),
-		LastMessageSentTimestamp:         time.Unix(0, atomic.LoadInt64(&t.czData.lastMsgSentTime)),
-		LastMessageReceivedTimestamp:     time.Unix(0, atomic.LoadInt64(&t.czData.lastMsgRecvTime)),
-		LocalFlowControlWindow:           int64(t.fc.getSize()),
-		SocketOptions:                    channelz.GetSocketOption(t.conn),
-		LocalAddr:                        t.localAddr,
-		RemoteAddr:                       t.remoteAddr,
-		// RemoteName :
-	}
-	if au, ok := t.authInfo.(credentials.ChannelzSecurityInfo); ok {
-		s.Security = au.GetSecurityValue()
-	}
-	s.RemoteFlowControlWindow = t.getOutFlowWindow()
-	return &s
-}
+//func (t *http2Server) ChannelzMetric() *channelz.SocketInternalMetric {
+//	s := channelz.SocketInternalMetric{
+//		StreamsStarted:                   atomic.LoadInt64(&t.czData.streamsStarted),
+//		StreamsSucceeded:                 atomic.LoadInt64(&t.czData.streamsSucceeded),
+//		StreamsFailed:                    atomic.LoadInt64(&t.czData.streamsFailed),
+//		MessagesSent:                     atomic.LoadInt64(&t.czData.msgSent),
+//		MessagesReceived:                 atomic.LoadInt64(&t.czData.msgRecv),
+//		KeepAlivesSent:                   atomic.LoadInt64(&t.czData.kpCount),
+//		LastRemoteStreamCreatedTimestamp: time.Unix(0, atomic.LoadInt64(&t.czData.lastStreamCreatedTime)),
+//		LastMessageSentTimestamp:         time.Unix(0, atomic.LoadInt64(&t.czData.lastMsgSentTime)),
+//		LastMessageReceivedTimestamp:     time.Unix(0, atomic.LoadInt64(&t.czData.lastMsgRecvTime)),
+//		LocalFlowControlWindow:           int64(t.fc.getSize()),
+//		SocketOptions:                    channelz.GetSocketOption(t.conn),
+//		LocalAddr:                        t.localAddr,
+//		RemoteAddr:                       t.remoteAddr,
+//		// RemoteName :
+//	}
+//	if au, ok := t.authInfo.(credentials.ChannelzSecurityInfo); ok {
+//		s.Security = au.GetSecurityValue()
+//	}
+//	s.RemoteFlowControlWindow = t.getOutFlowWindow()
+//	return &s
+//}
 
 func (t *http2Server) IncrMsgSent() {
 	atomic.AddInt64(&t.czData.msgSent, 1)

@@ -31,8 +31,6 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"google.golang.org/grpc/internal/channelz"
-	"google.golang.org/grpc/internal/syscall"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -254,7 +252,7 @@ func (s) TestKeepaliveServerWithResponsiveClient(t *testing.T) {
 func (s) TestKeepaliveClientClosesUnresponsiveServer(t *testing.T) {
 	connCh := make(chan net.Conn, 1)
 	copts := ConnectOptions{
-		ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
+		//ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
 		KeepaliveParams: keepalive.ClientParameters{
 			Time:                1 * time.Second,
 			Timeout:             1 * time.Second,
@@ -290,7 +288,7 @@ func (s) TestKeepaliveClientClosesUnresponsiveServer(t *testing.T) {
 func (s) TestKeepaliveClientOpenWithUnresponsiveServer(t *testing.T) {
 	connCh := make(chan net.Conn, 1)
 	copts := ConnectOptions{
-		ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
+		//ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
 		KeepaliveParams: keepalive.ClientParameters{
 			Time:    1 * time.Second,
 			Timeout: 1 * time.Second,
@@ -323,7 +321,7 @@ func (s) TestKeepaliveClientOpenWithUnresponsiveServer(t *testing.T) {
 func (s) TestKeepaliveClientClosesWithActiveStreams(t *testing.T) {
 	connCh := make(chan net.Conn, 1)
 	copts := ConnectOptions{
-		ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
+		//ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
 		KeepaliveParams: keepalive.ClientParameters{
 			Time:    1 * time.Second,
 			Timeout: 1 * time.Second,
@@ -638,106 +636,5 @@ func (s) TestKeepaliveServerEnforcementWithDormantKeepaliveOnClient(t *testing.T
 	// Make sure the client transport is healthy.
 	if _, err := client.NewStream(ctx, &CallHdr{}); err != nil {
 		t.Fatalf("client.NewStream() failed: %v", err)
-	}
-}
-
-// TestTCPUserTimeout tests that the TCP_USER_TIMEOUT socket option is set to
-// the keepalive timeout, as detailed in proposal A18.
-func (s) TestTCPUserTimeout(t *testing.T) {
-	tests := []struct {
-		time              time.Duration
-		timeout           time.Duration
-		clientWantTimeout time.Duration
-		serverWantTimeout time.Duration
-	}{
-		{
-			10 * time.Second,
-			10 * time.Second,
-			10 * 1000 * time.Millisecond,
-			10 * 1000 * time.Millisecond,
-		},
-		{
-			0,
-			0,
-			0,
-			20 * 1000 * time.Millisecond,
-		},
-		{
-			infinity,
-			infinity,
-			0,
-			0,
-		},
-	}
-	for _, tt := range tests {
-		server, client, cancel := setUpWithOptions(
-			t,
-			0,
-			&ServerConfig{
-				KeepaliveParams: keepalive.ServerParameters{
-					Time:    tt.time,
-					Timeout: tt.timeout,
-				},
-			},
-			normal,
-			ConnectOptions{
-				KeepaliveParams: keepalive.ClientParameters{
-					Time:    tt.time,
-					Timeout: tt.timeout,
-				},
-			},
-		)
-		defer func() {
-			client.Close(fmt.Errorf("closed manually by test"))
-			server.stop()
-			cancel()
-		}()
-
-		var sc *http2Server
-		// Wait until the server transport is setup.
-		for {
-			server.mu.Lock()
-			if len(server.conns) == 0 {
-				server.mu.Unlock()
-				time.Sleep(time.Millisecond)
-				continue
-			}
-			for k := range server.conns {
-				var ok bool
-				sc, ok = k.(*http2Server)
-				if !ok {
-					t.Fatalf("Failed to convert %v to *http2Server", k)
-				}
-			}
-			server.mu.Unlock()
-			break
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-		defer cancel()
-		stream, err := client.NewStream(ctx, &CallHdr{})
-		if err != nil {
-			t.Fatalf("client.NewStream() failed: %v", err)
-		}
-		client.CloseStream(stream, io.EOF)
-
-		cltOpt, err := syscall.GetTCPUserTimeout(client.conn)
-		if err != nil {
-			t.Fatalf("syscall.GetTCPUserTimeout() failed: %v", err)
-		}
-		if cltOpt < 0 {
-			t.Skipf("skipping test on unsupported environment")
-		}
-		if gotTimeout := time.Duration(cltOpt) * time.Millisecond; gotTimeout != tt.clientWantTimeout {
-			t.Fatalf("syscall.GetTCPUserTimeout() = %d, want %d", gotTimeout, tt.clientWantTimeout)
-		}
-
-		srvOpt, err := syscall.GetTCPUserTimeout(sc.conn)
-		if err != nil {
-			t.Fatalf("syscall.GetTCPUserTimeout() failed: %v", err)
-		}
-		if gotTimeout := time.Duration(srvOpt) * time.Millisecond; gotTimeout != tt.serverWantTimeout {
-			t.Fatalf("syscall.GetTCPUserTimeout() = %d, want %d", gotTimeout, tt.serverWantTimeout)
-		}
 	}
 }

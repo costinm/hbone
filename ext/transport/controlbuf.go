@@ -27,9 +27,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/costinm/hbone/ext/transport/grpcutil"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
-	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/status"
 )
 

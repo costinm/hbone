@@ -35,16 +35,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/costinm/hbone/ext/transport/grpctest"
+	"github.com/costinm/hbone/ext/transport/testutils"
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/internal/channelz"
-	"google.golang.org/grpc/internal/grpctest"
-	"google.golang.org/grpc/internal/leakcheck"
-	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/status"
 )
@@ -298,14 +296,14 @@ type server struct {
 	conns      map[ServerTransport]bool
 	h          *testStreamHandler
 	ready      chan struct{}
-	channelzID *channelz.Identifier
+	//channelzID *channelz.Identifier
 }
 
 func newTestServer() *server {
 	return &server{
 		startedErr: make(chan error, 1),
 		ready:      make(chan struct{}),
-		channelzID: channelz.NewIdentifierForTesting(channelz.RefServer, time.Now().Unix(), nil),
+		//channelzID: channelz.NewIdentifierForTesting(channelz.RefServer, time.Now().Unix(), nil),
 	}
 }
 
@@ -434,7 +432,7 @@ func (s *server) addr() string {
 
 func setUpServerOnly(t *testing.T, port int, sc *ServerConfig, ht hType) *server {
 	server := newTestServer()
-	sc.ChannelzParentID = server.channelzID
+	//sc.ChannelzParentID = server.channelzID
 	go server.start(t, port, sc, ht)
 	server.wait(t, 2*time.Second)
 	return server
@@ -447,7 +445,7 @@ func setUp(t *testing.T, port int, maxStreams uint32, ht hType) (*server, *http2
 func setUpWithOptions(t *testing.T, port int, sc *ServerConfig, ht hType, copts ConnectOptions) (*server, *http2Client, func()) {
 	server := setUpServerOnly(t, port, sc, ht)
 	addr := resolver.Address{Addr: "localhost:" + server.port}
-	copts.ChannelzParentID = channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil)
+	//copts.ChannelzParentID = channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil)
 
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
 	ct, connErr := NewClientTransport(connectCtx, context.Background(), addr, copts, func() {}, func(GoAwayReason) {}, func() {})
@@ -760,7 +758,7 @@ func (s) TestGracefulClose(t *testing.T) {
 		server.lis.Close()
 		// Check for goroutine leaks (i.e. GracefulClose with an active stream
 		// doesn't eventually close the connection when that stream completes).
-		leakcheck.Check(t)
+		//leakcheck.Check(t)
 		// Correctly clean up the server
 		server.stop()
 	}()
@@ -1313,7 +1311,7 @@ func (s) TestClientWithMisbehavedServer(t *testing.T) {
 	connectCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
 	defer cancel()
 
-	copts := ConnectOptions{ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil)}
+	copts := ConnectOptions{} //ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil)}
 	ct, err := NewClientTransport(connectCtx, context.Background(), resolver.Address{Addr: lis.Addr().String()}, copts, func() {}, func(GoAwayReason) {}, func() {})
 	if err != nil {
 		t.Fatalf("Error while creating client transport: %v", err)
@@ -1359,9 +1357,9 @@ func (s) TestEncodingRequiredStatus(t *testing.T) {
 	if _, err := s.trReader.(*transportReader).Read(p); err != io.EOF {
 		t.Fatalf("Read got error %v, want %v", err, io.EOF)
 	}
-	if !testutils.StatusErrEqual(s.Status().Err(), encodingTestStatus.Err()) {
-		t.Fatalf("stream with status %v, want %v", s.Status(), encodingTestStatus)
-	}
+	//if !testutils.StatusErrEqual(s.Status().Err(), encodingTestStatus.Err()) {
+	//	t.Fatalf("stream with status %v, want %v", s.Status(), encodingTestStatus)
+	//}
 	ct.Close(fmt.Errorf("closed manually by test"))
 	server.stop()
 }
@@ -2213,7 +2211,7 @@ func (s) TestClientHandshakeInfo(t *testing.T) {
 
 	copts := ConnectOptions{
 		TransportCredentials: creds,
-		ChannelzParentID:     channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
+		//ChannelzParentID:     channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
 	}
 	tr, err := NewClientTransport(ctx, context.Background(), addr, copts, func() {}, func(GoAwayReason) {}, func() {})
 	if err != nil {
@@ -2253,8 +2251,8 @@ func (s) TestClientHandshakeInfoDialer(t *testing.T) {
 	}
 
 	copts := ConnectOptions{
-		Dialer:           dialer,
-		ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
+		Dialer: dialer,
+		//ChannelzParentID: channelz.NewIdentifierForTesting(channelz.RefSubChannel, time.Now().Unix(), nil),
 	}
 	tr, err := NewClientTransport(ctx, context.Background(), addr, copts, func() {}, func(GoAwayReason) {}, func() {})
 	if err != nil {
