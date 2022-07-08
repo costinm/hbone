@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -16,12 +15,12 @@ import (
 // - H2R Server accepts mTLS connection from client, using h2r ALPN
 // - Client opens a H2 _server_ handler on the stream, H2R server acts as
 // a H2 client.
-// - Endpoint is registered in k8s, using IP of the server holding the connection
+// - EndpointCon is registered in k8s, using IP of the server holding the connection
 // - SNI requests on the H2R server are routed to existing connection
 // - if a connection is not found on local server, forward based on endpoint.
 // DialH2R connects to an H2R tunnel endpoint, and accepts connections from the tunnel
 // Not blocking.
-func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error) {
+func (hc *EndpointCon) DialH2R(ctx context.Context, addr string) (*tls.Conn, error) {
 	tlsCon, err := hc.dialTLS(ctx, addr)
 	if err != nil {
 		return nil, err
@@ -31,9 +30,9 @@ func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error)
 		backoff := 50 * time.Millisecond
 		for {
 			t0 := time.Now()
-			hc.HBone.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
+			hc.hb.h2Server.ServeConn(tlsCon, &http2.ServeConnOpts{
 				//Context:    ctx,
-				Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.HBone},
+				Handler:    &HBoneAcceptedConn{conn: tlsCon, hb: hc.hb},
 				BaseConfig: &http.Server{},
 			})
 			if Debug {
@@ -66,7 +65,7 @@ func (hc *Endpoint) DialH2R(ctx context.Context, addr string) (*tls.Conn, error)
 }
 
 func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
-	s := NewBufferReader(conn)
+	s := nio.NewBufferReader(conn)
 	// will also close the conn ( which is the reader )
 	defer s.Close()
 
@@ -86,10 +85,11 @@ func (hb *HBone) HandleH2RSNIConn(conn net.Conn) {
 	}
 }
 
-func (hb *HBone) HandleH2R(conn net.Conn, s *BufferReader, sni string) (bool, error) {
-	if strings.HasPrefix(sni, "outbound_.") {
+func (hb *HBone) HandleH2R(conn net.Conn, s *nio.StreamBuffer, sni string) (bool, error) {
+	//if strings.HasPrefix(sni, "outbound_.") {
+	//
+	//}
 
-	}
 	hb.m.RLock()
 	rt := hb.H2R[sni]
 	hb.m.RUnlock()
@@ -105,20 +105,20 @@ func (hb *HBone) HandleH2R(conn net.Conn, s *BufferReader, sni string) (bool, er
 	}
 	res, err := rt.RoundTrip(r)
 
-	s1 := Stream{
+	s1 := &nio.ReaderCopier{
 		ID:  "sni-o",
-		Dst: o,
-		Src: s, // The SNI reader, including the initial buffer
+		Out: o,
+		In:  s, // The SNI reader, including the initial buffer
 	}
 	ch := make(chan int)
-	go s1.CopyBuffered(ch, true)
+	go s1.Copy(ch, true)
 
-	s2 := Stream{
+	s2 := &nio.ReaderCopier{
 		ID:  "sni-i",
-		Src: res.Body,
-		Dst: conn,
+		In:  res.Body,
+		Out: conn,
 	}
-	s2.CopyBuffered(nil, true)
+	s2.Copy(nil, true)
 
 	<-ch
 
@@ -135,7 +135,6 @@ func (hb *HBone) HandleH2R(conn net.Conn, s *BufferReader, sni string) (bool, er
 	}
 
 	return true, nil
-
 }
 
 // GetClientConn is called by http2.Transport, if Transport.RoundTrip is called (
@@ -165,7 +164,7 @@ func (hb *HBone) HandlerH2RConn(conn net.Conn) {
 	tls := tls.Server(conn, conf)
 
 	// TODO: replace with handshake with context, timeout
-	err := HandshakeTimeout(tls, hb.HandsahakeTimeout, conn)
+	err := nio.HandshakeTimeout(tls, hb.HandsahakeTimeout, conn)
 	if err != nil {
 		conn.Close()
 		return
@@ -206,7 +205,7 @@ func (hb *HBone) HandlerH2RConn(conn net.Conn) {
 	}
 	// TODO: track the active connections in hb, for close purpose.
 
-	// Stream remains open
+	// ReaderCopier remains open
 }
 
 type H2RConn struct {

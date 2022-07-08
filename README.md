@@ -54,6 +54,26 @@ authentication if needed.
 
 [] convert sshd to use h2r (still over mTLS, but not exposed on the public address)
 
+# uREST 
+
+It is extremely common for applications to make REST or gRPC requests - this 
+package is focused on implementing the mesh and HBONE protocols, and provides 
+some minimal support for gRPC and K8S calls without extra dependencies and using
+the same code.
+
+It is based on/inspired from kelseyhightower/konfig - which uses the 'raw' 
+K8S protocol to avoid a big dependency. Google, K8S and many other APIs have
+a raw representation and don't require complex client libraries and depdencies.
+No code generation or protos are used - raw JSON in []byte is used, caller 
+can handle marshalling.
+
+For gRPC only the basic framing and protocol are support - exposed as frames
+containing []byte. Caller or generated code can handle marshalling.
+
+This is intended for apps that make few small requests and want to keep 
+size small, or want to take advantage of HBONE and mesh auto-setup. Also
+for low-level testing.
+
 # Other projects
 
 - https://github.com/xnuter/http-tunnel

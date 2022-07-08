@@ -20,7 +20,7 @@ func listenAndServeTCP(addr string, f func(conn net.Conn)) (net.Listener, error)
 		return nil, err
 	}
 
-	go ServeListener(listener, f)
+	go nio.ServeListener(listener, f)
 	return listener, nil
 }
 
@@ -185,15 +185,15 @@ func TestHBone(t *testing.T) {
 
 		rin, lout := io.Pipe()
 		lin, rout := io.Pipe()
-		gate.EndpointResolver = func(sni string) *Endpoint {
-			gc := gate.NewEndpoint("https://" + bobHBAddr + "/_hbone/mtls")
+		gate.EndpointResolver = func(sni string) *EndpointCon {
+			gc := gate.NewEndpointCon("https://" + bobHBAddr + "/_hbone/mtls")
 
 			return gc
 		}
 
 		go func() {
 			// 13022 is the SNI port of the gateway. It'll pass-through to the resolved address.
-			c := alice.NewEndpoint("https://" + gateSNIL.Addr().String() + "/_hbone/tcp")
+			c := alice.NewEndpointCon("https://" + gateSNIL.Addr().String() + "/_hbone/tcp")
 			c.SNI = "bob"
 			c.SNIGate = gateSNIL.Addr().String()
 			err = c.Proxy(context.Background(), rin, rout)
@@ -217,7 +217,8 @@ func TestHBone(t *testing.T) {
 
 		// Connect bob to the gate.
 		// ...
-		h2rc := bob.NewClient("gate.gate:13222")
+
+		h2rc := bob.AddCluster("", &Cluster{Addr: "gate.gate:13222"})
 
 		// May have multiple h2r endpoints, to different instances (or all instances, if the gate is a stateful
 		// set).
@@ -246,7 +247,7 @@ func TestHBone(t *testing.T) {
 			rin, lout := io.Pipe()
 			lin, rout := io.Pipe()
 			go func() {
-				c := alice.NewEndpoint("https://" + gateH2RSNIL.Addr().String() + "/_hbone/tcp")
+				c := alice.NewEndpointCon("https://" + gateH2RSNIL.Addr().String() + "/_hbone/tcp")
 				c.SNI = "default.bob.svc.cluster.local"
 				c.SNIGate = gateH2RSNIL.Addr().String()
 
@@ -263,7 +264,7 @@ func TestHBone(t *testing.T) {
 			rin, lout := io.Pipe()
 			lin, rout := io.Pipe()
 			go func() {
-				c := alice.NewEndpoint("https://" + gateH2RSNIL.Addr().String() + "/_hbone/tcp")
+				c := alice.NewEndpointCon("https://" + gateH2RSNIL.Addr().String() + "/_hbone/tcp")
 				// The endpoint looks like an Istio endpoint.
 				c.SNI = "outbound_.8080._.default.bob.svc.cluster.local"
 				c.SNIGate = gateH2RSNIL.Addr().String()

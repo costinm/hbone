@@ -29,11 +29,10 @@ import (
 
 // MeshAuth represents a workload identity and associated info required for minimal Mesh-compatible security.
 type MeshAuth struct {
-	// Will attempt to load certificates from this directory, defaults to
-	// "./var/run/secrets/istio.io/"
+	// Will attempt to load certificates from this directory.
 	CertDir string
 
-	// Current certificate, after calling GetCertificate("")
+	// Primary certificate and private key. Loaded or generated.
 	Cert *tls.Certificate
 
 	// MeshTLSConfig is a tls.Config that requires mTLS with a spiffee identity,
@@ -44,24 +43,36 @@ type MeshAuth struct {
 	MeshTLSConfig *tls.Config
 
 	// TrustDomain is extracted from the cert or set by user, used to verify
-	// peer certificates.
+	// peer certificates. If not set, will be populated when cert is loaded.
+	// Should be 'cluster.local', a real domain with OIDC keys or platform specific.
 	TrustDomain string
 
-	// Namespace and SA are extracted from the certificate or set by user.
+	// Namespace and Name are extracted from the certificate or set by user.
 	// Namespace is used to verify peer certificates
 	Namespace string
-	SA        string
+	Name      string
 
 	// Additional namespaces to allow access from. By default 'same namespace' and 'istio-system' are allowed.
 	AllowedNamespaces []string
 
-	// Trusted roots
+	// Trusted roots - used for verification. RawSubject is used as key - Subjects() return the DER list.
+	// This is 'write only', used as a cache in verification.
+	//
 	// TODO: copy Istiod multiple trust domains code. This will be a map[trustDomain]roots and a
 	// list of TrustDomains. XDS will return the info via ProxyConfig.
 	// This can also be done by krun - loading a config map with same info.
 	TrustedCertPool *x509.CertPool
 
-	// GetCertificateHook allows plugging in an alternative certificate provider. By default files are used.
+	// Private key to use in both server and client authentication.
+	// ED22519: 32B
+	// EC256: DER
+	// RSA: DER
+	Priv []byte
+
+	// Root CAs. Each element may include multiple concatenated roots.
+	RootCAPEM [][]byte
+
+	// GetCertificateHook allows plugging in an alternative certificate provider.
 	GetCertificateHook func(host string) (*tls.Certificate, error)
 }
 
@@ -89,7 +100,7 @@ const (
 	// to all workloads including TD proxyless GRPC.
 	//
 	// Outside of GKE, this is loaded from the mesh.env - the mesh gate is responsible to keep it up to date.
-	WorkloadRootCAs = "ca_certificates.pem"
+	rootCAs = "ca_certificates.pem"
 )
 
 // Will load the credentials and create an Auth object.
@@ -120,7 +131,7 @@ func (a *MeshAuth) SetKeysPEM(privatePEM []byte, chainPEM []string) error {
 
 func (a *MeshAuth) SetTLSCertificate(cert *tls.Certificate) error {
 	a.Cert = cert
-	a.initTLS()
+	a.initFromCert()
 	return nil
 }
 
@@ -269,7 +280,7 @@ func (a *MeshAuth) initFromDir() error {
 		}
 	}
 
-	a.initTLS()
+	a.initFromCert()
 	return nil
 }
 
@@ -280,7 +291,7 @@ func (a *MeshAuth) initFromDir() error {
 //  populate it - ideally from the CSI/Zatar or TrustConfig CRD.
 func (kr *MeshAuth) InitRoots(ctx context.Context, outDir string) error {
 	if outDir != "" {
-		rootFile := filepath.Join(outDir, WorkloadRootCAs)
+		rootFile := filepath.Join(outDir, rootCAs)
 		rootCertPEM, err := ioutil.ReadFile(rootFile)
 		if err == nil {
 			block, rest := pem.Decode(rootCertPEM)
@@ -364,7 +375,7 @@ func (kr *MeshAuth) InitCertificates(ctx context.Context, certDir string) error 
 	return nil
 }
 
-// Extract the trustDomain, namespace and SA from a spiffee certificate
+// Extract the trustDomain, namespace and Name from a spiffee certificate
 func (a *MeshAuth) Spiffee() (*url.URL, string, string, string) {
 	cert, err := x509.ParseCertificate(a.Cert.Certificate[0])
 	if err != nil {
@@ -422,8 +433,6 @@ func (a *MeshAuth) GenerateTLSConfigClient(name string) *tls.Config {
 	return &tls.Config{
 		//MinVersion: tls.VersionTLS13,
 		//PreferServerCipherSuites: ugate.preferServerCipherSuites(),
-		InsecureSkipVerify: true,                  // This is not insecure here. We will verify the cert chain ourselves.
-		ClientAuth:         tls.RequestClientCert, // not require - we'll fallback to JWT
 
 		GetCertificate: func(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return a.GetCertificate(ch.Context(), ch.ServerName)
@@ -434,6 +443,7 @@ func (a *MeshAuth) GenerateTLSConfigClient(name string) *tls.Config {
 		},
 		NextProtos: []string{"istio", "h2"},
 
+		InsecureSkipVerify:    true, // This is not insecure here. We will verify the cert chain ourselves.
 		VerifyPeerCertificate: a.VerifyServerCert,
 	}
 }
@@ -599,9 +609,9 @@ func (a *MeshAuth) GenerateTLSConfigServer() *tls.Config {
 	}
 }
 
-// initTLS initializes the MeshTLSConfig with the workload certificate
-func (a *MeshAuth) initTLS() {
-	_, a.TrustDomain, a.Namespace, a.SA = a.Spiffee()
+// initFromCert initializes the MeshTLSConfig with the workload certificate
+func (a *MeshAuth) initFromCert() {
+	_, a.TrustDomain, a.Namespace, a.Name = a.Spiffee()
 
 	a.MeshTLSConfig = a.GenerateTLSConfigServer()
 }

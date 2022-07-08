@@ -12,7 +12,7 @@ import (
 	"github.com/costinm/hbone"
 )
 
-func Forward(dest string, hb *hbone.HBone, hg string, auth *hbone.Auth, in io.Reader, out io.WriteCloser) error {
+func Forward(dest string, hb *hbone.HBone, hg string, auth hbone.Auth, in io.Reader, out io.WriteCloser) error {
 	host := ""
 	if strings.Contains(dest, "//") {
 		u, _ := url.Parse(dest)
@@ -25,11 +25,11 @@ func Forward(dest string, hb *hbone.HBone, hg string, auth *hbone.Auth, in io.Re
 	// TODO: -R to register to the gate, reverse proxy
 	// TODO: get certs
 
-	hc := hb.NewEndpoint(dest)
+	hc := hb.NewEndpointCon(dest)
 
 	if strings.HasSuffix(host, ".svc") {
 		hc.H2Gate = hg + ":15008" // hbone/mtls
-		hc.ExternalMTLSConfig = auth.MeshTLSConfig
+		hc.ExternalMTLSConfig = auth.GenerateTLSConfigServer()
 	}
 	// Initialization done - starting the proxy either on a listener or stdin.
 
@@ -40,8 +40,13 @@ func Forward(dest string, hb *hbone.HBone, hg string, auth *hbone.Auth, in io.Re
 	return nil
 }
 
+// WIP: RemoteForwardPort is similar with ssh -R remotePort. Will use the H2R protocol to open a remote H2C connection
+// attached to the Hbone remote server.
 func RemoteForwardPort(port string, hb *hbone.HBone, hg string, sn, ns string) {
-	attachC := hb.NewClient(sn + "." + ns + ":15009")
+	attachC := &hbone.Cluster{
+		Addr: sn + "." + ns + ":15009",
+	}
+	hb.AddCluster(attachC.Addr, attachC)
 	attachE := attachC.NewEndpoint("")
 	attachE.SNI = fmt.Sprintf("outbound_.%s_._.%s.%s.svc.cluster.local", port, sn, ns)
 	go func() {
@@ -50,9 +55,10 @@ func RemoteForwardPort(port string, hb *hbone.HBone, hg string, sn, ns string) {
 	}()
 }
 
-func LocalForwardPort(lf, dest string,hb *hbone.HBone, hg string, auth *hbone.Auth) error {
-
-	l, err := net.Listen("tcp", lf)
+// LocalForwardPort is a helper for port forwarding, similar with -L localPort:dest:destPort
+//
+func LocalForwardPort(localAddr, dest string, hb *hbone.HBone, hg string, auth hbone.Auth) error {
+	l, err := net.Listen("tcp", localAddr)
 	if err != nil {
 		return err
 	}
@@ -68,4 +74,3 @@ func LocalForwardPort(lf, dest string,hb *hbone.HBone, hg string, auth *hbone.Au
 		}()
 	}
 }
-

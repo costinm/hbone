@@ -15,7 +15,7 @@ import (
 // Accepted connections will decode the ServerName header, and use it to forward to either a HBONE
 // mTLS service or a H2R connection.
 
-func SNIProxy(ctx context.Context, hc *Endpoint, stdin io.Reader, stdout io.WriteCloser) error {
+func SNIProxy(ctx context.Context, hc *EndpointCon, stdin io.Reader, stdout io.WriteCloser) error {
 	d := net.Dialer{} // TODO: customizations
 
 	conn, err := d.DialContext(ctx, "tcp", hc.SNIGate)
@@ -27,23 +27,23 @@ func SNIProxy(ctx context.Context, hc *Endpoint, stdin io.Reader, stdout io.Writ
 	}
 
 	// Using the low-level interface, to keep control over TLS.
-	conf := hc.HBone.Auth.GenerateTLSConfigClient(hc.SNI)
+	conf := hc.hb.Auth.GenerateTLSConfigClient(hc.SNI)
 
 	conf.ServerName = hc.SNI
 
 	defer conn.Close()
 
 	tlsCon := tls.Client(conn, conf)
-	err = HandshakeTimeout(tlsCon, hc.HBone.HandsahakeTimeout, nil)
+	err = nio.HandshakeTimeout(tlsCon, hc.hb.HandsahakeTimeout, nil)
 	if err != nil {
 		return err
 	}
 
-	return Proxy(ctx, stdin, stdout, tlsCon, tlsCon)
+	return nio.Proxy(ctx, stdin, stdout, tlsCon, tlsCon)
 }
 
 func HandleSNIConn(hb *HBone, conn net.Conn) {
-	s := NewBufferReader(conn)
+	s := nio.NewBufferReader(conn)
 	// will also close the conn ( which is the reader )
 	defer s.Close()
 
@@ -112,8 +112,8 @@ const (
 //
 // TODO: in mesh, use one cypher suite (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
 // maybe 2 ( since keys are ECDSA )
-func ParseTLS(acc *BufferReader) (string, error) {
-	buf, err := acc.Fill(5)
+func ParseTLS(acc *nio.StreamBuffer) (string, error) {
+	buf, err := acc.Peek(5)
 	if err != nil {
 		return "", err
 	}
@@ -136,7 +136,7 @@ func ParseTLS(acc *BufferReader) (string, error) {
 	m := ClientHelloMsg{}
 
 	end := rlen + 5
-	buf, err = acc.Fill(end)
+	buf, err = acc.Peek(end)
 	if err != nil {
 		return "", err
 	}

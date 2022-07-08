@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -39,10 +40,10 @@ func NewCA(trust string) *CA {
 }
 
 func (ca *CA) NewID(ns, sa string) *MeshAuth {
-	nodeID := NewMeshAuth()
 	caCert := ca.CACert
 	crt := ca.NewTLSCert(ns, sa)
 
+	nodeID := NewMeshAuth()
 	nodeID.TrustedCertPool.AddCert(caCert)
 	nodeID.SetTLSCertificate(crt)
 
@@ -56,16 +57,13 @@ func (ca *CA) NewTLSCert(ns, sa string) *tls.Certificate {
 	return cert
 }
 
-func (a *MeshAuth) NewCSR(kty string, trustDomain, san string) (privPEM []byte, csrPEM []byte, err error) {
+func (a *MeshAuth) NewCSR(san string) (privPEM []byte, csrPEM []byte, err error) {
 	var priv crypto.PrivateKey
 
-	if kty == "ec256" {
-		// TODO
-	}
 	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	priv = rsaKey
 
-	csr := GenCSRTemplate(trustDomain, san)
+	csr := GenCSRTemplate(a.TrustDomain, san)
 	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csr, priv)
 
 	encodeMsg := "CERTIFICATE REQUEST"
@@ -106,9 +104,9 @@ func SignCertDER(template *x509.Certificate, pub crypto.PublicKey, caPrivate cry
 }
 
 func PublicKey(key crypto.PrivateKey) crypto.PublicKey {
-	//if k, ok := key.(ed25519.PrivateKey); ok {
-	//	return k.Public()
-	//}
+	if k, ok := key.(ed25519.PrivateKey); ok {
+		return k.Public()
+	}
 	if k, ok := key.(*ecdsa.PrivateKey); ok {
 		return k.Public()
 	}

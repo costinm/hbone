@@ -3,41 +3,118 @@ package hbone
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
-type HBoneClient struct {
-	ServiceAddr string
+// Cluster represents a set of endpoints, with a common configuration.
+//
+//
+// Based on K8S Cluster config and semantics, also similar with Envoy Cluster
+// or Istio service.
+type Cluster struct {
+	// ServiceAddr is the TCP address of the cluster - VIP:port or DNS:port
+	// This can also be an 'original dst' address for single-endpoint clusters.
+	//
+	// Created from endpoint. For example Swagger generated configs uses BasePath, Host, Scheme.
+	Addr string
 
-	Endpoints []*Endpoint
-	hb        *HBone
+	// If not empty, the path to use in requests to the cluster.
+	Path string
+
+	// Active connections to endpoints
+	Endpoints []*EndpointCon
+
+	// Parent.
+	hb *HBone
+
+	// If empty, the cluster is using system certs.
+	// Otherwise it's the configured root certs list, in PEM format.
+	// May include multiple roots.
+	CACert []byte
+
+	// SNI to use when making the request. Defaults to hostname in Addr
+	SNI string
+
+	// TODO: UserAgent, DefaultHeaders
+
+	// Optional TokenProvider - not needed if client wraps google oauth
+	// or mTLS is used.
+	TokenProvider func(context.Context, string) (string, error)
+
+	// Cluster ID - the cluster name in kube config, hub, gke - cluster name in XDS
+	// Defaults to Base addr - but it is possible to have multiple clusters for
+	// same address ( ex. different users / token providers).
+	// Naming:
+	// GKE: gke_PROJECT_LOCATION_NAME
+	Id string
+
+	// For GKE K8S clusters - extracted from Id.
+	// This is the default location for the endpoints.
+	Location string
+
+	// From CDS
+
+	// timeout for new network connections to endpoints in cluster
+	ConnectTimeout           time.Duration
+	TCPKeepAlive             time.Duration
+	MaxRequestsPerConnection int
+
+	// Client configured with the root CA of the K8S cluster, used
+	// for HTTP/1.1 requests. If set, the cluster is not HBone/H2 but a fallback
+	// or non-mesh destination.
+	// TODO: customize Dialer to still use mesh LB
+	// TODO: attempt ws for tunneling H2
+	Client *http.Client
+
+	// TLS config used when dialing, shared
+	TLSClientConfig *tls.Config
+
+	// Shared by all endpoints for this cluster
+	H2T *http2.Transport
+
+	// If set, will be used to select the next endpoint. Based on lb_policy
+	// May dial a new connection.
+	//LB func(*Cluster) *EndpointCon
 }
 
-func (c HBoneClient) NewEndpoint(url string) *Endpoint {
-	ep := c.hb.NewEndpoint(url)
+// Endpoint represents a connection/association with a node.
+type Endpoint struct {
+	Labels map[string]string
+
+	LBWeight int
+	Priority int
+
+	Address string
+}
+
+func (c *Cluster) NewEndpoint(url string) *EndpointCon {
+	ep := c.hb.NewEndpointCon(url)
+	ep.c = c
 	c.Endpoints = append(c.Endpoints, ep)
 	return ep
 }
 
-// Endpoint is a client for a specific destination.
-type Endpoint struct {
-	HBone *HBone
+// EndpointCon is a client for a specific destination.
+type EndpointCon struct {
+	hb *HBone
 
-	// Service addr - using the service name.
-	ServiceAddr string
-
-	// URL used to reach the H2 endpoint providing the Proxy.
+	// URL used to reach the H2 endpoint providing the Hbone service.
 	URL string
 
-	// MTLSConfig is a custom config to use for the inner connection - will enable mTLS over H2
-	// If nil, it's regular TCP over H2.
+	// MTLSConfig is a custom config to use for the inner connection - will
+	// enable mTLS over H2. If nil, it's regular TCP over H2.
 	MTLSConfig *tls.Config
 
 	ExternalMTLSConfig *tls.Config
@@ -56,22 +133,32 @@ type Endpoint struct {
 	// similar with an egress gateway.
 	H2Gate string
 
-	// TODO: multiple per endpoint
 	tlsCon net.Conn
 	rt     http.RoundTripper // *http2.ClientConn //
+	c      *Cluster
 }
 
-func (hb *HBone) NewClient(service string) *HBoneClient {
-	return &HBoneClient{hb: hb, ServiceAddr: service}
+func (hb *HBone) AddCluster(service string, c *Cluster) *Cluster {
+	hb.m.Lock()
+	if service == "" {
+		service = c.Addr
+	}
+	hb.Clusters[service] = c
+	c.hb = hb
+	if c.ConnectTimeout == 0 {
+		c.ConnectTimeout = hb.ConnectTimeout
+	}
+	hb.m.Unlock()
+	return c
 }
 
-// NewEndpoint creates a client for connecting to a specific service:port
+// NewEndpointCon creates a client for connecting to a specific service:port
 //
 // The service is mapped to an endpoint URL, protocol, etc. using a config callback,
 // to isolate XDS or discovery dependency.
 //
-func (hb *HBone) NewEndpoint(urlOrHost string) *Endpoint {
-	hc := &Endpoint{HBone: hb}
+func (hb *HBone) NewEndpointCon(urlOrHost string) *EndpointCon {
+	hc := &EndpointCon{hb: hb}
 
 	if !strings.HasPrefix(urlOrHost, "https://") {
 
@@ -92,12 +179,12 @@ func (hb *HBone) NewEndpoint(urlOrHost string) *Endpoint {
 // Proxy will Proxy in/out (plain text) to a remote service, using mTLS tunnel over H2 POST.
 // used for testing.
 func (hb *HBone) Proxy(svc string, hbURL string, stdin io.ReadCloser, stdout io.WriteCloser, innerTLS *tls.Config) error {
-	c := hb.NewEndpoint(hbURL)
+	c := hb.NewEndpointCon(hbURL)
 	c.MTLSConfig = innerTLS
 	return c.Proxy(context.Background(), stdin, stdout)
 }
 
-func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error) {
+func (hc *EndpointCon) dialTLS(ctx context.Context, addr string) (*tls.Conn, error) {
 	d := net.Dialer{} // TODO: customizations
 
 	conn, err := d.DialContext(ctx, "tcp", addr)
@@ -106,7 +193,7 @@ func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error)
 	}
 
 	// Using the low-level interface, to keep control over TLS.
-	conf := hc.HBone.Auth.GenerateTLSConfigClient(addr) //MeshTLSConfig.Clone()
+	conf := hc.hb.Auth.GenerateTLSConfigClient(addr) //MeshTLSConfig.Clone()
 
 	if hc.SNI != "" {
 		conf.ServerName = hc.SNI
@@ -120,7 +207,7 @@ func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error)
 
 	tlsCon := tls.Client(conn, conf)
 
-	err = HandshakeTimeout(tlsCon, hc.HBone.HandsahakeTimeout, conn)
+	err = nio.HandshakeTimeout(tlsCon, hc.hb.HandsahakeTimeout, conn)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +215,123 @@ func (hc *Endpoint) dialTLS(ctx context.Context, addr string) (*tls.Conn, error)
 	return tlsCon, nil
 }
 
-func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteCloser) error {
+func (c *Cluster) DoRequest(req *http.Request) ([]byte, error) {
+	var resp *http.Response
+	var err error
+
+	resp, err = c.RoundTrip(req) // Client.Do(req)
+	if Debug {
+		log.Println(req, resp, err)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
+		return nil, errors.New(fmt.Sprintf("kconfig: unable to get %v, status code %v",
+			req.URL, resp.StatusCode))
+	}
+
+	return data, nil
+}
+
+// RoundTrip implements a barebone connection and roundtrip using a single endpoint.
+func (c *Cluster) RoundTrip(req *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+
+	if c.TokenProvider != nil {
+		t, err := c.TokenProvider(req.Context(), "https://"+c.Addr)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Add("authorization", "Bearer "+t)
+	}
+
+	// Find a channel - LB would go here if multiple addresses and sockets
+	//
+
+	rg, err := c.DialRoundTripper(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	resp, err = rg.RoundTrip(req)
+	if Debug {
+		log.Println(req, resp, err)
+	}
+
+	return resp, err
+}
+
+// Dial a single connection to the host, wrap it with a h2 RoundTripper.
+// This is bypassing the http2 client - allowing custom LB and mesh options.
+func (c *Cluster) DialRoundTripper(ctx context.Context) (*http2.ClientConn, error) {
+	d := &net.Dialer{
+		Timeout:   c.ConnectTimeout,
+		KeepAlive: c.TCPKeepAlive,
+	}
+
+	// TODO: skip TLS if trusted network
+	if c.TLSClientConfig == nil {
+		sni := c.SNI
+		if sni == "" {
+			sni, _, _ = net.SplitHostPort(c.Addr)
+		}
+
+		if c.CACert != nil && len(c.CACert) > 0 {
+			roots := x509.NewCertPool()
+			if !roots.AppendCertsFromPEM(c.CACert) {
+				log.Println("Failed to decode PEM")
+			}
+			c.TLSClientConfig = &tls.Config{
+				RootCAs:    roots,
+				ServerName: sni, // required
+				NextProtos: []string{"istio", "h2"},
+			}
+		} else {
+			c.TLSClientConfig = &tls.Config{
+				ServerName: sni, // required
+				NextProtos: []string{"istio", "h2"},
+			}
+		}
+	}
+
+	// First do TCP
+	tcpC, err := d.DialContext(ctx, "tcp", c.Addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Upgrade to TLS - NPN included
+	cc := tls.Client(tcpC, c.TLSClientConfig)
+	err = cc.HandshakeContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.H2T == nil {
+		c.H2T = &http2.Transport{
+			ReadIdleTimeout:            10000 * time.Second,
+			StrictMaxConcurrentStreams: false,
+			AllowHTTP:                  true,
+		}
+	}
+
+	// Multiplex the connection
+	rt, err := c.H2T.NewClientConn(cc)
+	return rt, err
+}
+
+// Send the content of in and out to the remote endpoint as a Hbone stream.
+func (hc *EndpointCon) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteCloser) error {
 	if hc.SNIGate != "" {
 		return SNIProxy(ctx, hc, stdin, stdout)
 	}
@@ -146,13 +349,13 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 
 	var rt = hc.rt
 
-	if hc.HBone.TokenCallback != nil {
+	if hc.hb.TokenCallback != nil {
 		h := r.URL.Host
 		if strings.Contains(h, ":") && h[0] != '[' {
 			hn, _, _ := net.SplitHostPort(h)
 			h = hn
 		}
-		t, err := hc.HBone.TokenCallback(ctx, "https://"+h)
+		t, err := hc.hb.TokenCallback(ctx, "https://"+h)
 		if err != nil {
 			log.Println("Failed to get token, attempt unauthenticated", err)
 		} else {
@@ -168,7 +371,7 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 					AllowHTTP: true,
 					// Pretend we are dialing a TLS endpoint.
 					// Note, we ignore the passed tls.Config
-					DialTLS: func(network, addr string, cfg *tls.Config) (net.Stream, error) {
+					DialTLS: func(network, addr string, cfg *tls.Config) (net.ReaderCopier, error) {
 						return net.Dial(network, addr)
 					},
 				},
@@ -243,13 +446,13 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 			// TODO: check the SANs have been verified by TLSConfig call.
 		}
 
-		rt, err = hc.HBone.h2t.NewClientConn(hc.tlsCon)
+		rt, err = hc.hb.h2t.NewClientConn(hc.tlsCon)
 		if err != nil {
 			return err
 		}
 
-		if hc.HBone.Transport != nil {
-			rt = hc.HBone.Transport(rt)
+		if hc.hb.Transport != nil {
+			rt = hc.hb.Transport(rt)
 		}
 		hc.rt = rt
 	}
@@ -263,41 +466,41 @@ func (hc *Endpoint) Proxy(ctx context.Context, stdin io.Reader, stdout io.WriteC
 
 	t1 := time.Now()
 	ch := make(chan int)
-	var s1, s2 Stream
+	var s1, s2 *nio.ReaderCopier
 
 	if hc.MTLSConfig == nil {
-		s1 = Stream{
+		s1 = &nio.ReaderCopier{
 			ID:  "client-o",
-			Dst: o,
-			Src: stdin,
+			Out: o,
+			In:  stdin,
 		}
-		go s1.CopyBuffered(ch, true)
+		go s1.Copy(ch, true)
 
-		s2 = Stream{
+		s2 = &nio.ReaderCopier{
 			ID:  "client-i",
-			Dst: stdout,
-			Src: res.Body,
+			Out: stdout,
+			In:  res.Body,
 		}
-		s2.CopyBuffered(nil, true)
+		s2.Copy(nil, true)
 	} else {
 		// Do the mTLS handshake for the tunneled connection
-		tlsTun := tls.Client(&HTTPConn{acceptedConn: hc.tlsCon, r: res.Body, w: o}, hc.MTLSConfig)
-		err = HandshakeTimeout(tlsTun, hc.HBone.HandsahakeTimeout, nil)
+		tlsTun := tls.Client(&nio.HTTPConn{Conn: hc.tlsCon, R: res.Body, W: o}, hc.MTLSConfig)
+		err = nio.HandshakeTimeout(tlsTun, hc.hb.HandsahakeTimeout, nil)
 		if err != nil {
 			return err
 		}
 		log.Println("client-rt tun handshake", tlsTun.ConnectionState())
-		s1 = Stream{
-			Dst: tlsTun,
-			Src: stdin,
+		s1 = &nio.ReaderCopier{
+			Out: tlsTun,
+			In:  stdin,
 		}
-		go s1.CopyBuffered(ch, true)
+		go s1.Copy(ch, true)
 
-		s2 = Stream{
-			Dst: stdout,
-			Src: tlsTun,
+		s2 = &nio.ReaderCopier{
+			Out: stdout,
+			In:  tlsTun,
 		}
-		s2.CopyBuffered(nil, true)
+		s2.Copy(nil, true)
 	}
 
 	<-ch

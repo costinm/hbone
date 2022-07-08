@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"strconv"
+
+	"github.com/costinm/hbone"
 )
 
 // Egress capture using SOCKS5, for whitebox mode.
@@ -75,7 +77,7 @@ const (
 type Socks struct {
 }
 
-func HandleSocks(br *BufferReader, s *Stream, w io.WriteCloser) (done bool, err error) {
+func HandleSocks(br *hbone.StreamBuffer, s *hbone.Stream, w io.WriteCloser) (done bool, err error) {
 	// Fill the read buffer with one Read.
 	// Typically 3-4 bytes unless client is eager.
 
