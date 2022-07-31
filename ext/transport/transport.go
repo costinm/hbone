@@ -39,7 +39,6 @@ import (
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/tap"
 )
 
 const logLevel = 2
@@ -518,10 +517,10 @@ const (
 
 // ServerConfig consists of all the configurations to establish a server transport.
 type ServerConfig struct {
-	MaxStreams            uint32
-	ConnectionTimeout     time.Duration
-	Credentials           credentials.TransportCredentials
-	InTapHandle           tap.ServerInHandle
+	MaxStreams        uint32
+	ConnectionTimeout time.Duration
+	Credentials       credentials.TransportCredentials
+	//InTapHandle           tap.ServerInHandle
 	StatsHandler          stats.Handler
 	KeepaliveParams       keepalive.ServerParameters
 	KeepalivePolicy       keepalive.EnforcementPolicy

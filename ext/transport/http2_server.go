@@ -34,22 +34,19 @@ import (
 	"github.com/costinm/hbone/ext/transport/grpcrand"
 	"github.com/costinm/hbone/ext/transport/grpcutil"
 	"github.com/costinm/hbone/ext/transport/syscall"
+
 	"github.com/golang/protobuf/proto"
+
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
-	//"google.golang.org/grpc/internal/syscall"
-
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	//"google.golang.org/grpc/internal/channelz"
-	//"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/tap"
 )
 
 var (
@@ -67,18 +64,18 @@ var serverConnectionCounter uint64
 
 // http2Server implements the ServerTransport interface with HTTP2.
 type http2Server struct {
-	lastRead    int64 // Keep this field 64-bit aligned. Accessed atomically.
-	ctx         context.Context
-	done        chan struct{}
-	conn        net.Conn
-	loopy       *loopyWriter
-	readerDone  chan struct{} // sync point to enable testing.
-	writerDone  chan struct{} // sync point to enable testing.
-	remoteAddr  net.Addr
-	localAddr   net.Addr
-	authInfo    credentials.AuthInfo // auth info about the connection
-	inTapHandle tap.ServerInHandle
-	framer      *framer
+	lastRead   int64 // Keep this field 64-bit aligned. Accessed atomically.
+	ctx        context.Context
+	done       chan struct{}
+	conn       net.Conn
+	loopy      *loopyWriter
+	readerDone chan struct{} // sync point to enable testing.
+	writerDone chan struct{} // sync point to enable testing.
+	remoteAddr net.Addr
+	localAddr  net.Addr
+	authInfo   credentials.AuthInfo // auth info about the connection
+	//inTapHandle tap.ServerInHandle
+	framer *framer
 	// The max number of concurrent streams.
 	maxStreams uint32
 	// controlBuf delivers all the control related tasks (e.g., window
@@ -246,17 +243,17 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 
 	done := make(chan struct{})
 	t := &http2Server{
-		ctx:               setConnection(context.Background(), rawConn),
-		done:              done,
-		conn:              conn,
-		remoteAddr:        conn.RemoteAddr(),
-		localAddr:         conn.LocalAddr(),
-		authInfo:          authInfo,
-		framer:            framer,
-		readerDone:        make(chan struct{}),
-		writerDone:        make(chan struct{}),
-		maxStreams:        maxStreams,
-		inTapHandle:       config.InTapHandle,
+		ctx:        setConnection(context.Background(), rawConn),
+		done:       done,
+		conn:       conn,
+		remoteAddr: conn.RemoteAddr(),
+		localAddr:  conn.LocalAddr(),
+		authInfo:   authInfo,
+		framer:     framer,
+		readerDone: make(chan struct{}),
+		writerDone: make(chan struct{}),
+		maxStreams: maxStreams,
+		//inTapHandle:       config.InTapHandle,
 		fc:                &trInFlow{limit: uint32(icwz)},
 		state:             reachable,
 		activeStreams:     make(map[uint32]*Stream),
@@ -539,27 +536,27 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		s.cancel()
 		return false
 	}
-	if t.inTapHandle != nil {
-		var err error
-		if s.ctx, err = t.inTapHandle(s.ctx, &tap.Info{FullMethodName: s.method}); err != nil {
-			t.mu.Unlock()
-			if logger.V(logLevel) {
-				logger.Infof("transport: http2Server.operateHeaders got an error from InTapHandle: %v", err)
-			}
-			stat, ok := status.FromError(err)
-			if !ok {
-				stat = status.New(codes.PermissionDenied, err.Error())
-			}
-			t.controlBuf.put(&earlyAbortStream{
-				httpStatus:     200,
-				streamID:       s.id,
-				contentSubtype: s.contentSubtype,
-				status:         stat,
-				rst:            !frame.StreamEnded(),
-			})
-			return false
-		}
-	}
+	//if t.inTapHandle != nil {
+	//	var err error
+	//	if s.ctx, err = t.inTapHandle(s.ctx, &tap.Info{FullMethodName: s.method}); err != nil {
+	//		t.mu.Unlock()
+	//		if logger.V(logLevel) {
+	//			logger.Infof("transport: http2Server.operateHeaders got an error from InTapHandle: %v", err)
+	//		}
+	//		stat, ok := status.FromError(err)
+	//		if !ok {
+	//			stat = status.New(codes.PermissionDenied, err.Error())
+	//		}
+	//		t.controlBuf.put(&earlyAbortStream{
+	//			httpStatus:     200,
+	//			streamID:       s.id,
+	//			contentSubtype: s.contentSubtype,
+	//			status:         stat,
+	//			rst:            !frame.StreamEnded(),
+	//		})
+	//		return false
+	//	}
+	//}
 	t.activeStreams[streamID] = s
 	if len(t.activeStreams) == 1 {
 		t.idle = time.Time{}

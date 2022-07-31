@@ -163,9 +163,9 @@ func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error
 	if !ok {
 		networkType, address = parseDialTarget(address)
 	}
-	if networkType == "tcp" && useProxy {
-		return proxyDial(ctx, address, grpcUA)
-	}
+	//if networkType == "tcp" && useProxy {
+	//	return proxyDial(ctx, address, grpcUA)
+	//}
 	return (&net.Dialer{}).DialContext(ctx, networkType, address)
 }
 
@@ -210,6 +210,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		}
 		return nil, connectionErrorf(true, err, "transport: Error while dialing %v", err)
 	}
+
 	// Any further errors will close the underlying connection
 	defer func(conn net.Conn) {
 		if err != nil {
@@ -289,25 +290,25 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		maxHeaderListSize = *opts.MaxHeaderListSize
 	}
 	t := &http2Client{
-		ctx:                   ctx,
-		ctxDone:               ctx.Done(), // Cache Done chan.
-		cancel:                cancel,
-		userAgent:             opts.UserAgent,
-		conn:                  conn,
-		remoteAddr:            conn.RemoteAddr(),
-		localAddr:             conn.LocalAddr(),
-		authInfo:              authInfo,
-		readerDone:            make(chan struct{}),
-		writerDone:            make(chan struct{}),
-		goAway:                make(chan struct{}),
-		framer:                newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize),
-		fc:                    &trInFlow{limit: uint32(icwz)},
-		scheme:                scheme,
-		activeStreams:         make(map[uint32]*Stream),
-		isSecure:              isSecure,
-		perRPCCreds:           perRPCCreds,
-		kp:                    kp,
-		statsHandler:          opts.StatsHandler,
+		ctx:           ctx,
+		ctxDone:       ctx.Done(), // Cache Done chan.
+		cancel:        cancel,
+		userAgent:     opts.UserAgent,
+		conn:          conn,
+		remoteAddr:    conn.RemoteAddr(),
+		localAddr:     conn.LocalAddr(),
+		authInfo:      authInfo,
+		readerDone:    make(chan struct{}),
+		writerDone:    make(chan struct{}),
+		goAway:        make(chan struct{}),
+		framer:        newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize),
+		fc:            &trInFlow{limit: uint32(icwz)},
+		scheme:        scheme,
+		activeStreams: make(map[uint32]*Stream),
+		isSecure:      isSecure,
+		perRPCCreds:   perRPCCreds,
+		kp:            kp,
+		//statsHandler:          opts.StatsHandler,
 		initialWindowSize:     initialWindowSize,
 		onPrefaceReceipt:      onPrefaceReceipt,
 		nextID:                1,
@@ -337,16 +338,16 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 			updateFlowControl: t.updateFlowControl,
 		}
 	}
-	if t.statsHandler != nil {
-		t.ctx = t.statsHandler.TagConn(t.ctx, &stats.ConnTagInfo{
-			RemoteAddr: t.remoteAddr,
-			LocalAddr:  t.localAddr,
-		})
-		connBegin := &stats.ConnBegin{
-			Client: true,
-		}
-		t.statsHandler.HandleConn(t.ctx, connBegin)
-	}
+	//if t.statsHandler != nil {
+	//	t.ctx = t.statsHandler.TagConn(t.ctx, &stats.ConnTagInfo{
+	//		RemoteAddr: t.remoteAddr,
+	//		LocalAddr:  t.localAddr,
+	//	})
+	//	connBegin := &stats.ConnBegin{
+	//		Client: true,
+	//	}
+	//	t.statsHandler.HandleConn(t.ctx, connBegin)
+	//}
 	//t.channelzID, err = channelz.RegisterNormalSocket(t, opts.ChannelzParentID, fmt.Sprintf("%s -> %s", t.localAddr, t.remoteAddr))
 	//if err != nil {
 	//	return nil, err
@@ -769,25 +770,25 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*Stream,
 			return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
 		}
 	}
-	if t.statsHandler != nil {
-		header, ok := metadata.FromOutgoingContext(ctx)
-		if ok {
-			header.Set("user-agent", t.userAgent)
-		} else {
-			header = metadata.Pairs("user-agent", t.userAgent)
-		}
-		// Note: The header fields are compressed with hpack after this call returns.
-		// No WireLength field is set here.
-		outHeader := &stats.OutHeader{
-			Client:      true,
-			FullMethod:  callHdr.Method,
-			RemoteAddr:  t.remoteAddr,
-			LocalAddr:   t.localAddr,
-			Compression: callHdr.SendCompress,
-			Header:      header,
-		}
-		t.statsHandler.HandleRPC(s.ctx, outHeader)
-	}
+	//if t.statsHandler != nil {
+	//	header, ok := metadata.FromOutgoingContext(ctx)
+	//	if ok {
+	//		header.Set("user-agent", t.userAgent)
+	//	} else {
+	//		header = metadata.Pairs("user-agent", t.userAgent)
+	//	}
+	//	// Note: The header fields are compressed with hpack after this call returns.
+	//	// No WireLength field is set here.
+	//	outHeader := &stats.OutHeader{
+	//		Client:      true,
+	//		FullMethod:  callHdr.Method,
+	//		RemoteAddr:  t.remoteAddr,
+	//		LocalAddr:   t.localAddr,
+	//		Compression: callHdr.SendCompress,
+	//		Header:      header,
+	//	}
+	//	t.statsHandler.HandleRPC(s.ctx, outHeader)
+	//}
 	return s, nil
 }
 
@@ -912,12 +913,12 @@ func (t *http2Client) Close(err error) {
 	for _, s := range streams {
 		t.closeStream(s, err, false, http2.ErrCodeNo, st, nil, false)
 	}
-	if t.statsHandler != nil {
-		connEnd := &stats.ConnEnd{
-			Client: true,
-		}
-		t.statsHandler.HandleConn(t.ctx, connEnd)
-	}
+	//if t.statsHandler != nil {
+	//	connEnd := &stats.ConnEnd{
+	//		Client: true,
+	//	}
+	//	t.statsHandler.HandleConn(t.ctx, connEnd)
+	//}
 }
 
 // GracefulClose sets the state to draining, which prevents new streams from
@@ -1406,14 +1407,14 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 		return
 	}
 
-	isHeader := false
+	//isHeader := false
 
 	// If headerChan hasn't been closed yet
 	if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
 		s.headerValid = true
 		if !endStream {
 			// HEADERS frame block carries a Response-Headers.
-			isHeader = true
+			//isHeader = true
 			// These values can be set without any synchronization because
 			// stream goroutine will read it only after seeing a closed
 			// headerChan which we'll close after setting this.
@@ -1428,24 +1429,24 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 		close(s.headerChan)
 	}
 
-	if t.statsHandler != nil {
-		if isHeader {
-			inHeader := &stats.InHeader{
-				Client:      true,
-				WireLength:  int(frame.Header().Length),
-				Header:      metadata.MD(mdata).Copy(),
-				Compression: s.recvCompress,
-			}
-			t.statsHandler.HandleRPC(s.ctx, inHeader)
-		} else {
-			inTrailer := &stats.InTrailer{
-				Client:     true,
-				WireLength: int(frame.Header().Length),
-				Trailer:    metadata.MD(mdata).Copy(),
-			}
-			t.statsHandler.HandleRPC(s.ctx, inTrailer)
-		}
-	}
+	//if t.statsHandler != nil {
+	//	if isHeader {
+	//		inHeader := &stats.InHeader{
+	//			Client:      true,
+	//			WireLength:  int(frame.Header().Length),
+	//			Header:      metadata.MD(mdata).Copy(),
+	//			Compression: s.recvCompress,
+	//		}
+	//		t.statsHandler.HandleRPC(s.ctx, inHeader)
+	//	} else {
+	//		inTrailer := &stats.InTrailer{
+	//			Client:     true,
+	//			WireLength: int(frame.Header().Length),
+	//			Trailer:    metadata.MD(mdata).Copy(),
+	//		}
+	//		t.statsHandler.HandleRPC(s.ctx, inTrailer)
+	//	}
+	//}
 
 	if !endStream {
 		return
