@@ -592,6 +592,10 @@ type stream struct {
 
 	trailer    http.Header // accumulated trailers
 	reqTrailer http.Header // handler's Request.Trailer
+
+	// HBONE:
+	closeWrite     bool
+	closeWriteSent bool
 }
 
 func (sc *serverConn) Framer() *Framer  { return sc.framer }
@@ -1149,7 +1153,9 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 				// RFC 7540 Section 5.1 allows sending RST_STREAM, PRIORITY, and WINDOW_UPDATE
 				// in this state. (We never send PRIORITY from the server, so that is not checked.)
 			default:
-				panic(fmt.Sprintf("internal error: attempt to send frame on a half-closed-local stream: %v", wr))
+				if !st.closeWrite {
+					panic(fmt.Sprintf("internal error: attempt to send frame on a half-closed-local stream: %v", wr))
+				}
 			}
 		case stateClosed:
 			panic(fmt.Sprintf("internal error: attempt to send frame on a closed stream: %v", wr))
@@ -1216,7 +1222,9 @@ func (sc *serverConn) wroteFrame(res frameWriteResult) {
 			// transmission of a request without error by sending a
 			// RST_STREAM with an error code of NO_ERROR after sending
 			// a complete response.
-			sc.resetStream(streamError(st.id, ErrCodeNo))
+			if !res.wr.stream.closeWrite {
+				sc.resetStream(streamError(st.id, ErrCodeNo))
+			}
 		case stateHalfClosedRemote:
 			sc.closeStream(st, errHandlerComplete)
 		}
@@ -1694,7 +1702,9 @@ func (sc *serverConn) processData(f *DataFrame) error {
 			// Already have a stream error in flight. Don't send another.
 			return nil
 		}
-		return sc.countError("closed", streamError(id, ErrCodeStreamClosed))
+		if st.state != stateHalfClosedLocal {
+			return sc.countError("closed", streamError(id, ErrCodeStreamClosed))
+		}
 	}
 	if st.body == nil {
 		panic("internal error: should have a body in this state")
@@ -1716,6 +1726,7 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		st.inflow.take(int32(f.Length))
 
 		if len(data) > 0 {
+			// HBONE: fast path
 			wrote, err := st.body.Write(data)
 			if err != nil {
 				sc.sendWindowUpdate(nil, int(f.Length)-wrote)
@@ -2493,22 +2504,33 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 	if isHeadResp {
 		return len(p), nil
 	}
-	if len(p) == 0 && !rws.handlerDone {
+	// HBONE: close write
+	if len(p) == 0 && !rws.handlerDone && !rws.stream.closeWrite {
 		return 0, nil
 	}
 
-	if rws.handlerDone {
+	if rws.handlerDone || rws.stream.closeWrite {
 		rws.promoteUndeclaredTrailers()
 	}
 
 	// only send trailers if they have actually been defined by the
 	// server handler.
 	hasNonemptyTrailers := rws.hasNonemptyTrailers()
-	endStream := rws.handlerDone && !hasNonemptyTrailers
-	if len(p) > 0 || endStream {
+	endStream := rws.handlerDone && !hasNonemptyTrailers || rws.stream.closeWrite
+	if rws.stream.closeWriteSent {
+		return 0, nil
+	}
+	if len(p) > 0 {
 		// only send a 0 byte DATA frame if we're ending the stream.
 		if err := rws.conn.writeDataFromHandler(rws.stream, p, endStream); err != nil {
 			rws.dirty = true
+			return 0, err
+		}
+	}
+	if endStream {
+		// only send a 0 byte DATA frame if we're ending the stream.
+		if err := rws.conn.writeDataFromHandler(rws.stream, p, endStream); err != nil {
+			rws.stream.closeWriteSent = true
 			return 0, err
 		}
 	}
@@ -2538,8 +2560,9 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 // prior to the headers being written. If the set of trailers is fixed
 // or known before the header is written, the normal Go trailers mechanism
 // is preferred:
-//    https://golang.org/pkg/net/http/#ResponseWriter
-//    https://golang.org/pkg/net/http/#example_ResponseWriter_trailers
+//
+//	https://golang.org/pkg/net/http/#ResponseWriter
+//	https://golang.org/pkg/net/http/#example_ResponseWriter_trailers
 const TrailerPrefix = "Trailer:"
 
 // promoteUndeclaredTrailers permits http.Handlers to set trailers
