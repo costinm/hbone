@@ -1,47 +1,19 @@
 package hbone
 
 import (
-	"context"
-	"crypto/tls"
 	"errors"
-	"io"
 	"log"
 	"net"
 	"strings"
-	"time"
+
+	"github.com/costinm/hbone/nio"
 )
 
-// Will start a SNI proxy, similar with Istio East-West or Gateway SNI router.
-// Accepted connections will decode the ServerName header, and use it to forward to either a HBONE
-// mTLS service or a H2R connection.
-
-func SNIProxy(ctx context.Context, hc *EndpointCon, stdin io.Reader, stdout io.WriteCloser) error {
-	d := net.Dialer{} // TODO: customizations
-
-	conn, err := d.DialContext(ctx, "tcp", hc.SNIGate)
-	if Debug {
-		log.Println("sniProxyC: ", conn.RemoteAddr(), hc.URL, hc.SNIGate)
-	}
-	if err != nil {
-		return err
-	}
-
-	// Using the low-level interface, to keep control over TLS.
-	conf := hc.hb.Auth.GenerateTLSConfigClient(hc.SNI)
-
-	conf.ServerName = hc.SNI
-
-	defer conn.Close()
-
-	tlsCon := tls.Client(conn, conf)
-	err = nio.HandshakeTimeout(tlsCon, hc.hb.HandsahakeTimeout, nil)
-	if err != nil {
-		return err
-	}
-
-	return nio.Proxy(ctx, stdin, stdout, tlsCon, tlsCon)
-}
-
+// HandleSNIConn implements SNI based routing. This can be used for compat
+// with Istio. Was original method to tunnel for serverless.
+//
+// This can be used for a legacy CNI to HBone bridge. The old Istio client expects an mTLS connection
+// to the other end - the HBone proxy is untrusted.
 func HandleSNIConn(hb *HBone, conn net.Conn) {
 	s := nio.NewBufferReader(conn)
 	// will also close the conn ( which is the reader )
@@ -53,34 +25,37 @@ func HandleSNIConn(hb *HBone, conn net.Conn) {
 		return
 	}
 
-	ok, err := hb.HandleH2R(conn, s, sni)
-	if err != nil {
-		log.Println("SNI-H2R 500", sni, err)
-	}
-	if ok {
-		// Handled as h2r
-		return
+	// At this point we have a SNI service name. Need to convert it to a real service
+	// name, Dial and proxy.
+
+	addr := sni + ":443"
+	// Based on SNI, make a hbone request, using JWT auth.
+	if strings.HasPrefix(sni, "outbound_.") {
+		// Current Istio SNI looks like:
+		//
+		// outbound_.9090_._.prometheus-1-prometheus.mon.svc.cluster.local
+		// We need to map it to a cloudrun external address, add token based on the audience, and
+		// make the call using the tunnel.
+		//
+		// Also supports the 'natural' form and egress
+
+		//
+		//
+		parts := strings.SplitN(sni, ".", 4)
+		remoteService := parts[3]
+		// TODO: extract 'version' from URL, convert it to cloudrun revision ?
+		addr = net.JoinHostPort(remoteService, parts[1])
 	}
 
-	// Based on SNI, make a hbone request, using JWT auth.
-	if hb.EndpointResolver != nil {
-		dst := hb.EndpointResolver(sni)
-		if dst != nil {
-			if Debug {
-				log.Println("SNI: start proxy", "sni", sni, "URL", dst.URL)
-			}
-			t0 := time.Now()
-			err = dst.Proxy(context.Background(), s, conn)
-			if err != nil {
-				log.Println("SNI: error connecting to proxy", "sni", sni, "error", err, "URL", dst.URL)
-			} else {
-				log.Println("SNI:done", "sni", sni, "URL", dst.URL, "dur", time.Since(t0))
-			}
-		} else {
-			log.Println("SNI: Missing destination", "sni", sni)
-		}
-	} else {
-		log.Println("SNI: Missing EndpointResolver", "sni", sni)
+	nc, err := hb.Dial("tcp", addr)
+	if err != nil {
+		log.Println("Error connecting ", err)
+		return
+	}
+	err = Proxy(nc, s, conn, addr)
+	if err != nil {
+		log.Println("Error proxy ", err)
+		return
 	}
 }
 
@@ -112,7 +87,7 @@ const (
 //
 // TODO: in mesh, use one cypher suite (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
 // maybe 2 ( since keys are ECDSA )
-func ParseTLS(acc *nio.StreamBuffer) (string, error) {
+func ParseTLS(acc *nio.Buffer) (string, error) {
 	buf, err := acc.Peek(5)
 	if err != nil {
 		return "", err

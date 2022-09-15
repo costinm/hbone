@@ -27,8 +27,6 @@ func (e *EchoHandler) handle(str net.Conn) {
 	}
 	b := &bytes.Buffer{}
 	b.WriteString("Hello world\n")
-	//b.Write(b1)
-	//b.Write([]byte{'\n'})
 
 	time.Sleep(e.WaitFirst)
 

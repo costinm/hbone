@@ -20,16 +20,15 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/costinm/hbone"
+	"github.com/costinm/hbone/auth"
 	"github.com/costinm/hbone/ext/gcp"
-	"github.com/costinm/hbone/ext/grpc"
 	"github.com/costinm/hbone/ext/k8s"
-	"github.com/costinm/ugate/auth"
-	istioca "github.com/costinm/ugate/gen/proto/istio/v1/auth"
-	"github.com/costinm/ugate/gen/proto/xds"
-
-	"google.golang.org/protobuf/proto"
+	"github.com/costinm/hbone/ext/uxds"
+	"github.com/costinm/hbone/ext/uxds/xds"
+	"github.com/golang/protobuf/jsonpb"
 )
 
 // Requires a GSA (either via GOOGLE_APPLICATION_CREDENTIALS, gcloud config, metadata) with hub and
@@ -37,12 +36,14 @@ import (
 // Requires a kube config - the default cluster should be in same project.
 //
 // Will verify kube config loading and queries to hub and gke.
-//
 func TestURest(t *testing.T) {
 	ctx, cf := context.WithCancel(context.Background())
 	defer cf()
 
-	urst := hbone.NewMesh(&hbone.MeshSettings{})
+	// No certificate !
+	hc := &hbone.MeshSettings{}
+	id := auth.NewMeshAuth()
+	urst := hbone.NewHBone(hc, id)
 
 	// Support for "gcp" access tokens using ADS or MDS
 	gcp.InitDefaultTokenSource(ctx, urst)
@@ -61,45 +62,69 @@ func TestURest(t *testing.T) {
 
 	// Tokens using istio-ca audience for Istio
 	catokenS := &k8s.K8STokenSource{Cluster: dk, AudOverride: "istio-ca", Namespace: urst.Namespace, KSA: urst.ServiceAccount}
-	catokenSystem := &k8s.K8STokenSource{Cluster: dk, AudOverride: "istio-ca", Namespace: "istio-system", KSA: urst.ServiceAccount}
 
 	istiodCA := cm["CAROOT_ISTIOD"]
 	istiodAddr := cm["MCON_ADDR"]
+	//log.Println("Using " + istiodAddr + "\n" + istiodCA)
 
-	istiodC := urst.AddCluster("", &hbone.Cluster{
+	// Istiod cluster, using tokens
+	istiodC := urst.AddService(&hbone.Cluster{
 		Addr:          istiodAddr + ":15012",
 		TokenProvider: catokenS.GetToken,
-		Id:            "istiod",
+		Id:            "istiod.istio-system.svc:15012",
 		SNI:           "istiod.istio-system.svc",
-		CACert:        []byte(istiodCA),
-	})
-	istiodSystem := urst.AddCluster("istiod-system", &hbone.Cluster{
-		Addr:          istiodAddr + ":15012",
-		TokenProvider: catokenSystem.GetToken,
-		Id:            "istiod",
-		SNI:           "istiod.istio-system.svc",
-		CACert:        []byte(istiodCA),
-	})
-
-	id := auth.NewMeshAuth()
-	meshCAID := auth.NewMeshAuth()
-
-	t.Run("istiocert", func(t *testing.T) {
-		err = getCertificate(ctx, id, istiodC)
-		if err != nil {
-			t.Fatal(err)
-		}
-	})
-
-	t.Run("xdsc", func(t *testing.T) {
-		err = xdsTest(t, ctx, istiodSystem, "istio-system", "istio/debug/events")
-		if err != nil {
-			t.Fatal(err)
-		}
+		CACert:        istiodCA,
 	})
 
 	t.Run("xdsc-clusters", func(t *testing.T) {
-		err = xdsTest(t, ctx, istiodC, "default", "type.googleapis.com/envoy.config.cluster.v3.Cluster")
+		err = xdsTest(t, ctx, istiodC, urst)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Cert provisioning using tokens.
+	t.Run("istiocert", func(t *testing.T) {
+		err = uxds.GetCertificate(ctx, id, istiodC)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Test for 'system' streams
+	t.Run("xdsc-system", func(t *testing.T) {
+		urstSys := hbone.NewMesh(&hbone.MeshSettings{})
+		gcp.InitDefaultTokenSource(ctx, urstSys)
+		catokenSystem := &k8s.K8STokenSource{Cluster: dk, AudOverride: "istio-ca", Namespace: "istio-system", KSA: urst.ServiceAccount}
+
+		istiodSystem := urstSys.AddService(&hbone.Cluster{
+			Addr:          istiodAddr + ":15012",
+			TokenProvider: catokenSystem.GetToken,
+			Id:            "istiod",
+			SNI:           "istiod.istio-system.svc",
+			CACert:        istiodCA,
+		})
+
+		xdsc, err := uxds.DialContext(ctx, "", &uxds.Config{
+			Cluster: istiodSystem,
+			HBone:   urstSys,
+			Meta: map[string]interface{}{
+				"SERVICE_ACCOUNT": "default",
+				"NAMESPACE":       "istio-system",
+			},
+			InitialDiscoveryRequests: []*xds.DiscoveryRequest{
+				&xds.DiscoveryRequest{TypeUrl: "istio/debug/events"},
+			},
+		})
+
+		err = xdsc.Send(&xds.DiscoveryRequest{
+			TypeUrl: "istio/debug/events"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		xdsc.Wait("istio/debug/events", 10*time.Second)
+
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -120,7 +145,9 @@ func TestURest(t *testing.T) {
 	}
 
 	t.Run("meshca-cert", func(t *testing.T) {
-		sts := auth.NewFederatedTokenSource(&auth.AuthConfig{
+		meshCAID := auth.NewMeshAuth()
+
+		sts := gcp.NewFederatedTokenSource(&gcp.AuthConfig{
 			ProjectNumber: projectNumber,
 			TrustDomain:   projectId + ".svc.id.goog",
 			ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
@@ -134,13 +161,13 @@ func TestURest(t *testing.T) {
 				KSA:         urst.ServiceAccount},
 		})
 
-		meshca := urst.AddCluster("", &hbone.Cluster{
+		meshca := urst.AddService(&hbone.Cluster{
 			Addr:          "meshca.googleapis.com:443",
 			TokenProvider: sts.GetToken,
 			// Used in the TLS request and to verify the DNS SANs
 			SNI: "meshca.googleapis.com",
 		})
-		err := getCertificate(ctx, meshCAID, meshca)
+		err := uxds.GetCertificate(ctx, meshCAID, meshca)
 
 		if err != nil {
 			t.Fatal(err)
@@ -175,7 +202,7 @@ func TestURest(t *testing.T) {
 
 	t.Run("gkelist-in", func(t *testing.T) {
 
-		ts := auth.NewGSATokenSource(&auth.AuthConfig{
+		ts := gcp.NewGSATokenSource(&gcp.AuthConfig{
 			ProjectNumber: projectNumber,
 			TrustDomain:   projectId + ".svc.id.goog",
 			ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
@@ -210,74 +237,43 @@ func TestURest(t *testing.T) {
 
 }
 
-// getCertificate is using Istio CA gRPC protocol to get a certificate for the id.
-// Google implementation of the protocol is also supported.
-func getCertificate(ctx context.Context, id *auth.Auth, ca *hbone.Cluster) error {
-	// TODO: Add ClusterID header
-	var req istioca.IstioCertificateRequest
+var marshal = &jsonpb.Marshaler{OrigName: true, Indent: "  "}
 
-	_, csr, err := id.NewCSR("spiffe://cluster.local/ns/default/sa/default")
-	req.Csr = string(csr)
+func xdsTest(t *testing.T, ctx context.Context, istiodC *hbone.Cluster, ns *hbone.HBone) error {
+	xdsc, err := uxds.DialContext(ctx, "", &uxds.Config{
+		Cluster: istiodC,
+		HBone:   ns,
+		ResponseHandler: func(con *uxds.ADSC, r *xds.DiscoveryResponse) {
+			log.Println("DR:", r.TypeUrl, r.VersionInfo, r.Nonce, len(r.Resources))
+			for _, l := range r.Resources {
+				b, err := marshal.MarshalToString(l)
+				if err != nil {
+					log.Printf("Error in LDS: %v", err)
+				}
 
-	payload, err := proto.Marshal(&req)
-	// TODO: Add ClusterID header
+				log.Println(b)
+			}
+		},
+	})
 
-	path := "/istio.v1.auth.IstioCertificateService/CreateCertificate"
-	if strings.Contains(ca.Addr, "meshca.googleapis.com") {
-		path = "/google.security.meshca.v1.MeshCertificateService/CreateCertificate"
-	}
-
-	//gstr := urest.NewGRPCStream(ctx, ca, path)
-
-	resd, err := grpc.DoGRPC(ctx, ca, path, payload)
-	if err != nil {
-		return err
-	}
-	var res istioca.IstioCertificateResponse
-	proto.Unmarshal(resd, &res)
-	log.Println("Cert: ", res.CertChain)
-	return err
-}
-
-func xdsTest(t *testing.T, ctx context.Context, istiodC *hbone.Cluster, ns, typeurl string) error {
-
-	// Will create a Request, populate with basic headers. The first Send will trigger the roundtrip.
-	// Receive will return the results.
-	gstr := grpc.NewGRPCStream(ctx, istiodC,
-		"/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources")
-
-	// Istio will wait for the first message to be received. Regular gRPC also requires
-	// the body to be available.
-	var req xds.DiscoveryRequest
-	req.Node = &xds.Node{
-		Id: fmt.Sprintf("sidecar~10.244.0.36~foo.%s~%s.svc.cluster.local", ns, ns),
-	}
-	//req.TypeUrl =
-	//
-	req.TypeUrl = typeurl
-
-	b := gstr.GetWriteFrame()
-	bout, err := proto.MarshalOptions{}.MarshalAppend(b.Bytes(), &req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b.UpdateAppend(bout)
-
-	err = gstr.Send(b) // will roundtrip for first send
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for {
-		rm, err := gstr.Recv()
-		if err != nil {
-			t.Fatal(err)
+		res := <-xdsc.Updates
+		if res == "eds" {
+			break
 		}
-
-		var res xds.DiscoveryResponse
-		// Makes copy of byte[]
-		proto.Unmarshal(rm.Data, &res)
-		log.Println("XDSRes: ", res)
 	}
+
+	for _, c := range xdsc.Endpoints {
+
+		if len(c.Endpoints) > 0 && len(c.Endpoints[0].LbEndpoints) > 0 {
+			log.Println(c.ClusterName, c.Endpoints[0].LbEndpoints[0].Endpoint.Address)
+		}
+		//log.Println(prototext.MarshalOptions{Multiline: true}.Format(&c))
+	}
+
 	return err
 }

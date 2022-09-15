@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -16,19 +17,25 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/http2"
+	"github.com/costinm/hbone/ext/transport"
+	"github.com/costinm/hbone/nio"
+	"github.com/costinm/hbone/nio/syscall"
+
+	//"golang.org/x/net/http2"
+	"github.com/costinm/hbone/ext/http2"
 )
 
 // Auth is the interface expected by hbone for mTLS support.
 type Auth interface {
 	GenerateTLSConfigServer() *tls.Config
 	GenerateTLSConfigClient(name string) *tls.Config
+	GenerateTLSConfigClientRoots(name string, pool *x509.CertPool) *tls.Config
 }
 
 // Debug for dev support, will log verbose info.
 // Avoiding dependency on logging - eventually a trace interface will be provided
 // so any logger can be used.
-var Debug = false
+var Debug = true
 
 // MeshSettings has common settings for all clients
 type MeshSettings struct {
@@ -44,9 +51,64 @@ type MeshSettings struct {
 	// Location where the workload is running, to select local clusters.
 	Location string
 
+	ConnectTimeout time.Duration
+	TCPUserTimeout time.Duration
+
+	// Clients by name
+	Clusters map[string]*Cluster
+
+	// Ports is the equivalent of container ports in k8s.
+	// Name follows the same conventions as Istio and should match the port name in the Service.
+	// Port "*" means 'any' port - if set, allows connections to any port by number.
+	// Currently this is loaded from env variables named PORT_name=value, with the default PORT_http=8080
+	// TODO: refine the 'wildcard' to indicate http1/2 protocol
+	// TODO: this can be populated from a WorkloadGroup object, loaded from XDS or mesh env.
+	Ports map[string]string
+
+	// Timeout used for TLS handshakes. If not set, 3 seconds is used.
+	HandsahakeTimeout time.Duration
+
 	// Auth plugs-in mTLS support. The generated configs should perform basic mesh
 	// authentication.
 	Auth Auth
+
+	EnvironmentVariables map[string]string
+
+	// Internal ports
+
+	// Default to 0.0.0.0:15008
+	HBone string
+
+	// Reverse tunnel to this address if set
+	RemoteTunnel string
+
+	// If set, hbonec is enabled on this address
+	// TrustedIPRanges should be used instead.
+	HBoneC string
+
+	// Default to localhost:1080
+	SocksAddr string
+
+	// SNI port, default to 15003
+	SNI string
+
+	AdminPort string
+
+	LocalForward map[int]string
+	// Envoy/Istio
+
+	// ServiceCluster is mapped to Istio canonical service and envoy --serviceCluster
+	// It will show up in x-envoy-downstream-service-cluster if user_agent is true
+	ServiceCluster string
+
+	// Secure is the list of secure networks (IPSec, wireguard, etc).
+	// If both client and server are on a secure network, tls is not used.
+	// WIP - for now any string will cause the cluster to use plaintext.
+	SecureCIDR []string
+
+	// ServiceNode is mapped to node name and envoy --service-node
+	// It will show up in x-envoy-downstream-service-node
+	ServiceNode string
 }
 
 // HBone represents a node using a HTTP/2 or HTTP/3 based overlay network environment.
@@ -65,51 +127,27 @@ type HBone struct {
 	// It is expected to return tokens with the given audience - in case of GCP
 	// returns access tokens. If not set the cluster can't be created.
 	AuthProviders map[string]func(context.Context, string) (string, error)
+	TokenCallback func(ctx context.Context, host string) (string, error)
 
 	// h2Server is the server used for accepting HBONE connections
 	h2Server *http2.Server
 
-	Cert *tls.Certificate
-
-	// Clients by name
-	Clusters map[string]*Cluster
-
 	// rp is used when HBone is used to proxy to a local http/1.1 server.
 	rp *httputil.ReverseProxy
 
-	// Non-local endpoints. Key is the 'pod id' of a H2R client
-	Endpoints map[string]*EndpointCon
+	// h2t is the transport used for all h2 connections used.
+	// hb is the connection pool, gets notified when con is closed.
+	h2t *http2.Transport
 
-	// H2R holds H2 client (reverse) connections to the local server.
-	// Will be used to route requests directly. Key is the SNI expected in forwarding requests.
-	H2R map[string]http.RoundTripper
+	Mux http.ServeMux
 
-	h2rListener net.Listener
-	sniListener net.Listener
-	h2t         *http2.Transport
-
-	SNIAddr string
-
-	TcpAddr string
-
-	// Ports is the equivalent of container ports in k8s.
-	// Name follows the same conventions as Istio and should match the port name in the Service.
-	// Port "*" means 'any' port - if set, allows connections to any port by number.
-	// Currently this is loaded from env variables named PORT_name=value, with the default PORT_http=8080
-	// TODO: refine the 'wildcard' to indicate http1/2 protocol
-	// TODO: this can be populated from a WorkloadGroup object, loaded from XDS or mesh env.
-	Ports map[string]string
-
-	TokenCallback func(ctx context.Context, host string) (string, error)
-	Mux           http.ServeMux
-
-	// Timeout used for TLS handshakes. If not set, 3 seconds is used.
-	HandsahakeTimeout time.Duration
-
+	// EndpointResolver hooks into the Dial process and return the configured
+	// EndpointCon object. This integrates with the XDS/config plane, with
+	// additional local configs.
 	EndpointResolver func(sni string) *EndpointCon
 
 	m           sync.RWMutex
-	H2RConn     map[*http2.ClientConn]string
+	H2RConn     map[*http2.ClientConn]*EndpointCon
 	H2RCallback func(string, *http2.ClientConn)
 
 	// Transport returns a wrapper for the h2c RoundTripper.
@@ -117,9 +155,32 @@ type HBone struct {
 
 	HandlerWrapper func(h http.Handler) http.Handler
 
-	// Client is a
-	Client         *http.Client
-	ConnectTimeout time.Duration
+	Client *http.Client
+	DialF  func(context.Context, *Cluster, net.Conn) (Mux, error)
+	ServeF func(ctx context.Context, hb *HBone, conn net.Conn) error
+}
+
+type noAuth struct {
+}
+
+func (n noAuth) GenerateTLSConfigServer() *tls.Config {
+	return nil
+}
+
+func (n noAuth) GenerateTLSConfigClient(name string) *tls.Config {
+	return nil
+}
+
+func (n noAuth) GenerateTLSConfigClientRoots(name string, pool *x509.CertPool) *tls.Config {
+	return &tls.Config{
+		//MinVersion: tls.VersionTLS13,
+		//PreferServerCipherSuites: ugate.preferServerCipherSuites(),
+
+		ServerName: name,
+		NextProtos: []string{"h2"},
+
+		RootCAs: pool,
+	}
 }
 
 // New creates a new HBone node. It requires a workload identity, including mTLS certificates.
@@ -127,6 +188,14 @@ func New(auth Auth) *HBone {
 	return NewMesh(&MeshSettings{
 		Auth: auth,
 	})
+}
+
+func NewHBone(ms *MeshSettings, auth Auth) *HBone {
+	if ms == nil {
+		ms = &MeshSettings{}
+	}
+	ms.Auth = auth
+	return NewMesh(ms)
 }
 
 // NewMesh creates the mesh object. It requires an auth source. Configuring the auth source should also initialize
@@ -141,18 +210,13 @@ func NewMesh(ms *MeshSettings) *HBone {
 	h2.ReadIdleTimeout = 10 * time.Minute // TODO: much larger to support long-lived connections
 	h2.AllowHTTP = true
 	h2.StrictMaxConcurrentStreams = false
+
 	hb := &HBone{
-		ConnectTimeout: 5 * time.Second,
-		MeshSettings:   ms,
-		Endpoints:      map[string]*EndpointCon{},
-		H2R:            map[string]http.RoundTripper{},
-		H2RConn:        map[*http2.ClientConn]string{},
-		TcpAddr:        "127.0.0.1:8080",
-		h2t:            h2,
-		Ports:          map[string]string{},
-		Clusters:       map[string]*Cluster{},
-		Client:         http.DefaultClient,
-		AuthProviders:  map[string]func(context.Context, string) (string, error){},
+		MeshSettings:  ms,
+		H2RConn:       map[*http2.ClientConn]*EndpointCon{},
+		h2t:           h2,
+		Client:        http.DefaultClient,
+		AuthProviders: map[string]func(context.Context, string) (string, error){},
 		//&http2.Transport{
 		//	ReadIdleTimeout: 10000 * time.Second,
 		//	StrictMaxConcurrentStreams: false,
@@ -161,18 +225,39 @@ func NewMesh(ms *MeshSettings) *HBone {
 
 	}
 	hb.h2t.ConnPool = hb
-	hb.h2Server = &http2.Server{}
 
+	if ms.Auth == nil {
+		ms.Auth = &noAuth{}
+	}
+
+	ms.HandsahakeTimeout = 10 * time.Second
+
+	if ms.Clusters == nil {
+		ms.Clusters = map[string]*Cluster{}
+	} else {
+		for _, c := range ms.Clusters {
+			c.hb = hb
+		}
+	}
+	if ms.ConnectTimeout == 0 {
+		ms.ConnectTimeout = 5 * time.Second
+	}
+
+	hb.h2Server = &http2.Server{
+		MaxReadFrameSize: 1<<24 - 1, // 16M may be too much
+
+		MaxUploadBufferPerConnection: math.MaxInt32 / 2, // not uint32.
+		MaxUploadBufferPerStream:     math.MaxInt32 / 4,
+	}
+
+	// Init the HTTP reverse proxy, for apps listening for HTTP/1.1 on 8080
+	// This is used for serverless but also support regular pods.
+	// TODO: customize the port.
+	// TODO: add a h2 reverse proxy as well on 8082, and grpc on 8081
 	u, _ := url.Parse("http://127.0.0.1:8080")
 	hb.rp = httputil.NewSingleHostReverseProxy(u)
 
 	return hb
-}
-
-func (uk *HBone) AddService(rc *Cluster) {
-	uk.m.Lock()
-	uk.Clusters[rc.Id] = rc
-	uk.m.Unlock()
 }
 
 // StartBHoneD will listen on addr as H2C (typically :15009)
@@ -192,6 +277,9 @@ func (uk *HBone) AddService(rc *Cluster) {
 // TLS handshake.
 // conn may be a wrapped connection.
 func (hb *HBone) HandleAcceptedH2(conn net.Conn) {
+	if hb.TCPUserTimeout != 0 {
+		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
+	}
 	conf := hb.Auth.GenerateTLSConfigServer()
 	defer conn.Close()
 	tls := tls.Server(conn, conf)
@@ -204,9 +292,28 @@ func (hb *HBone) HandleAcceptedH2(conn net.Conn) {
 	hb.HandleAcceptedH2C(tls)
 }
 
+// SecureConn return true if the connection the the specific endpoint is over a secure network and doesn't
+// need encryption.
+func (hb *HBone) SecureConn(ep *Endpoint) bool {
+	//if strings.HasPrefix(ip, "localhost") {
+	//	return true
+	//}
+	//if strings.HasPrefix(ip, "127.") {
+	//	return true
+	//}
+
+	return ep.Secure
+}
+
+const useGrpcH2 = true
+
 // HandleAcceptedH2C handles a plain text H2 connection, for example
 // in case of secure networks.
 func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
+	if hb.TCPUserTimeout != 0 {
+		// only for TCPConn - if this is used for tls no effect
+		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
+	}
 	var hc http.Handler
 	hc = &HBoneAcceptedConn{hb: hb, conn: conn}
 
@@ -214,15 +321,82 @@ func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
 		hc = hb.HandlerWrapper(hc)
 	}
 
+	if hb.ServeF != nil {
+		hb.ServeF(context.Background(), hb, conn)
+		return
+	}
+
+	if useGrpcH2 {
+		st, err := transport.NewServerTransport(conn, &transport.ServerConfig{
+			MaxFrameSize:          1 << 24,
+			InitialConnWindowSize: 1 << 26,
+			InitialWindowSize:     1 << 25,
+		})
+		if err != nil {
+			log.Println("H2 server err", err)
+			conn.Close()
+			return
+		}
+
+		// blocks - read frames
+		st.HandleStreams(func(stream *transport.Stream) {
+			go func() {
+
+				host := stream.Request.Host
+				_, p, _ := net.SplitHostPort(host)
+				// TODO: verify host is endpoint IP ?
+				// TODO: support gateway mode
+
+				hostPort := "localhost:" + p
+
+				log.Println("HBone-START", stream.Id, host, stream)
+				nc, err := net.Dial("tcp", hostPort)
+				if err != nil {
+					log.Println("Error dialing ", hostPort, err)
+					return
+				}
+
+				stream.Response.Status = "200"
+				stream.Response.Header.Add("x-status", "200")
+				st.WriteHeader(stream)
+				proxyErr := Proxy(nc, stream, stream, hostPort)
+				log.Println("HBone-END: ", stream.Id, host, proxyErr)
+			}()
+
+		}, func(ctx context.Context, s string) context.Context {
+			log.Println("Trace", s)
+			return ctx
+		})
+		return
+	}
+
 	hb.h2Server.ServeConn(
 		conn,
 		&http2.ServeConnOpts{
 			Handler: hc, // Also plain text, needs to be upgraded
 			Context: context.Background(),
+			//Raw:     hb,
 			//Context can be used to cancel, pass meta.
 			// h2 adds http.LocalAddrContextKey(NetAddr), ServerContextKey (*Server)
 		})
 }
+
+//// Blocking - handle an accepted H2C using fasthttp2
+//func (hb *HBone) HandleAcceptedH2F(conn net.Conn) {
+//
+//	// TODO: interceptor/wrapper for telemetry
+//
+//	ioch := make(chan *fh2.IOEvent, 1024)
+//	s := &fh2.Server{
+//		IOEventCh: ioch,
+//	}
+//
+//	go hb.handleIOCH(ioch, conn)
+//
+//	// blocking
+//	s.ServeConn(conn)
+//
+//}
 
 // HBoneAcceptedConn keeps track of one accepted H2 connection.
 type HBoneAcceptedConn struct {
@@ -235,10 +409,14 @@ type HBoneAcceptedConn struct {
 // if they don't match a handler may be forwarded by the reverse HTTP
 // proxy.
 func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Println("ServeHTTP", r.Header)
 	t0 := time.Now()
 	var proxyErr error
+	host := r.Host
+
 	defer func() {
-		log.Println(r.Method, r.URL, r.Proto, r.Host, r.RemoteAddr, time.Since(t0), proxyErr)
+		log.Println(r.Method, r.URL, r.Proto, host, r.Header, r.RemoteAddr,
+			time.Since(t0), proxyErr)
 
 		if r := recover(); r != nil {
 			fmt.Println("Recovered in hbone", r)
@@ -262,28 +440,37 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 	}()
 
-	// TODO: parse Envoy / hbone headers.
+	// Envoy can't set the path when upgrading TCP using POST - all info is in :authority header, just like
+	// in CONNECT.
+
+	//
+	// Original :authority from client - for services would be svcname.ns.svc:port
+	//
+	//xfh := r.Header.Get("X-Forwarded-Host")
+
+	// Currently this is only used for 'terminal' connection
+	// TODO: support proxy/gateway mode, use host to forward to the proper pod
+	_, p, err := net.SplitHostPort(host)
+	if err != nil {
+		proxyErr = err
+		w.Header().Add("X-Error", err.Error())
+		return
+	}
+
 	w.(http.Flusher).Flush()
 
-	// TCP Proxy for SSH ( no mTLS, SSH has its own equivalent)
-	if r.RequestURI == "/_hbone/22" {
-		proxyErr = hac.hb.HandleTCPProxy(w, r.Body, "localhost:15022")
-		return
-	}
-	if r.RequestURI == "/_hbone/15003" {
-		proxyErr = hac.hb.HandleTCPProxy(w, r.Body, "localhost:15003")
-		return
-	}
-	if r.RequestURI == "/_hbone/tcp" {
-		proxyErr = hac.hb.HandleTCPProxy(w, r.Body, hac.hb.TcpAddr)
-		return
-	}
+	tunMode := r.Header.Get("X-tun")
+	if tunMode != "" {
+		_, p, err = net.SplitHostPort(tunMode)
 
-	if r.RequestURI == "/_hbone/mtls" {
 		// Create a stream, used for Proxy with caching.
 		conf := hac.hb.Auth.GenerateTLSConfigServer()
 
-		tls := tls.Server(&nio.HTTPConn{R: r.Body, W: w, Conn: hac.conn}, conf)
+		tls := tls.Server(&HTTPConn{R: r.Body,
+			W:    w,
+			Req:  r,
+			ResW: w,
+			Conn: hac.conn}, conf)
 
 		// TODO: replace with handshake with context
 		err := nio.HandshakeTimeout(tls, hac.hb.HandsahakeTimeout, nil)
@@ -299,19 +486,19 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 		// TODO: allow user to customize app port, protocol.
 		// TODO: if protocol is not matching wire protocol, convert.
-		hac.hb.HandleTCPProxy(tls, tls, hac.hb.TcpAddr)
-		//if tls.ConnectionState().NegotiatedProtocol == "h2" {
-		//	// http2 and http expect a net.Listener, and do their own accept()
-		//	hb.Proxy.ServeConn(
-		//		tls,
-		//		&http2.ServeConnOpts{
-		//			Handler: http.HandlerFunc(l.ug.H2Handler.httpHandleHboneCHTTP),
-		//			Context: tc.Context(), // associated with the stream, with cancel
-		//		})
-		//} else {
-		//	// HTTP/1.1
-		//	// TODO. Typically we want to upgrade over the wire to H2
-		//}
+
+		hac.hb.HandleTCPProxy(w, tls, tls, "localhost:"+p)
+
+		return
+	}
+
+	// TODO: other indicators/headers to identify HBONE ?
+
+	// For connect, the requestURI is the same as host - probably for backward compat
+	if r.Method == "CONNECT" || r.URL.Path == "" {
+		// TODO: verify host is endpoint IP ?
+		// TODO: support gateway mode
+		proxyErr = hac.hb.HandleTCPProxy(w, w, r.Body, "localhost:"+p)
 		return
 	}
 
@@ -327,37 +514,15 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 }
 
 // HandleTCPProxy connects and forwards r/w to the hostPort
-func (hb *HBone) HandleTCPProxy(w io.Writer, r io.Reader, hostPort string) error {
+func (hb *HBone) HandleTCPProxy(hw http.ResponseWriter, w io.Writer, r io.Reader, hostPort string) error {
+	log.Println("net.Dial", hostPort)
 	nc, err := net.Dial("tcp", hostPort)
 	if err != nil {
 		log.Println("Error dialing ", hostPort, err)
 		return err
 	}
 
-	s1 := &nio.ReaderCopier{
-		ID:  "TCP-o",
-		Out: nc,
-		In:  r,
-	}
-	ch := make(chan int)
-	go s1.Copy(ch, true)
-
-	s2 := nio.ReaderCopier{
-		ID:  "TCP-i",
-		Out: w,
-		In:  nc,
-	}
-	s2.Copy(nil, true)
-	<-ch
-
-	if s1.Err != nil {
-		return s1.Err
-	}
-	if s2.Err != nil {
-		return s2.Err
-	}
-
-	return nil
+	return Proxy(nc, r, w, hostPort)
 }
 
 // HttpClient returns a http.Client configured with the specified root CA, and reasonable settings.
@@ -398,3 +563,34 @@ func (uK8S *HBone) HttpClient(caCert []byte) *http.Client {
 		Transport: rt,
 	}
 }
+
+//func (hb *HBone) handleIOCH(ioch chan *fh2.IOEvent, conn net.Conn) {
+//	for {
+//		select {
+//		case ioe := <-ioch:
+//			log.Println(ioe.Type, ioe.Frame)
+//			switch fh2.FrameType(ioe.Type) {
+//			case fh2.FrameHeaders:
+//				ioe.Stream.IOChannel = ioch // will not use a go-routine per stream
+//				go hb.handleIOStream(ioch, ioe.Stream, ioe)
+//			case fh2.FrameData:
+//
+//			case fh2.FrameWindowUpdate:
+//			case fh2.FrameResetStream:
+//
+//			}
+//
+//		}
+//	}
+//
+//}
+//
+//func (hb *HBone) handleIOStream(ioch chan *fh2.IOEvent, s *fh2.Stream, ioe *fh2.IOEvent) {
+//
+//	fh := ioe.Frame.Body().(*fh2.Headers)
+//	h := http.Header{}
+//	s.ProcessHeaders(fh.Headers(), h)
+//
+//	ioe.Stream.SendHeaders(true, &http.Header{})
+//
+//}
