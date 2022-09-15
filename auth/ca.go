@@ -22,8 +22,18 @@ const (
 	blockTypePKCS8PrivateKey = "PRIVATE KEY"     // PKCS#8 plain private key
 )
 
-// CA is used as an internal CA, mainly for testing.
+// CA is used as an internal CA, mainly for testing and provisioning.
 // Roughly equivalent with a simplified Istio Citadel.
+//
+// Istio CA uses 2 kinds of roots:
+// - direct - using istio-ca-secret.istio-system secret
+// - intermediate - using cacerts.istio-system
+//
+// Istio stores the files in /etc/cacerts - there are 3 or 4 files:
+// ca-key.pem - root or intermediary key
+// ca-cert.pem - single certificate associated with ca-key.
+// cert-chain.pem - will be appended to all generated certificates - should be a chain path to the root, not including ca-cert
+// ca-cert.pem - the root key (top root)
 type CA struct {
 	Private     *rsa.PrivateKey
 	CACert      *x509.Certificate
@@ -32,6 +42,30 @@ type CA struct {
 }
 
 func NewCA(trust string) *CA {
+	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
+	caCert, _ := rootCert(trust, "rootCA", ca, ca)
+	return &CA{Private: ca, CACert: caCert, TrustDomain: trust,
+		prefix: "spiffe://" + trust + "/ns/",
+	}
+}
+
+func (ca *CA) NewIntermediaryCA(trust string) *CA {
+	cak, _ := rsa.GenerateKey(rand.Reader, 2048)
+	caCert, _ := rootCert(trust, "rootCA", cak, ca.Private)
+	return &CA{Private: cak, CACert: caCert, TrustDomain: trust,
+		prefix: "spiffe://" + trust + "/ns/",
+	}
+}
+
+func LoadCADir(dir, trust string) *CA {
+	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
+	caCert, _ := rootCert(trust, "rootCA", ca, ca)
+	return &CA{Private: ca, CACert: caCert, TrustDomain: trust,
+		prefix: "spiffe://" + trust + "/ns/",
+	}
+}
+
+func LoadCAPEM(keyPEM, certPEM, trust string) *CA {
 	ca, _ := rsa.GenerateKey(rand.Reader, 2048)
 	caCert, _ := rootCert(trust, "rootCA", ca, ca)
 	return &CA{Private: ca, CACert: caCert, TrustDomain: trust,
@@ -48,6 +82,10 @@ func (ca *CA) NewID(ns, sa string) *MeshAuth {
 	nodeID.SetTLSCertificate(crt)
 
 	return nodeID
+}
+
+func (ca *CA) Save(outDir string) error {
+	return nil
 }
 
 func (ca *CA) NewTLSCert(ns, sa string) *tls.Certificate {
