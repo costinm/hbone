@@ -1,7 +1,6 @@
 package nio
 
 import (
-	"context"
 	"crypto/tls"
 	"io"
 	"log"
@@ -15,22 +14,41 @@ import (
 
 // TODO: benchmark different sizes.
 var Debug = false
+var DebugRW = false
 
-// ReaderCopier copies from In to Out
+// ReaderCopier copies from In to Out, keeping track of copied bytes and errors.
 type ReaderCopier struct {
 	// Number of bytes copied.
 	Written int64
+	MaxRead int
+	ReadCnt int
 
 	// First error - may be on reading from In (InError=true) or writing to Out.
 	Err error
 
 	InError bool
 
-	In  io.Reader
+	In io.Reader
+
+	// For tunneled connections, this can be a tls.Writer. Close will write an TOS close.
 	Out io.Writer
 
 	// An ID of the copier, for debug purpose.
 	ID string
+
+	// Set if out doesn't implement Flusher and a separate function is needed.
+	// Example: tunneled mTLS over http, Out is a tls.Conn which writes to a http Body.
+	Flusher http.Flusher
+}
+
+func (rc *ReaderCopier) Close() {
+	if c, ok := rc.In.(io.Closer); ok {
+		c.Close()
+	}
+	if c, ok := rc.Out.(io.Closer); ok {
+		c.Close()
+	}
+
 }
 
 // Verify if in and out can be spliced. Used by proxy code to determine best
@@ -94,12 +112,30 @@ func (s *ReaderCopier) Copy(ch chan int, close bool) {
 			srcc.SetReadDeadline(time.Now().Add(15 * time.Minute))
 		}
 		nr, er := s.In.Read(buf)
-		if Debug {
+		if DebugRW && nr < 1024 {
 			log.Println(s.ID, "read()", nr, er)
 		}
+		if nr > s.MaxRead {
+			s.MaxRead = nr
+		}
+
+		// Even if we have an error, send the bytes we've read.
 		if nr > 0 { // before dealing with the read error
+			s.ReadCnt++
+			// If Out is a ResponseWriter, bad things may happen.
+			// There is no deadline - the buffer is put on a queue, and then there is a wait on a ch.
+			// The ch is signaled when the frame is sent - if window update has been received.
+			// We could try to add a deadline - or directly expose the flow control.
+			// See server.go writeDataFromHandler.
+
+			// Write will never return hanging the handler if the client doesn't read. No way to interupt.
+			// This may happen if the client is done but didn't close the connection or request, it
+			// may still be sending.
+
+			// DoneServing is checked - so it is possible to do this in background, but only works for proxy.
+
 			nw, ew := s.Out.Write(buf[0:nr])
-			if Debug {
+			if DebugRW && nw < 1024 {
 				log.Println(s.ID, "write()", nw, ew)
 			}
 			if nw > 0 {
@@ -108,7 +144,7 @@ func (s *ReaderCopier) Copy(ch chan int, close bool) {
 			if f, ok := s.Out.(http.Flusher); ok {
 				f.Flush()
 			}
-			if nr != nw { // Should not happen
+			if nr != nw && ew == nil { // Should not happen
 				ew = io.ErrShortWrite
 				if Debug {
 					log.Println(s.ID, "write error - short write", s.Err)
@@ -116,16 +152,34 @@ func (s *ReaderCopier) Copy(ch chan int, close bool) {
 			}
 			if ew != nil {
 				s.Err = ew
+				if close {
+					s.rstWriter(ew)
+				}
+				if Debug {
+					log.Println(s.ID, "write error rst writer, close in", close, s.Err)
+				}
 				return
 			}
 		}
+
+		// Handle Read errors - EOF or real error
 		if er != nil {
 			if strings.Contains(er.Error(), "NetworkIdleTimeout") {
 				er = io.EOF
 			}
 			if er == io.EOF {
 				if Debug {
-					log.Println(s.ID, "done()")
+					log.Println(s.ID, "EOF received, closing writer", close)
+				}
+				if close {
+					// read is already closed - we need to close out
+					// TODO: if err is not nil, we should send RST not FIN
+					closeWriter(s.Out)
+					// close in as well - won't receive more data.
+					// However: in many cases this causes the entire net.Conn to close
+					//if c, ok := s.In.(io.Closer); ok {
+					//	c.Close()
+					//}
 				}
 			} else {
 				s.Err = er
@@ -133,14 +187,52 @@ func (s *ReaderCopier) Copy(ch chan int, close bool) {
 				if Debug {
 					log.Println(s.ID, "readError()", s.Err)
 				}
+				if close {
+					// read is already closed - we need to close out
+					// TODO: if err is not nil, we should send RST not FIN
+					s.rstWriter(er)
+				}
 			}
-			if close {
-				// read is already closed - we need to close out
-				closeWriter(s.Out)
+
+			if Debug {
+				log.Println(s.ID, "read DONE", close, s.Err)
 			}
 			return
 		}
 	}
+}
+
+func (s *ReaderCopier) rstWriter(err error) error {
+	if c, ok := s.In.(io.Closer); ok {
+		// Otherwise it keeps getting data - this should send a RST
+		// TODO: should have a method that also allows errr to be set.
+		c.Close()
+	}
+	dst := s.Out
+	if c, ok := dst.(io.Closer); ok {
+		return c.Close()
+	}
+	if c, ok := s.In.(io.Closer); ok {
+		// Otherwise it keeps getting data - this should send a RST
+		// TODO: should have a method that also allows errr to be set.
+		c.Close()
+	}
+	if rw, ok := dst.(http.ResponseWriter); ok {
+		// Server side HTTP stream. For client side, FIN can be sent by closing the pipe (or
+		// request body). For server, the FIN will be sent when the handler returns - but
+		// this only happen after request is completed and body has been read. If server wants
+		// to send FIN first - while still reading the body - we are in trouble.
+
+		// That means HTTP2 TCP servers provide no way to send a FIN from server, without
+		// having the request fully read.
+
+		// This works for H2 with the current library - but very tricky, if not set as trailer.
+		rw.Header().Set("X-Close", "0")
+		rw.(http.Flusher).Flush()
+		return nil
+	}
+	log.Println("Server out not Closer nor CloseWriter nor ResponseWriter", dst)
+	return nil
 }
 
 func closeWriter(dst io.Writer) error {
@@ -168,85 +260,27 @@ func closeWriter(dst io.Writer) error {
 	return nil
 }
 
-func Proxy(ctx context.Context, cin io.Reader, cout io.WriteCloser, sin io.Reader, sout io.WriteCloser) error {
-	ch := make(chan int)
-	s1 := &ReaderCopier{
-		ID:  "client-o",
-		Out: sout,
-		In:  cin,
-	}
-	go s1.Copy(ch, true)
-
-	s2 := &ReaderCopier{
-		ID:  "client-i",
-		Out: cout,
-		In:  sin,
-	}
-	s2.Copy(nil, true)
-	<-ch
-	if s1.Err != nil {
-		return s1.Err
-	}
-	return s2.Err
-}
-
-// HTTPConn wraps a http server request/response in a net.Conn, used mainly as a parameter
-// to tls.Client and tls.Server, if the inner H2 stream uses (m)TLS.
-type HTTPConn struct {
-	R io.Reader
-	W io.Writer
-
-	// Conn is the underlying connection, for getting local/remote address.
-	Conn net.Conn
-}
-
-func (hc *HTTPConn) Read(b []byte) (n int, err error) {
-	return hc.R.Read(b)
-}
-
-// Write wraps the writer, which can be a http.ResponseWriter.
-// Will make sure Flush() is called - normal http is buffering.
-func (hc *HTTPConn) Write(b []byte) (n int, err error) {
-	n, err = hc.W.Write(b)
-	if f, ok := hc.W.(http.Flusher); ok {
-		f.Flush()
-	}
-	return
-}
-
-func (hc *HTTPConn) Close() error {
-	// TODO: close write
-	if cw, ok := hc.W.(CloseWriter); ok {
-		return cw.CloseWrite()
-	}
-	log.Println("Unexpected writer not implement CloseWriter")
-	return nil
-}
-
-func (hc *HTTPConn) LocalAddr() net.Addr {
-	return hc.Conn.LocalAddr()
-}
-
-func (hc *HTTPConn) RemoteAddr() net.Addr {
-	return hc.Conn.RemoteAddr()
-}
-
-func (hc *HTTPConn) SetDeadline(t time.Time) error {
-	err := hc.SetReadDeadline(t)
-	if err != nil {
-		return err
-	}
-	return hc.SetWriteDeadline(t)
-}
-
-func (hc *HTTPConn) SetReadDeadline(t time.Time) error {
-	// TODO: body read timeout
-	return hc.Conn.SetReadDeadline(t)
-}
-
-func (hc *HTTPConn) SetWriteDeadline(t time.Time) error {
-	return hc.Conn.SetWriteDeadline(t)
-}
+//func Proxy(ctx context.Context, cin io.Reader, cout io.WriteCloser, sin io.Reader, sout io.WriteCloser) error {
+//	ch := make(chan int)
+//	s1 := &ReaderCopier{
+//		ID:  "client-o",
+//		Out: sout,
+//		In:  cin,
+//	}
+//	go s1.Copy(ch, true)
+//
+//	s2 := &ReaderCopier{
+//		ID:  "client-i",
+//		Out: cout,
+//		In:  sin,
+//	}
+//	s2.Copy(nil, true)
+//	<-ch
+//	if s1.Err != nil {
+//		return s1.Err
+//	}
+//	return s2.Err
+//}
 
 type tlsHandshakeTimeoutError struct{}
 
@@ -280,6 +314,16 @@ func HandshakeTimeout(tlsConn *tls.Conn, d time.Duration, plainConn net.Conn) er
 		return err
 	}
 	return nil
+}
+
+func ListenAndServeTCP(addr string, f func(conn net.Conn)) (net.Listener, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	go ServeListener(listener, f)
+	return listener, nil
 }
 
 func ServeListener(l net.Listener, f func(conn net.Conn)) error {
