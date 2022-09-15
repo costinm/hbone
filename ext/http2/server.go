@@ -593,7 +593,6 @@ type stream struct {
 	trailer    http.Header // accumulated trailers
 	reqTrailer http.Header // handler's Request.Trailer
 
-	// HBONE:
 	closeWrite     bool
 	closeWriteSent bool
 }
@@ -1702,7 +1701,7 @@ func (sc *serverConn) processData(f *DataFrame) error {
 			// Already have a stream error in flight. Don't send another.
 			return nil
 		}
-		if st.state != stateHalfClosedLocal {
+		if st == nil || st.state != stateHalfClosedLocal {
 			return sc.countError("closed", streamError(id, ErrCodeStreamClosed))
 		}
 	}
@@ -1726,7 +1725,6 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		st.inflow.take(int32(f.Length))
 
 		if len(data) > 0 {
-			// HBONE: fast path
 			wrote, err := st.body.Write(data)
 			if err != nil {
 				sc.sendWindowUpdate(nil, int(f.Length)-wrote)
@@ -2362,6 +2360,15 @@ type responseWriter struct {
 	rws *responseWriterState
 }
 
+func (w *responseWriter) CloseWrite() error {
+	rws := w.rws
+	if rws != nil {
+		rws.stream.closeWrite = true
+	}
+	w.Flush()
+	return nil
+}
+
 // Optional http.ResponseWriter interfaces implemented.
 var (
 	_ http.CloseNotifier = (*responseWriter)(nil)
@@ -2504,7 +2511,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 	if isHeadResp {
 		return len(p), nil
 	}
-	// HBONE: close write
+	//  close write
 	if len(p) == 0 && !rws.handlerDone && !rws.stream.closeWrite {
 		return 0, nil
 	}
@@ -2517,20 +2524,21 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 	// server handler.
 	hasNonemptyTrailers := rws.hasNonemptyTrailers()
 	endStream := rws.handlerDone && !hasNonemptyTrailers || rws.stream.closeWrite
-	if rws.stream.closeWriteSent {
-		return 0, nil
-	}
-	if len(p) > 0 {
+
+	if len(p) > 0 && !rws.stream.closeWriteSent {
 		// only send a 0 byte DATA frame if we're ending the stream.
+		if endStream {
+			rws.stream.closeWriteSent = true
+		}
 		if err := rws.conn.writeDataFromHandler(rws.stream, p, endStream); err != nil {
 			rws.dirty = true
 			return 0, err
 		}
 	}
-	if endStream {
+	if endStream && !rws.stream.closeWriteSent {
 		// only send a 0 byte DATA frame if we're ending the stream.
+		rws.stream.closeWriteSent = true
 		if err := rws.conn.writeDataFromHandler(rws.stream, p, endStream); err != nil {
-			rws.stream.closeWriteSent = true
 			return 0, err
 		}
 	}
