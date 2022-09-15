@@ -15,13 +15,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 
 	"github.com/costinm/hbone"
 	"github.com/costinm/hbone/auth"
-	"github.com/costinm/hbone/ext/tcpproxy"
 )
 
 // Redirect stdin/stdout to a TCP-over-Http2 destination, minimal auth.
@@ -30,9 +30,16 @@ import (
 func main() {
 	auth := auth.NewMeshAuth()
 	hb := hbone.New(auth)
+	ctx := context.Background()
 
 	dest := os.Args[0]
-	err := tcpproxy.Forward(dest, hb, "", auth, os.Stdin, os.Stdout)
+	nc, err := hb.DialContext(ctx, "", dest)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error forwarding ", err)
+		log.Fatal(err)
+	}
+
+	err = hbone.Proxy(nc, os.Stdin, os.Stdout, dest)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error forwarding ", err)
 		log.Fatal(err)
