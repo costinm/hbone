@@ -129,12 +129,11 @@ type HBone struct {
 	AuthProviders map[string]func(context.Context, string) (string, error)
 	TokenCallback func(ctx context.Context, host string) (string, error)
 
-	// h2Server is the server used for accepting HBONE connections
-	h2Server *http2.Server
-
 	// rp is used when HBone is used to proxy to a local http/1.1 server.
 	rp *httputil.ReverseProxy
 
+	// h2Server is the server used for accepting HBONE connections
+	h2Server *http2.Server
 	// h2t is the transport used for all h2 connections used.
 	// hb is the connection pool, gets notified when con is closed.
 	h2t *http2.Transport
@@ -203,18 +202,18 @@ func NewHBone(ms *MeshSettings, auth Auth) *HBone {
 func NewMesh(ms *MeshSettings) *HBone {
 
 	// Need to set this to allow timeout on the read header
-	h1 := &http.Transport{
-		ExpectContinueTimeout: 3 * time.Second,
-	}
-	h2, _ := http2.ConfigureTransports(h1)
-	h2.ReadIdleTimeout = 10 * time.Minute // TODO: much larger to support long-lived connections
-	h2.AllowHTTP = true
-	h2.StrictMaxConcurrentStreams = false
+	//h1 := &http.Transport{
+	//	ExpectContinueTimeout: 3 * time.Second,
+	//}
+	//h2, _ := http2.ConfigureTransports(h1)
+	//h2.ReadIdleTimeout = 10 * time.Minute // TODO: much larger to support long-lived connections
+	//h2.AllowHTTP = true
+	//h2.StrictMaxConcurrentStreams = false
 
 	hb := &HBone{
-		MeshSettings:  ms,
-		H2RConn:       map[*http2.ClientConn]*EndpointCon{},
-		h2t:           h2,
+		MeshSettings: ms,
+		H2RConn:      map[*http2.ClientConn]*EndpointCon{},
+		//h2t:           h2,
 		Client:        http.DefaultClient,
 		AuthProviders: map[string]func(context.Context, string) (string, error){},
 		//&http2.Transport{
@@ -224,7 +223,7 @@ func NewMesh(ms *MeshSettings) *HBone {
 		//},
 
 	}
-	hb.h2t.ConnPool = hb
+	//hb.h2t.ConnPool = hb
 
 	if ms.Auth == nil {
 		ms.Auth = &noAuth{}
@@ -244,7 +243,7 @@ func NewMesh(ms *MeshSettings) *HBone {
 	}
 
 	hb.h2Server = &http2.Server{
-		MaxReadFrameSize: 1<<24 - 1, // 16M may be too much
+		//MaxReadFrameSize: 1<<24 - 1, // 16M may be too much
 
 		MaxUploadBufferPerConnection: math.MaxInt32 / 2, // not uint32.
 		MaxUploadBufferPerStream:     math.MaxInt32 / 4,
@@ -305,7 +304,7 @@ func (hb *HBone) SecureConn(ep *Endpoint) bool {
 	return ep.Secure
 }
 
-const useGrpcH2 = true
+const useGrpcH2 = false
 
 // HandleAcceptedH2C handles a plain text H2 connection, for example
 // in case of secure networks.
@@ -380,23 +379,6 @@ func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
 			// h2 adds http.LocalAddrContextKey(NetAddr), ServerContextKey (*Server)
 		})
 }
-
-//// Blocking - handle an accepted H2C using fasthttp2
-//func (hb *HBone) HandleAcceptedH2F(conn net.Conn) {
-//
-//	// TODO: interceptor/wrapper for telemetry
-//
-//	ioch := make(chan *fh2.IOEvent, 1024)
-//	s := &fh2.Server{
-//		IOEventCh: ioch,
-//	}
-//
-//	go hb.handleIOCH(ioch, conn)
-//
-//	// blocking
-//	s.ServeConn(conn)
-//
-//}
 
 // HBoneAcceptedConn keeps track of one accepted H2 connection.
 type HBoneAcceptedConn struct {

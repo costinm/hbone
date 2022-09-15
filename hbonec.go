@@ -551,28 +551,34 @@ func (c *Cluster) dial(ctx context.Context, req *http.Request) (*EndpointCon, ne
 			Cluster: c}, err
 	}
 
-	if useGrpcH2 {
-		if req == nil {
-			req, _ = http.NewRequestWithContext(ctx, "CONNECT", "https://"+epc.Endpoint.Address, nil)
-		}
-
-		req.Header.Add("X-Service", c.Addr)
-
-		res, tlsc, err := c.rt(epc, req)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		nc := res.Body.(net.Conn)
-		// TODO: return nc directly instead of HTTPConn
-		return epc, &HTTPConn{
-			R:       res.Body,
-			W:       nc,
-			Conn:    tlsc.tlsCon,
-			Req:     req,
-			Res:     res,
-			Cluster: c}, err
+	if !useGrpcH2 {
+		return InitH2ClientConn(ctx, req, epc, c)
 	}
+	if req == nil {
+		req, _ = http.NewRequestWithContext(ctx, "CONNECT", "https://"+epc.Endpoint.Address, nil)
+	}
+
+	req.Header.Add("X-Service", c.Addr)
+
+	res, tlsc, err := c.rt(epc, req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	nc := res.Body.(net.Conn)
+	// TODO: return nc directly instead of HTTPConn
+	return epc, &HTTPConn{
+		R:       res.Body,
+		W:       nc,
+		Conn:    tlsc.tlsCon,
+		Req:     req,
+		Res:     res,
+		Cluster: c}, err
+}
+
+/// temp
+
+func InitH2ClientConn(ctx context.Context, req *http.Request, epc *EndpointCon, c *Cluster) (*EndpointCon, net.Conn, error) {
 	// It is usually possible to pass stdin directly to NewRequest.
 	// Using a pipe allows getting stats.
 	var out io.Writer
@@ -598,6 +604,8 @@ func (c *Cluster) dial(ctx context.Context, req *http.Request) (*EndpointCon, ne
 	return epc, &HTTPConn{R: res.Body, W: out, Conn: tlsc.tlsCon,
 		Req: req, Res: res, Cluster: c}, err
 }
+
+//var InitH2ClientConn func(ctx context.Context, req *http.Request, epc *EndpointCon, c *Cluster) (*EndpointCon, net.Conn, error)
 
 func (c *Cluster) RoundTrip(req *http.Request) (*http.Response, error) {
 	epc, err := c.findMux(req.Context())

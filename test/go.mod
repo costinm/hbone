@@ -8,7 +8,7 @@ replace github.com/costinm/hbone/ext/gcp => ../ext/gcp
 
 replace github.com/costinm/hbone/ext/transport => ../ext/transport
 
-replace github.com/costinm/hbone/ext/http2 => ../ext/http2
+//replace github.com/costinm/hbone/ext/http2 => ../ext/http2
 
 replace github.com/costinm/hbone/ext/uxds => ../ext/uxds
 

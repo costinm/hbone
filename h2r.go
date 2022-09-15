@@ -6,12 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"time"
 
 	"github.com/costinm/hbone/nio"
-	//"golang.org/x/net/http2"
-	"github.com/costinm/hbone/ext/http2"
 )
 
 // H2R implements a reverse H2 connection:
@@ -80,11 +77,12 @@ func (hc *EndpointCon) DialH2R(ctx context.Context, addr string) (net.Conn, erro
 		backoff := 50 * time.Millisecond
 		for {
 			t0 := time.Now()
-			hc.c.hb.h2Server.ServeConn(tc, &http2.ServeConnOpts{
-				//Context:    ctx,
-				Handler:    &HBoneAcceptedConn{conn: hc.tlsCon, hb: hc.c.hb},
-				BaseConfig: &http.Server{},
-			})
+			// XXX replace with grpc stack
+			//hc.c.hb.h2Server.ServeConn(tc, &http2.ServeConnOpts{
+			//	//Context:    ctx,
+			//	Handler:    &HBoneAcceptedConn{conn: hc.tlsCon, hb: hc.c.hb},
+			//	BaseConfig: &http.Server{},
+			//})
 			if Debug {
 				log.Println("H2RClient closed, redial", time.Since(t0))
 			}
@@ -115,34 +113,34 @@ func (hc *EndpointCon) DialH2R(ctx context.Context, addr string) (net.Conn, erro
 	return tlsCon, nil
 }
 
-// GetClientConn is called by http2.Transport, if Transport.RoundTrip is called (
-// for example used in a http.Client ). We are using the http2.ClientConn directly,
-// but this method may be needed if this library is used as a http client.
-func (hb *HBone) GetClientConn(req *http.Request, addr string) (*http2.ClientConn, error) {
-	c, err := hb.Cluster(req.Context(), addr)
-	if err != nil {
-		return nil, err
-	}
-
-	m, err := c.findMux(req.Context())
-	if err != nil {
-		return nil, err
-	}
-
-	return m.rt.(*http2.ClientConn), nil
-}
-
-func (hb *HBone) MarkDead(conn *http2.ClientConn) {
-	hb.m.Lock()
-	sni := hb.H2RConn[conn]
-
-	if sni != nil {
-		log.Println("H2RSNI: MarkDead ", sni)
-	}
-	delete(hb.H2RConn, conn)
-	hb.m.Unlock()
-
-}
+//// GetClientConn is called by http2.Transport, if Transport.RoundTrip is called (
+//// for example used in a http.Client ). We are using the http2.ClientConn directly,
+//// but this method may be needed if this library is used as a http client.
+//func (hb *HBone) GetClientConn(req *http.Request, addr string) (*http2.ClientConn, error) {
+//	c, err := hb.Cluster(req.Context(), addr)
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	m, err := c.findMux(req.Context())
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	return m.rt.(*http2.ClientConn), nil
+//}
+//
+//func (hb *HBone) MarkDead(conn *http2.ClientConn) {
+//	hb.m.Lock()
+//	sni := hb.H2RConn[conn]
+//
+//	if sni != nil {
+//		log.Println("H2RSNI: MarkDead ", sni)
+//	}
+//	delete(hb.H2RConn, conn)
+//	hb.m.Unlock()
+//
+//}
 
 // HandleH2RConn takes a connection on the H2R port or on a stream and
 // implements a reverse connection.
