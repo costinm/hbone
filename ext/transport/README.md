@@ -20,7 +20,52 @@ The changes made to gRPC are around few goals:
 
 Ideally the framer can also be optimized and an event based, non-blocking low level can be added. 
 
+# TODO
+
+- test with 1M frame size instead of default 16k
+- remove the use of the pipe for http request
+- use Stream as net.Conn
+- P0 implement deadlines properly, use an idle timer for streams too
+- Read() seems to return one frame at a time - despite having more info. Should also report buffered in/iot
+
 # Internals
+
+## API
+
+- ServerTransport is an interface - gRPC allows plugging different implemenation, so hbone could
+be one.
+
+- HandleStreams() callbacks on stream received - returns after handshake !
+- WriteHeader(s), Write(...), WriteStatus(), Close(), Drain(), IncrMsgSend/Recv 
+- 'channelzData' has stats for the stream.
+
+- Context includes the Stream ( with interface exposing the Method, SetHeader, SendHeader, SetTrailer)
+
+
+Client:
+- Close/GracefulClose for the connection
+- Write(stream, 2 byte[], last)
+- NewStrem() - sends headers, doesn't wait
+- CloseStream() - must be called when stream is finished.
+- Error() ch -> closed on connection error
+- GoAway() ch for graceful connection close
+- 
+
+## Removed / fixed
+
+- grpc specific headers
+- auth - using http layer
+- the h in data frames
+- context, MD - since exposing the Stream directly.
+- Write - was not blocking on write, since byte[] was result of marshal. Also no 
+reuse
+- Read - io semantics, partial reads instead of readfull.
+
+## Added
+
+- WIP: frame size. Std stack allows setting it for server - but not in client.
+
+## Code
 
 - bpdEstimator - evaluate bandwidth ( Bandwidth * Delay product), for dynamicWindow (unless InitialConnWindowSize is set),
 updates the window and sends SettingsInitialWindowSize dynamically.

@@ -33,13 +33,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
-	spb "google.golang.org/genproto/googleapis/rpc/status"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/grpclog"
-	"google.golang.org/grpc/status"
+	http2 "github.com/costinm/hbone/ext/transport/frame"
+
+	"github.com/costinm/hbone/ext/transport/hpack"
+	//"golang.org/x/net/http2"
+	//"golang.org/x/net/http2/hpack"
 )
 
 const (
@@ -57,42 +55,41 @@ const (
 
 var (
 	clientPreface   = []byte(http2.ClientPreface)
-	http2ErrConvTab = map[http2.ErrCode]codes.Code{
-		http2.ErrCodeNo:                 codes.Internal,
-		http2.ErrCodeProtocol:           codes.Internal,
-		http2.ErrCodeInternal:           codes.Internal,
-		http2.ErrCodeFlowControl:        codes.ResourceExhausted,
-		http2.ErrCodeSettingsTimeout:    codes.Internal,
-		http2.ErrCodeStreamClosed:       codes.Internal,
-		http2.ErrCodeFrameSize:          codes.Internal,
-		http2.ErrCodeRefusedStream:      codes.Unavailable,
-		http2.ErrCodeCancel:             codes.Canceled,
-		http2.ErrCodeCompression:        codes.Internal,
-		http2.ErrCodeConnect:            codes.Internal,
-		http2.ErrCodeEnhanceYourCalm:    codes.ResourceExhausted,
-		http2.ErrCodeInadequateSecurity: codes.PermissionDenied,
-		http2.ErrCodeHTTP11Required:     codes.Internal,
+	http2ErrConvTab = map[http2.ErrCode]Code{
+		http2.ErrCodeNo:                 Internal,
+		http2.ErrCodeProtocol:           Internal,
+		http2.ErrCodeInternal:           Internal,
+		http2.ErrCodeFlowControl:        ResourceExhausted,
+		http2.ErrCodeSettingsTimeout:    Internal,
+		http2.ErrCodeStreamClosed:       Internal,
+		http2.ErrCodeFrameSize:          Internal,
+		http2.ErrCodeRefusedStream:      Unavailable,
+		http2.ErrCodeCancel:             Canceled,
+		http2.ErrCodeCompression:        Internal,
+		http2.ErrCodeConnect:            Internal,
+		http2.ErrCodeEnhanceYourCalm:    ResourceExhausted,
+		http2.ErrCodeInadequateSecurity: PermissionDenied,
+		http2.ErrCodeHTTP11Required:     Internal,
 	}
 	// HTTPStatusConvTab is the HTTP status code to gRPC error code conversion table.
-	HTTPStatusConvTab = map[int]codes.Code{
+	HTTPStatusConvTab = map[int]Code{
 		// 400 Bad Request - INTERNAL.
-		http.StatusBadRequest: codes.Internal,
+		http.StatusBadRequest: Internal,
 		// 401 Unauthorized  - UNAUTHENTICATED.
-		http.StatusUnauthorized: codes.Unauthenticated,
+		http.StatusUnauthorized: Unauthenticated,
 		// 403 Forbidden - PERMISSION_DENIED.
-		http.StatusForbidden: codes.PermissionDenied,
+		http.StatusForbidden: PermissionDenied,
 		// 404 Not Found - UNIMPLEMENTED.
-		http.StatusNotFound: codes.Unimplemented,
+		http.StatusNotFound: Unimplemented,
 		// 429 Too Many Requests - UNAVAILABLE.
-		http.StatusTooManyRequests: codes.Unavailable,
+		http.StatusTooManyRequests: Unavailable,
 		// 502 Bad Gateway - UNAVAILABLE.
-		http.StatusBadGateway: codes.Unavailable,
+		http.StatusBadGateway: Unavailable,
 		// 503 Service Unavailable - UNAVAILABLE.
-		http.StatusServiceUnavailable: codes.Unavailable,
+		http.StatusServiceUnavailable: Unavailable,
 		// 504 Gateway timeout - UNAVAILABLE.
-		http.StatusGatewayTimeout: codes.Unavailable,
+		http.StatusGatewayTimeout: Unavailable,
 	}
-	logger = grpclog.Component("transport")
 )
 
 // isReservedHeader checks whether hdr belongs to HTTP2 headers
@@ -111,6 +108,22 @@ func isReservedHeader(hdr string) bool {
 		"grpc-status",
 		"grpc-timeout",
 		"grpc-status-details-bin",
+		// Intentionally exclude grpc-previous-rpc-attempts and
+		// grpc-retry-pushback-ms, which are "reserved", but their API
+		// intentionally works via metadata.
+		"te":
+		return true
+	default:
+		return false
+	}
+}
+
+func isReservedHeaderReq(hdr string) bool {
+	if hdr != "" && hdr[0] == ':' {
+		return true
+	}
+	switch strings.ToLower(hdr) {
+	case "content-type",
 		// Intentionally exclude grpc-previous-rpc-attempts and
 		// grpc-retry-pushback-ms, which are "reserved", but their API
 		// intentionally works via metadata.
@@ -159,18 +172,6 @@ func decodeMetadataHeader(k, v string) (string, error) {
 		return string(b), err
 	}
 	return v, nil
-}
-
-func decodeGRPCStatusDetails(rawDetails string) (*status.Status, error) {
-	v, err := decodeBinHeader(rawDetails)
-	if err != nil {
-		return nil, err
-	}
-	st := &spb.Status{}
-	if err = proto.Unmarshal(v, st); err != nil {
-		return nil, err
-	}
-	return status.FromProto(st), nil
 }
 
 type timeoutUnit uint8
@@ -373,7 +374,7 @@ type framer struct {
 	fr     *http2.Framer
 }
 
-func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderListSize uint32) *framer {
+func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderListSize uint32, maxFrame uint32) *framer {
 	if writeBufferSize < 0 {
 		writeBufferSize = 0
 	}
@@ -386,7 +387,7 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderList
 		writer: w,
 		fr:     http2.NewFramer(w, r),
 	}
-	f.fr.SetMaxReadFrameSize(http2MaxFrameLen)
+	f.fr.SetMaxReadFrameSize(maxFrame)
 	// Opt-in to Frame reuse API on framer to reduce garbage.
 	// Frames aren't safe to read from after a subsequent call to ReadFrame.
 	f.fr.SetReuseFrames()

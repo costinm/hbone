@@ -2,22 +2,21 @@ package transport
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	"github.com/costinm/hbone/ext/transport/syscall"
-	"golang.org/x/net/http2"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/resolver"
+	http2 "github.com/costinm/hbone/ext/transport/frame"
+	"github.com/costinm/hbone/nio"
 )
 
 // newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
-func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, addr resolver.Address, opts ConnectOptions, onPrefaceReceipt func(), onGoAway func(GoAwayReason), onClose func()) (_ *http2Client, err error) {
+func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, opts ConnectOptions, onPrefaceReceipt func(), onGoAway func(GoAwayReason), onClose func()) (_ *HTTP2ClientMux, err error) {
 	scheme := "http"
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
@@ -42,48 +41,17 @@ func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, addr resolve
 	}
 	keepaliveEnabled := false
 	if kp.Time != infinity {
-		if err = syscall.SetTCPUserTimeout(conn, kp.Timeout); err != nil {
-			return nil, connectionErrorf(false, err, "transport: failed to set TCP_USER_TIMEOUT: %v", err)
-		}
+		//if err = syscall.SetTCPUserTimeout(conn, kp.Timeout); err != nil {
+		//	return nil, connectionErrorf(false, err, "transport: failed to set TCP_USER_TIMEOUT: %v", err)
+		//}
 		keepaliveEnabled = true
 	}
 	isSecure := true
-	var (
-		authInfo credentials.AuthInfo
-	)
-	transportCreds := opts.TransportCredentials
-	perRPCCreds := opts.PerRPCCredentials
+	//var (
+	//	authInfo credentials.AuthInfo
+	//)
+	//perRPCCreds := opts.PerRPCCredentials
 
-	if transportCreds != nil {
-		rawConn := conn
-		// Pull the deadline from the connectCtx, which will be used for
-		// timeouts in the authentication protocol handshake. Can ignore the
-		// boolean as the deadline will return the zero value, which will make
-		// the conn not timeout on I/O operations.
-		deadline, _ := connectCtx.Deadline()
-		rawConn.SetDeadline(deadline)
-		conn, authInfo, err = transportCreds.ClientHandshake(connectCtx, addr.ServerName, rawConn)
-		rawConn.SetDeadline(time.Time{})
-		if err != nil {
-			return nil, connectionErrorf(isTemporary(err), err, "transport: authentication handshake failed: %v", err)
-		}
-		for _, cd := range perRPCCreds {
-			if cd.RequireTransportSecurity() {
-				if ci, ok := authInfo.(interface {
-					GetCommonAuthInfo() credentials.CommonAuthInfo
-				}); ok {
-					secLevel := ci.GetCommonAuthInfo().SecurityLevel
-					if secLevel != credentials.InvalidSecurityLevel && secLevel < credentials.PrivacyAndIntegrity {
-						return nil, connectionErrorf(true, nil, "transport: cannot send secure credentials on an insecure connection")
-					}
-				}
-			}
-		}
-		isSecure = true
-		if transportCreds.Info().SecurityProtocol == "tls" {
-			scheme = "https"
-		}
-	}
 	dynamicWindow := true
 	icwz := int32(initialWindowSize)
 	if opts.InitialConnWindowSize >= defaultWindowSize {
@@ -96,24 +64,25 @@ func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, addr resolve
 	if opts.MaxHeaderListSize != nil {
 		maxHeaderListSize = *opts.MaxHeaderListSize
 	}
-	t := &http2Client{
-		ctx:                   ctx,
-		ctxDone:               ctx.Done(), // Cache Done chan.
-		cancel:                cancel,
-		userAgent:             opts.UserAgent,
-		conn:                  conn,
-		remoteAddr:            conn.RemoteAddr(),
-		localAddr:             conn.LocalAddr(),
-		authInfo:              authInfo,
-		readerDone:            make(chan struct{}),
-		writerDone:            make(chan struct{}),
-		goAway:                make(chan struct{}),
-		framer:                newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize),
-		fc:                    &trInFlow{limit: uint32(icwz)},
-		scheme:                scheme,
-		activeStreams:         make(map[uint32]*Stream),
-		isSecure:              isSecure,
-		perRPCCreds:           perRPCCreds,
+	fs := uint32(http2MaxFrameLen)
+	if opts.MaxFrameSize != 0 {
+		fs = opts.MaxFrameSize
+	}
+	t := &HTTP2ClientMux{
+		ctx:           ctx,
+		ctxDone:       ctx.Done(), // Cache Done chan.
+		cancel:        cancel,
+		userAgent:     opts.UserAgent,
+		conn:          conn,
+		readerDone:    make(chan struct{}),
+		writerDone:    make(chan struct{}),
+		goAway:        make(chan struct{}),
+		framer:        newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize, fs),
+		fc:            &trInFlow{limit: uint32(icwz)},
+		scheme:        scheme,
+		activeStreams: make(map[uint32]*Stream),
+		isSecure:      isSecure,
+		//perRPCCreds:           perRPCCreds,
 		kp:                    kp,
 		initialWindowSize:     initialWindowSize,
 		onPrefaceReceipt:      onPrefaceReceipt,
@@ -128,11 +97,6 @@ func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, addr resolve
 		bufferPool:            newBufferPool(),
 	}
 
-	if md, ok := addr.Metadata.(*metadata.MD); ok {
-		t.md = *md
-		//} else if md := imetadata.Get(addr); md != nil {
-		//	t.md = md
-	}
 	t.controlBuf = newControlBuffer(t.ctxDone)
 	if opts.InitialWindowSize >= defaultWindowSize {
 		t.initialWindowSize = opts.InitialWindowSize
@@ -177,6 +141,11 @@ func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, addr resolve
 			Val: uint32(t.initialWindowSize),
 		})
 	}
+	ss = append(ss, http2.Setting{
+		ID:  http2.SettingMaxFrameSize,
+		Val: fs,
+	})
+	t.FrameSize = fs
 	if opts.MaxHeaderListSize != nil {
 		ss = append(ss, http2.Setting{
 			ID:  http2.SettingMaxHeaderListSize,
@@ -204,12 +173,10 @@ func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, addr resolve
 		return nil, err
 	}
 	go func() {
-		t.loopy = newLoopyWriter(clientSide, t.framer, t.controlBuf, t.bdpEst)
+		t.loopy = newLoopyWriter(clientSide, t.framer, t.controlBuf, t.bdpEst, fs)
 		err := t.loopy.run()
 		if err != nil {
-			if logger.V(logLevel) {
-				logger.Errorf("transport: loopyWriter.run returning. Err: %v", err)
-			}
+			log.Printf("transport: loopyWriter.run returning. Err: %v", err)
 		}
 		// Do not close the transport.  Let reader goroutine handle it since
 		// there might be data in the buffers.
@@ -218,4 +185,46 @@ func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, addr resolve
 		close(t.writerDone)
 	}()
 	return t, nil
+}
+
+func (t *HTTP2ClientMux) RoundTrip(request *http.Request) (*http.Response, error) {
+	res, err := t.Dial(request)
+	if err != nil {
+		return nil, err
+	}
+	s := res.Body.(*Stream)
+	s.waitOnHeader()
+
+	return res, err
+}
+
+func (t *HTTP2ClientMux) Dial(request *http.Request) (*http.Response, error) {
+	s, err := t.NewStream(request.Context(), &CallHdr{
+		Req: request,
+		DoneFunc: func() {
+			log.Println("Dial ", request.Host, "done")
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	// TODO: special header or method to indicate the Body of Request supports optimized
+	// copy ( no io.Pipe !!)
+	if request.Body != nil {
+		go func() {
+			s1 := &nio.ReaderCopier{
+				ID:  fmt.Sprintf("req-body-%d", s.Id),
+				Out: s,
+				In:  request.Body,
+			}
+			s1.Copy(nil, false)
+			if s1.Err != nil {
+				s1.Close()
+			} else {
+				s.CloseWrite()
+			}
+		}()
+	}
+
+	return s.Response, nil
 }

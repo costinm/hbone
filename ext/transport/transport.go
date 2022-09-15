@@ -27,18 +27,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/resolver"
-	"google.golang.org/grpc/stats"
-	"google.golang.org/grpc/status"
+	http2 "github.com/costinm/hbone/ext/transport/frame"
+	"github.com/costinm/hbone/nio"
 )
 
 const logLevel = 2
@@ -153,26 +150,58 @@ type recvBufferReader struct {
 // read additional data from recv. It blocks if there no additional data available
 // in recv. If Read returns any non-nil error, it will continue to return that error.
 func (r *recvBufferReader) Read(p []byte) (n int, err error) {
-	if r.err != nil {
-		return 0, r.err
-	}
+	copied := 0
 	if r.last != nil {
 		// Read remaining data left in last call.
-		copied, _ := r.last.Read(p)
+		copied, _ = r.last.Read(p)
 		if r.last.Len() == 0 {
 			r.freeBuffer(r.last)
 			r.last = nil
 		}
+	}
+	// copy more data if already received and space in the p
+	more := true
+	for copied < len(p) && more {
+		select {
+		case m := <-r.recv.get():
+			r.recv.load()
+			if m.err != nil {
+				return 0, m.err
+			}
+			copied1, _ := m.buffer.Read(p[copied:])
+			if m.buffer.Len() == 0 {
+				r.freeBuffer(m.buffer)
+				r.last = nil
+			} else {
+				r.last = m.buffer
+				copied += copied1
+				break // we filled the buffer
+			}
+			copied += copied1
+			continue
+		default:
+			more = false
+			break
+		}
+	}
+
+	if copied > 0 || copied == len(p) {
 		return copied, nil
 	}
-	if r.closeStream != nil {
-		n, r.err = r.readClient(p)
-	} else {
-		n, r.err = r.read(p)
+
+	if r.err != nil {
+		return 0, r.err
 	}
-	return n, r.err
+
+	if r.closeStream != nil {
+		n, r.err = r.readClient(p[copied:])
+	} else {
+		n, r.err = r.read(p[copied:])
+	}
+	return copied + n, r.err
 }
 
+// used in h2 server, blocks
 func (r *recvBufferReader) read(p []byte) (n int, err error) {
 	select {
 	case <-r.ctxDone:
@@ -182,6 +211,7 @@ func (r *recvBufferReader) read(p []byte) (n int, err error) {
 	}
 }
 
+// used in h2 client - closeStream is set to send FIN/RST on the other side
 func (r *recvBufferReader) readClient(p []byte) (n int, err error) {
 	// If the context is canceled, then closes the stream with nil metadata.
 	// closeStream writes its error parameter to r.recv as a recvMsg.
@@ -227,36 +257,44 @@ func (r *recvBufferReader) readAdditional(m recvMsg, p []byte) (n int, err error
 type streamState uint32
 
 const (
-	streamActive    streamState = iota
-	streamWriteDone             // EndStream sent
-	streamReadDone              // EndStream received
-	streamDone                  // the entire stream is finished.
+	streamActive streamState = iota
+	streamDone               // the entire stream is finished.
 )
 
 // Stream represents an RPC in the transport layer.
 type Stream struct {
-	id           uint32
-	st           ServerTransport    // nil for client side Stream
-	ct           *http2Client       // nil for server side Stream
-	ctx          context.Context    // the associated context of the stream
-	cancel       context.CancelFunc // always nil for client side Stream
-	done         chan struct{}      // closed at the end of stream to unblock writers. On the client side.
-	doneFunc     func()             // invoked at the end of stream on client side.
-	ctxDone      <-chan struct{}    // same as done chan but for server side. Cache of ctx.Done() (for performance)
-	method       string             // the associated RPC method of the stream
+	Id uint32
+
+	st *HTTP2ServerMux // nil for client side Stream
+	ct *HTTP2ClientMux // nil for server side Stream
+
+	ctx    context.Context // the associated context of the stream
+	cancel context.CancelFunc
+
+	done     chan struct{}   // closed at the end of stream to unblock writers. On the client side.
+	doneFunc func()          // invoked at the end of stream on client side.
+	ctxDone  <-chan struct{} // same as done chan but for server side. Cache of ctx.Done() (for performance)
+
+	Path string // the associated RPC Path of the stream.
+
 	recvCompress string
-	sendCompress string
-	buf          *recvBuffer
-	trReader     io.Reader
-	fc           *inFlow
-	wq           *writeQuota
+	//sendCompress string
+
+	buf      *recvBuffer
+	trReader *transportReader
+	fc       *inFlow
+	wq       *writeQuota
 
 	// Callback to state application's intentions to read data. This
 	// is used to adjust flow control, if needed.
 	requestRead func(int)
 
+	writeDoneChan       chan *dataFrame
+	writeDoneChanClosed uint32
+
 	headerChan       chan struct{} // closed to indicate the end of header metadata.
 	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
+
 	// headerValid indicates whether a valid header was received.  Only
 	// meaningful after headerChan is closed (always call waitOnHeader() before
 	// reading its value).  Not valid on server side.
@@ -264,30 +302,130 @@ type Stream struct {
 
 	// hdrMu protects header and trailer metadata on the server-side.
 	hdrMu sync.Mutex
-	// On client side, header keeps the received header metadata.
-	//
-	// On server side, header keeps the header set by SetHeader(). The complete
-	// header will merged into this after t.WriteHeader() is called.
-	header  metadata.MD
-	trailer metadata.MD // the key-value map of trailer metadata.
+
+	Request  *http.Request
+	Response *http.Response
 
 	noHeaders bool // set if the client never received headers (set only after the stream is done).
 
 	// On the server-side, headerSent is atomically set to 1 when the headers are sent out.
 	headerSent uint32
 
+	// Old state - doesn't work if read/write can be closed independently.
 	state streamState
 
-	// On client-side it is the status error received from the server.
-	// On server-side it is unused.
-	status *status.Status
+	// A stream may still be in used when read and write are closed - client or server may process
+	// headers.
+
+	// Set when FIN or RST received. No frame should be received after.
+	// Also set after a trailer header
+	readClosed uint32
+
+	// Set when FIN or RST were sent. No frame should be written after.
+	// Also set after sending a trailer.
+	writeClosed uint32
+
+	status *Status
 
 	bytesReceived uint32 // indicates whether any bytes have been received on this stream
 	unprocessed   uint32 // set if the server sends a refused stream or GOAWAY including this stream
 
-	// contentSubtype is the content-subtype for requests.
-	// this must be lowercase or the behavior is undefined.
-	contentSubtype string
+	readDeadline  time.Time
+	writeDeadline time.Time
+
+	// grpc is set if the stream is working in grpc mode, based on content type.
+	// Close will use trailer instead of end data, ordering of headers.
+	grpc bool
+}
+
+func (s *Stream) CloseError(code uint32) {
+	// On error we remove the stream from active.
+	// In and out are also closed, s is canceled
+	if s.st != nil {
+		s.st.closeStream(s, true, http2.ErrCode(code), true)
+	} else {
+		s.ct.closeStream(s, nil, true, http2.ErrCode(code), nil, nil, true)
+	}
+}
+
+// Part of ResponseStream Body (ReaderCloser).
+// Should this should send a RST if EOF was not received ?
+// Use CloseWrite for a sending FIN
+func (s *Stream) Close() error {
+	// TODO(costin): RST
+	if s.st == nil {
+		log.Println("Client Stream Read Close()", s.Id)
+
+		s.ct.Write(s, nil, nil, true)
+		s.ct.CloseStream(s, nil)
+	} else {
+		log.Println("Server stream Close()", s.Id)
+		if s.grpc {
+			return s.st.WriteStatus(s, &Status{})
+		} else {
+			s.CloseWrite()
+			s.st.closeStream(s, true, http2.ErrCode(0), true)
+		}
+	}
+	// Unblock writes waiting to send
+	if s.writeDoneChanClosed == 0 {
+		s.writeDoneChanClosed = 1
+		select {
+		case s.writeDoneChan <- nil:
+		default:
+		}
+	}
+	return nil
+}
+
+// Return the underlying connection ( typically tcp ), for remote addr or other things.
+func (s *Stream) Conn() net.Conn {
+	if s.st == nil {
+		return s.ct.conn
+	}
+	return s.st.conn
+}
+
+func (s *Stream) Write(d []byte) (int, error) {
+	if s.st == nil {
+		// Client mode, RoundTrip with request Body
+		err := s.ct.Write(s, nil, d, false)
+		if err != nil {
+			return 0, err
+		}
+		return len(d), err
+	}
+	err := s.st.Write(s, nil, d, false)
+	if err != nil {
+		return 0, err
+	}
+	return len(d), err
+}
+
+// Normal write close.
+//
+// Client: send FIN
+// Server: send trailers and FIN
+func (s *Stream) CloseWrite() error {
+	if s.st == nil {
+		// Client mode, RoundTrip with request Body
+		if nio.Debug {
+			log.Println("Client sends CloseWrite()", s.Id)
+		}
+		return s.ct.Write(s, nil, nil, true)
+	}
+	// TODO: use this only if trailer are present
+	if false {
+		if nio.Debug {
+			log.Println("Server sends CloseWrite() with trailer", s.Id)
+		}
+		return s.st.WriteStatus(s, &Status{})
+	} else {
+		if nio.Debug {
+			log.Println("Server sends CloseWrite()", s.Id)
+		}
+		return s.st.Write(s, nil, nil, true)
+	}
 }
 
 // isHeaderSent is only valid on the server-side.
@@ -305,8 +443,20 @@ func (s *Stream) swapState(st streamState) streamState {
 	return streamState(atomic.SwapUint32((*uint32)(&s.state), uint32(st)))
 }
 
-func (s *Stream) compareAndSwapState(oldState, newState streamState) bool {
-	return atomic.CompareAndSwapUint32((*uint32)(&s.state), uint32(oldState), uint32(newState))
+func (s *Stream) setReadClosed(mode uint32) bool {
+	return atomic.SwapUint32(&s.readClosed, mode) == mode
+}
+
+func (s *Stream) setWriteClosed(mode uint32) bool {
+	return atomic.SwapUint32(&s.writeClosed, 1) == 1
+}
+
+func (s *Stream) getWriteClosed() uint32 {
+	return atomic.LoadUint32((*uint32)(&s.writeClosed))
+}
+
+func (s *Stream) getReadClosed() uint32 {
+	return atomic.LoadUint32((*uint32)(&s.readClosed))
 }
 
 func (s *Stream) getState() streamState {
@@ -338,63 +488,10 @@ func (s *Stream) RecvCompress() string {
 	return s.recvCompress
 }
 
-// SetSendCompress sets the compression algorithm to the stream.
-func (s *Stream) SetSendCompress(str string) {
-	s.sendCompress = str
-}
-
 // Done returns a channel which is closed when it receives the final status
 // from the server.
 func (s *Stream) Done() <-chan struct{} {
 	return s.done
-}
-
-// Header returns the header metadata of the stream.
-//
-// On client side, it acquires the key-value pairs of header metadata once it is
-// available. It blocks until i) the metadata is ready or ii) there is no header
-// metadata or iii) the stream is canceled/expired.
-//
-// On server side, it returns the out header after t.WriteHeader is called.  It
-// does not block and must not be called until after WriteHeader.
-func (s *Stream) Header() (metadata.MD, error) {
-	if s.headerChan == nil {
-		// On server side, return the header in stream. It will be the out
-		// header after t.WriteHeader is called.
-		return s.header.Copy(), nil
-	}
-	s.waitOnHeader()
-	if !s.headerValid {
-		return nil, s.status.Err()
-	}
-	return s.header.Copy(), nil
-}
-
-// TrailersOnly blocks until a header or trailers-only frame is received and
-// then returns true if the stream was trailers-only.  If the stream ends
-// before headers are received, returns true, nil.  Client-side only.
-func (s *Stream) TrailersOnly() bool {
-	s.waitOnHeader()
-	return s.noHeaders
-}
-
-// Trailer returns the cached trailer metedata. Note that if it is not called
-// after the entire stream is done, it could return an empty MD. Client
-// side only.
-// It can be safely read only after stream has ended that is either read
-// or write have returned io.EOF.
-func (s *Stream) Trailer() metadata.MD {
-	c := s.trailer.Copy()
-	return c
-}
-
-// ContentSubtype returns the content-subtype for a request. For example, a
-// content-subtype of "proto" will result in a content-type of
-// "application/grpc+proto". This will always be lowercase.  See
-// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests for
-// more details.
-func (s *Stream) ContentSubtype() string {
-	return s.contentSubtype
 }
 
 // Context returns the context of the stream.
@@ -402,69 +499,53 @@ func (s *Stream) Context() context.Context {
 	return s.ctx
 }
 
-// Method returns the method for the stream.
-func (s *Stream) Method() string {
-	return s.method
-}
-
-// Status returns the status received from the server.
-// Status can be read safely only after the stream has ended,
-// that is, after Done() is closed.
-func (s *Stream) Status() *status.Status {
-	return s.status
-}
-
-// SetHeader sets the header metadata. This can be called multiple times.
-// Server side only.
-// This should not be called in parallel to other data writes.
-func (s *Stream) SetHeader(md metadata.MD) error {
-	if md.Len() == 0 {
-		return nil
-	}
-	if s.isHeaderSent() || s.getState() == streamDone {
-		return ErrIllegalHeaderWrite
-	}
-	s.hdrMu.Lock()
-	s.header = metadata.Join(s.header, md)
-	s.hdrMu.Unlock()
-	return nil
-}
-
-// SendHeader sends the given header metadata. The given metadata is
-// combined with any metadata set by previous calls to SetHeader and
-// then written to the transport stream.
-func (s *Stream) SendHeader(md metadata.MD) error {
-	return s.st.WriteHeader(s, md)
-}
-
-// SetTrailer sets the trailer metadata which will be sent with the RPC status
-// by the server. This can be called multiple times. Server side only.
-// This should not be called parallel to other data writes.
-func (s *Stream) SetTrailer(md metadata.MD) error {
-	if md.Len() == 0 {
-		return nil
-	}
-	if s.getState() == streamDone {
-		return ErrIllegalHeaderWrite
-	}
-	s.hdrMu.Lock()
-	s.trailer = metadata.Join(s.trailer, md)
-	s.hdrMu.Unlock()
-	return nil
-}
-
+// Called when data frames are received (with a COPY of the data !!)
 func (s *Stream) write(m recvMsg) {
 	s.buf.put(m)
 }
 
+func (s *Stream) LocalAddr() net.Addr {
+	return s.Conn().LocalAddr()
+}
+
+func (s *Stream) RemoteAddr() net.Addr {
+	return s.Conn().RemoteAddr()
+}
+
+func (s *Stream) SetDeadline(t time.Time) error {
+	return nil
+}
+func (s *Stream) SetReadDeadline(t time.Time) error {
+	s.readDeadline = t
+	return nil
+}
+func (s *Stream) SetWriteDeadline(t time.Time) error {
+	s.writeDeadline = t
+	return nil
+}
+
 // Read reads all p bytes from the wire for this stream.
 func (s *Stream) Read(p []byte) (n int, err error) {
-	// Don't request a read if there was an error earlier
-	if er := s.trReader.(*transportReader).er; er != nil {
-		return 0, er
+	rc := s.getReadClosed()
+	if rc != 0 {
+		if rc == 1 {
+			return 0, io.EOF
+		}
+		return 0, errStreamRST
 	}
-	s.requestRead(len(p))
-	return io.ReadFull(s.trReader, p)
+	// Don't request a read if there was an error earlier
+	if s.trReader.er != nil {
+		return 0, s.trReader.er
+	}
+	// effectively t.adjustWindow(len(p)).
+	// This is clearly not right - read may be smaller.
+	// TODO(costin): fix, in gRPC Read reads the full p !
+	//s.requestRead(len(p))
+	return s.trReader.Read(p)
+}
+
+type h2transport interface {
+	updateWindow(*Stream, uint32)
 }
 
 // tranportReader reads all the data available for this Stream from the transport and
@@ -472,10 +553,11 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 // The error is io.EOF when the stream is done or another non-nil error if
 // the stream broke.
 type transportReader struct {
-	reader io.Reader
+	s      *Stream
+	reader *recvBufferReader
 	// The handler to control the window update procedure for both this
 	// particular stream and the associated transport.
-	windowHandler func(int)
+	windowHandler h2transport
 	er            error
 }
 
@@ -485,7 +567,7 @@ func (t *transportReader) Read(p []byte) (n int, err error) {
 		t.er = err
 		return
 	}
-	t.windowHandler(n)
+	t.windowHandler.updateWindow(t.s, uint32(n))
 	return
 }
 
@@ -503,7 +585,7 @@ func (s *Stream) Unprocessed() bool {
 // GoString is implemented by Stream so context.String() won't
 // race when printing %#v.
 func (s *Stream) GoString() string {
-	return fmt.Sprintf("<stream: %p, %v>", s, s.method)
+	return fmt.Sprintf("<stream: %p, %v>", s, s.Request.URL)
 }
 
 // state of transport
@@ -517,20 +599,16 @@ const (
 
 // ServerConfig consists of all the configurations to establish a server transport.
 type ServerConfig struct {
-	MaxStreams        uint32
-	ConnectionTimeout time.Duration
-	Credentials       credentials.TransportCredentials
-	//InTapHandle           tap.ServerInHandle
-	StatsHandler          stats.Handler
-	KeepaliveParams       keepalive.ServerParameters
-	KeepalivePolicy       keepalive.EnforcementPolicy
+	MaxStreams            uint32
+	MaxFrameSize          uint32
+	KeepaliveParams       ServerParameters
+	KeepalivePolicy       EnforcementPolicy
 	InitialWindowSize     int32
 	InitialConnWindowSize int32
 	WriteBufferSize       int
 	ReadBufferSize        int
-	//ChannelzParentID      *channelz.Identifier
-	MaxHeaderListSize *uint32
-	HeaderTableSize   *uint32
+	MaxHeaderListSize     *uint32
+	HeaderTableSize       *uint32
 }
 
 // ConnectOptions covers all relevant options for communicating with the server.
@@ -541,18 +619,8 @@ type ConnectOptions struct {
 	Dialer func(context.Context, string) (net.Conn, error)
 	// FailOnNonTempDialError specifies if gRPC fails on non-temporary dial errors.
 	FailOnNonTempDialError bool
-	// PerRPCCredentials stores the PerRPCCredentials required to issue RPCs.
-	PerRPCCredentials []credentials.PerRPCCredentials
-	// TransportCredentials stores the Authenticator required to setup a client
-	// connection. Only one of TransportCredentials and CredsBundle is non-nil.
-	TransportCredentials credentials.TransportCredentials
-	// CredsBundle is the credentials bundle to be used. Only one of
-	// TransportCredentials and CredsBundle is non-nil.
-	CredsBundle credentials.Bundle
 	// KeepaliveParams stores the keepalive parameters.
-	KeepaliveParams keepalive.ClientParameters
-	// StatsHandler stores the handler for stats.
-	StatsHandler stats.Handler
+	KeepaliveParams ClientParameters
 	// InitialWindowSize sets the initial window size for a stream.
 	InitialWindowSize int32
 	// InitialConnWindowSize sets the initial window size for a connection.
@@ -561,18 +629,73 @@ type ConnectOptions struct {
 	WriteBufferSize int
 	// ReadBufferSize sets the size of read buffer, which in turn determines how much data can be read at most for one read syscall.
 	ReadBufferSize int
-	// ChannelzParentID sets the addrConn id which initiate the creation of this client transport.
-	//ChannelzParentID *channelz.Identifier
 	// MaxHeaderListSize sets the max (uncompressed) size of header list that is prepared to be received.
 	MaxHeaderListSize *uint32
+
+	MaxFrameSize uint32
+
 	// UseProxy specifies if a proxy should be used.
 	UseProxy bool
 }
 
-// NewClientTransport establishes the transport with the required ConnectOptions
-// and returns it to the caller.
-func NewClientTransport(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onPrefaceReceipt func(), onGoAway func(GoAwayReason), onClose func()) (ClientTransport, error) {
-	return newHTTP2Client(connectCtx, ctx, addr, opts, onPrefaceReceipt, onGoAway, onClose)
+// ClientParameters is used to set keepalive parameters on the client-side.
+// These configure how the client will actively probe to notice when a
+// connection is broken and send pings so intermediaries will be aware of the
+// liveness of the connection. Make sure these parameters are set in
+// coordination with the keepalive policy on the server, as incompatible
+// settings can result in closing of connection.
+type ClientParameters struct {
+	// After a duration of this time if the client doesn't see any activity it
+	// pings the server to see if the transport is still alive.
+	// If set below 10s, a minimum value of 10s will be used instead.
+	Time time.Duration // The current default value is infinity.
+	// After having pinged for keepalive check, the client waits for a duration
+	// of Timeout and if no activity is seen even after that the connection is
+	// closed.
+	Timeout time.Duration // The current default value is 20 seconds.
+	// If true, client sends keepalive pings even with no active RPCs. If false,
+	// when there are no active RPCs, Time and Timeout will be ignored and no
+	// keepalive pings will be sent.
+	PermitWithoutStream bool // false by default.
+}
+
+// ServerParameters is used to set keepalive and max-age parameters on the
+// server-side.
+type ServerParameters struct {
+	// MaxConnectionIdle is a duration for the amount of time after which an
+	// idle connection would be closed by sending a GoAway. Idleness duration is
+	// defined since the most recent time the number of outstanding RPCs became
+	// zero or the connection establishment.
+	MaxConnectionIdle time.Duration // The current default value is infinity.
+	// MaxConnectionAge is a duration for the maximum amount of time a
+	// connection may exist before it will be closed by sending a GoAway. A
+	// random jitter of +/-10% will be added to MaxConnectionAge to spread out
+	// connection storms.
+	MaxConnectionAge time.Duration // The current default value is infinity.
+	// MaxConnectionAgeGrace is an additive period after MaxConnectionAge after
+	// which the connection will be forcibly closed.
+	MaxConnectionAgeGrace time.Duration // The current default value is infinity.
+	// After a duration of this time if the server doesn't see any activity it
+	// pings the client to see if the transport is still alive.
+	// If set below 1s, a minimum value of 1s will be used instead.
+	Time time.Duration // The current default value is 2 hours.
+	// After having pinged for keepalive check, the server waits for a duration
+	// of Timeout and if no activity is seen even after that the connection is
+	// closed.
+	Timeout time.Duration // The current default value is 20 seconds.
+}
+
+// EnforcementPolicy is used to set keepalive enforcement policy on the
+// server-side. Server will close connection with a client that violates this
+// policy.
+type EnforcementPolicy struct {
+	// MinTime is the minimum amount of time a client should wait before sending
+	// a keepalive ping.
+	MinTime time.Duration // The current default value is 5 minutes.
+	// If true, server allows keepalive pings even when there are no active
+	// streams(RPCs). If false, and client sends ping when there are no active
+	// streams, server will send GOAWAY and close the connection.
+	PermitWithoutStream bool // false by default.
 }
 
 // Options provides additional hints and information for message
@@ -585,123 +708,11 @@ type Options struct {
 
 // CallHdr carries the information of a particular RPC.
 type CallHdr struct {
-	// Host specifies the peer's host.
-	Host string
-
-	// Method specifies the operation to perform.
-	Method string
-
-	// SendCompress specifies the compression algorithm applied on
-	// outbound message.
-	SendCompress string
-
-	// Creds specifies credentials.PerRPCCredentials for a call.
-	Creds credentials.PerRPCCredentials
-
-	// ContentSubtype specifies the content-subtype for a request. For example, a
-	// content-subtype of "proto" will result in a content-type of
-	// "application/grpc+proto". The value of ContentSubtype must be all
-	// lowercase, otherwise the behavior is undefined. See
-	// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests
-	// for more details.
-	ContentSubtype string
+	Req *http.Request
 
 	PreviousAttempts int // value of grpc-previous-rpc-attempts header to set
 
 	DoneFunc func() // called when the stream is finished
-}
-
-// ClientTransport is the common interface for all gRPC client-side transport
-// implementations.
-type ClientTransport interface {
-	// Close tears down this transport. Once it returns, the transport
-	// should not be accessed any more. The caller must make sure this
-	// is called only once.
-	Close(err error)
-
-	// GracefulClose starts to tear down the transport: the transport will stop
-	// accepting new RPCs and NewStream will return error. Once all streams are
-	// finished, the transport will close.
-	//
-	// It does not block.
-	GracefulClose()
-
-	// Write sends the data for the given stream. A nil stream indicates
-	// the write is to be performed on the transport as a whole.
-	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
-
-	// NewStream creates a Stream for an RPC.
-	NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error)
-
-	// CloseStream clears the footprint of a stream when the stream is
-	// not needed any more. The err indicates the error incurred when
-	// CloseStream is called. Must be called when a stream is finished
-	// unless the associated transport is closing.
-	CloseStream(stream *Stream, err error)
-
-	// Error returns a channel that is closed when some I/O error
-	// happens. Typically the caller should have a goroutine to monitor
-	// this in order to take action (e.g., close the current transport
-	// and create a new one) in error case. It should not return nil
-	// once the transport is initiated.
-	Error() <-chan struct{}
-
-	// GoAway returns a channel that is closed when ClientTransport
-	// receives the draining signal from the server (e.g., GOAWAY frame in
-	// HTTP/2).
-	GoAway() <-chan struct{}
-
-	// GetGoAwayReason returns the reason why GoAway frame was received, along
-	// with a human readable string with debug info.
-	GetGoAwayReason() (GoAwayReason, string)
-
-	// RemoteAddr returns the remote network address.
-	RemoteAddr() net.Addr
-
-	// IncrMsgSent increments the number of message sent through this transport.
-	IncrMsgSent()
-
-	// IncrMsgRecv increments the number of message received through this transport.
-	IncrMsgRecv()
-}
-
-// ServerTransport is the common interface for all gRPC server-side transport
-// implementations.
-//
-// Methods may be called concurrently from multiple goroutines, but
-// Write methods for a given Stream will be called serially.
-type ServerTransport interface {
-	// HandleStreams receives incoming streams using the given handler.
-	HandleStreams(func(*Stream), func(context.Context, string) context.Context)
-
-	// WriteHeader sends the header metadata for the given stream.
-	// WriteHeader may not be called on all streams.
-	WriteHeader(s *Stream, md metadata.MD) error
-
-	// Write sends the data for the given stream.
-	// Write may not be called on all streams.
-	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
-
-	// WriteStatus sends the status of a stream to the client.  WriteStatus is
-	// the final call made on a stream and always occurs.
-	WriteStatus(s *Stream, st *status.Status) error
-
-	// Close tears down the transport. Once it is called, the transport
-	// should not be accessed any more. All the pending streams and their
-	// handlers will be terminated asynchronously.
-	Close()
-
-	// RemoteAddr returns the remote network address.
-	RemoteAddr() net.Addr
-
-	// Drain notifies the client this ServerTransport stops accepting new RPCs.
-	Drain()
-
-	// IncrMsgSent increments the number of message sent through this transport.
-	IncrMsgSent()
-
-	// IncrMsgRecv increments the number of message received through this transport.
-	IncrMsgRecv()
 }
 
 // connectionErrorf creates an ConnectionError with the specified error description.
@@ -752,13 +763,14 @@ var (
 	// errStreamDrain indicates that the stream is rejected because the
 	// connection is draining. This could be caused by goaway or balancer
 	// removing the address.
-	errStreamDrain = status.Error(codes.Unavailable, "the connection is draining")
+	errStreamDrain = &Status{Code: int(Unavailable), Message: "the connection is draining"}
 	// errStreamDone is returned from write at the client side to indiacte application
 	// layer of an error.
 	errStreamDone = errors.New("the stream is done")
+	errStreamRST  = errors.New("the stream is RST")
 	// StatusGoAway indicates that the server sent a GOAWAY that included this
 	// stream's ID in unprocessed RPCs.
-	statusGoAway = status.New(codes.Unavailable, "the stream is rejected because server is draining the connection")
+	statusGoAway = &Status{Code: int(Unavailable), Message: "the stream is rejected because server is draining the connection"}
 )
 
 // GoAwayReason contains the reason for the GoAway frame received.
@@ -775,8 +787,8 @@ const (
 	GoAwayTooManyPings GoAwayReason = 2
 )
 
-// channelzData is used to store channelz related data for http2Client and http2Server.
-// These fields cannot be embedded in the original structs (e.g. http2Client), since to do atomic
+// channelzData is used to store channelz related data for HTTP2ClientMux and HTTP2ServerMux.
+// These fields cannot be embedded in the original structs (e.g. HTTP2ClientMux), since to do atomic
 // operation on int64 variable on 32-bit machine, user is responsible to enforce memory alignment.
 // Here, by grouping those int64 fields inside a struct, we are enforcing the alignment.
 type channelzData struct {
@@ -803,9 +815,201 @@ type channelzData struct {
 func ContextErr(err error) error {
 	switch err {
 	case context.DeadlineExceeded:
-		return status.Error(codes.DeadlineExceeded, err.Error())
+		return &Status{Code: int(DeadlineExceeded), Message: err.Error()}
 	case context.Canceled:
-		return status.Error(codes.Canceled, err.Error())
+		return &Status{Code: int(Canceled), Message: err.Error()}
 	}
-	return status.Errorf(codes.Internal, "Unexpected error from context packet: %v", err)
+	return &Status{Code: int(Internal), Message: fmt.Sprintf("Unexpected error from context packet: %v", err)}
 }
+
+type Status struct {
+
+	// The status code, which should be an enum value of [google.rpc.Code][google.rpc.Code].
+	Code int
+	// A developer-facing error message, which should be in English. Any
+	// user-facing error message should be localized and sent in the
+	// [google.rpc.Status.details][google.rpc.Status.details] field, or localized by the client.
+	Message string
+	// A list of messages that carry the error details.  There is a common set of
+	// message types for APIs to use.
+	Details [][]byte
+
+	Err error
+}
+
+func (s *Status) Error() string {
+	if s.Err != nil {
+		return s.Err.Error()
+	}
+	return s.Message
+}
+
+// A Code is an unsigned 32-bit error code as defined in the gRPC spec.
+type Code uint32
+
+const (
+	// OK is returned on success.
+	OK Code = 0
+
+	// Canceled indicates the operation was canceled (typically by the caller).
+	//
+	// The gRPC framework will generate this error code when cancellation
+	// is requested.
+	Canceled Code = 1
+
+	// Unknown error. An example of where this error may be returned is
+	// if a Status value received from another address space belongs to
+	// an error-space that is not known in this address space. Also
+	// errors raised by APIs that do not return enough error information
+	// may be converted to this error.
+	//
+	// The gRPC framework will generate this error code in the above two
+	// mentioned cases.
+	Unknown Code = 2
+
+	// InvalidArgument indicates client specified an invalid argument.
+	// Note that this differs from FailedPrecondition. It indicates arguments
+	// that are problematic regardless of the state of the system
+	// (e.g., a malformed file name).
+	//
+	// This error code will not be generated by the gRPC framework.
+	InvalidArgument Code = 3
+
+	// DeadlineExceeded means operation expired before completion.
+	// For operations that change the state of the system, this error may be
+	// returned even if the operation has completed successfully. For
+	// example, a successful response from a server could have been delayed
+	// long enough for the deadline to expire.
+	//
+	// The gRPC framework will generate this error code when the deadline is
+	// exceeded.
+	DeadlineExceeded Code = 4
+
+	// NotFound means some requested entity (e.g., file or directory) was
+	// not found.
+	//
+	// This error code will not be generated by the gRPC framework.
+	NotFound Code = 5
+
+	// AlreadyExists means an attempt to create an entity failed because one
+	// already exists.
+	//
+	// This error code will not be generated by the gRPC framework.
+	AlreadyExists Code = 6
+
+	// PermissionDenied indicates the caller does not have permission to
+	// execute the specified operation. It must not be used for rejections
+	// caused by exhausting some resource (use ResourceExhausted
+	// instead for those errors). It must not be
+	// used if the caller cannot be identified (use Unauthenticated
+	// instead for those errors).
+	//
+	// This error code will not be generated by the gRPC core framework,
+	// but expect authentication middleware to use it.
+	PermissionDenied Code = 7
+
+	// ResourceExhausted indicates some resource has been exhausted, perhaps
+	// a per-user quota, or perhaps the entire file system is out of space.
+	//
+	// This error code will be generated by the gRPC framework in
+	// out-of-memory and server overload situations, or when a message is
+	// larger than the configured maximum size.
+	ResourceExhausted Code = 8
+
+	// FailedPrecondition indicates operation was rejected because the
+	// system is not in a state required for the operation's execution.
+	// For example, directory to be deleted may be non-empty, an rmdir
+	// operation is applied to a non-directory, etc.
+	//
+	// A litmus test that may help a service implementor in deciding
+	// between FailedPrecondition, Aborted, and Unavailable:
+	//  (a) Use Unavailable if the client can retry just the failing call.
+	//  (b) Use Aborted if the client should retry at a higher-level
+	//      (e.g., restarting a read-modify-write sequence).
+	//  (c) Use FailedPrecondition if the client should not retry until
+	//      the system state has been explicitly fixed. E.g., if an "rmdir"
+	//      fails because the directory is non-empty, FailedPrecondition
+	//      should be returned since the client should not retry unless
+	//      they have first fixed up the directory by deleting files from it.
+	//  (d) Use FailedPrecondition if the client performs conditional
+	//      REST Get/Update/Delete on a resource and the resource on the
+	//      server does not match the condition. E.g., conflicting
+	//      read-modify-write on the same resource.
+	//
+	// This error code will not be generated by the gRPC framework.
+	FailedPrecondition Code = 9
+
+	// Aborted indicates the operation was aborted, typically due to a
+	// concurrency issue like sequencer check failures, transaction aborts,
+	// etc.
+	//
+	// See litmus test above for deciding between FailedPrecondition,
+	// Aborted, and Unavailable.
+	//
+	// This error code will not be generated by the gRPC framework.
+	Aborted Code = 10
+
+	// OutOfRange means operation was attempted past the valid range.
+	// E.g., seeking or reading past end of file.
+	//
+	// Unlike InvalidArgument, this error indicates a problem that may
+	// be fixed if the system state changes. For example, a 32-bit file
+	// system will generate InvalidArgument if asked to read at an
+	// offset that is not in the range [0,2^32-1], but it will generate
+	// OutOfRange if asked to read from an offset past the current
+	// file size.
+	//
+	// There is a fair bit of overlap between FailedPrecondition and
+	// OutOfRange. We recommend using OutOfRange (the more specific
+	// error) when it applies so that callers who are iterating through
+	// a space can easily look for an OutOfRange error to detect when
+	// they are done.
+	//
+	// This error code will not be generated by the gRPC framework.
+	OutOfRange Code = 11
+
+	// Unimplemented indicates operation is not implemented or not
+	// supported/enabled in this service.
+	//
+	// This error code will be generated by the gRPC framework. Most
+	// commonly, you will see this error code when a method implementation
+	// is missing on the server. It can also be generated for unknown
+	// compression algorithms or a disagreement as to whether an RPC should
+	// be streaming.
+	Unimplemented Code = 12
+
+	// Internal errors. Means some invariants expected by underlying
+	// system has been broken. If you see one of these errors,
+	// something is very broken.
+	//
+	// This error code will be generated by the gRPC framework in several
+	// internal error conditions.
+	Internal Code = 13
+
+	// Unavailable indicates the service is currently unavailable.
+	// This is a most likely a transient condition and may be corrected
+	// by retrying with a backoff. Note that it is not always safe to retry
+	// non-idempotent operations.
+	//
+	// See litmus test above for deciding between FailedPrecondition,
+	// Aborted, and Unavailable.
+	//
+	// This error code will be generated by the gRPC framework during
+	// abrupt shutdown of a server process or network connection.
+	Unavailable Code = 14
+
+	// DataLoss indicates unrecoverable data loss or corruption.
+	//
+	// This error code will not be generated by the gRPC framework.
+	DataLoss Code = 15
+
+	// Unauthenticated indicates the request does not have valid
+	// authentication credentials for the operation.
+	//
+	// The gRPC framework will generate this error code when the
+	// authentication metadata is invalid or a Credentials callback fails,
+	// but also expect authentication middleware to generate it.
+	Unauthenticated Code = 16
+
+	_maxCode = 17
+)

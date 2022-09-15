@@ -20,6 +20,7 @@ package transport
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -50,7 +51,14 @@ func newWriteQuota(sz int32, done <-chan struct{}) *writeQuota {
 	return w
 }
 
+// get blocks until write quota is available for sz bytes.
+// TODO: write deadline
+// TODO: return a smaller ammount ( what's available), so very large writes can
+// be chunked.
 func (w *writeQuota) get(sz int32) error {
+	if sz == 0 {
+		return nil
+	}
 	for {
 		if atomic.LoadInt32(&w.quota) > 0 {
 			atomic.AddInt32(&w.quota, -sz)
@@ -181,6 +189,7 @@ func (f *inFlow) onData(n uint32) error {
 		limit := f.limit
 		rcvd := f.pendingData + f.pendingUpdate
 		f.mu.Unlock()
+		log.Printf("received %d pendingUpdate %d n %d  exceeding the limit %d bytes", rcvd, f.pendingUpdate, n, limit)
 		return fmt.Errorf("received %d-bytes data exceeding the limit %d bytes", rcvd, limit)
 	}
 	f.mu.Unlock()
@@ -204,7 +213,7 @@ func (f *inFlow) onRead(n uint32) uint32 {
 		n = 0
 	}
 	f.pendingUpdate += n
-	if f.pendingUpdate >= f.limit/4 {
+	if f.pendingUpdate >= f.limit/4 || f.pendingUpdate > 64*1024 {
 		wu := f.pendingUpdate
 		f.pendingUpdate = 0
 		f.mu.Unlock()

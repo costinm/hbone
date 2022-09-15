@@ -20,17 +20,15 @@ package transport
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
+	"log"
 	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
-	"github.com/costinm/hbone/ext/transport/grpcutil"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
-	"google.golang.org/grpc/status"
+	http2 "github.com/costinm/hbone/ext/transport/frame"
+
+	"github.com/costinm/hbone/ext/transport/hpack"
 )
 
 var updateHeaderTblSize = func(e *hpack.Encoder, v uint32) {
@@ -132,24 +130,18 @@ type cleanupStream struct {
 
 func (c *cleanupStream) isTransportResponseFrame() bool { return c.rst } // Results in a RST_STREAM
 
-type earlyAbortStream struct {
-	httpStatus     uint32
-	streamID       uint32
-	contentSubtype string
-	status         *status.Status
-	rst            bool
-}
-
-func (*earlyAbortStream) isTransportResponseFrame() bool { return false }
-
 type dataFrame struct {
 	streamID  uint32
 	endStream bool
-	h         []byte
 	d         []byte
-	// onEachWrite is called every time
-	// a part of d is written out.
+	// onEachWrite is called every time a part of d is written out.
+	// Used by server to determine activity and not generate pings ?
 	onEachWrite func()
+
+	// Typically per stream or global channel, associated with the stream.
+	// When all bytes from d have been sent, the frame is sent so it can be
+	// recycled and to unblock blocking Write()
+	onDone chan *dataFrame
 }
 
 func (*dataFrame) isTransportResponseFrame() bool { return false }
@@ -479,11 +471,13 @@ type loopyWriter struct {
 	bdpEst        *bdpEstimator
 	draining      bool
 
+	maxFrameSize uint32
+
 	// Side-specific handlers
 	ssGoAwayHandler func(*goAway) (bool, error)
 }
 
-func newLoopyWriter(s side, fr *framer, cbuf *controlBuffer, bdpEst *bdpEstimator) *loopyWriter {
+func newLoopyWriter(s side, fr *framer, cbuf *controlBuffer, bdpEst *bdpEstimator, maxFrameSize uint32) *loopyWriter {
 	var buf bytes.Buffer
 	l := &loopyWriter{
 		side:          s,
@@ -496,6 +490,7 @@ func newLoopyWriter(s side, fr *framer, cbuf *controlBuffer, bdpEst *bdpEstimato
 		hBuf:          &buf,
 		hEnc:          hpack.NewEncoder(&buf),
 		bdpEst:        bdpEst,
+		maxFrameSize:  maxFrameSize,
 	}
 	return l
 }
@@ -521,13 +516,6 @@ const minBatchSize = 1000
 func (l *loopyWriter) run() (err error) {
 	defer func() {
 		if err == ErrConnClosing {
-			// Don't log ErrConnClosing as error since it happens
-			// 1. When the connection is closed by some other known issue.
-			// 2. User closed the connection.
-			// 3. A graceful close of connection.
-			if logger.V(logLevel) {
-				logger.Infof("transport: loopyWriter.run returning. %v", err)
-			}
 			err = nil
 		}
 	}()
@@ -627,9 +615,7 @@ func (l *loopyWriter) headerHandler(h *headerFrame) error {
 	if l.side == serverSide {
 		str, ok := l.estdStreams[h.streamID]
 		if !ok {
-			if logger.V(logLevel) {
-				logger.Warningf("transport: loopy doesn't recognize the stream: %d", h.streamID)
-			}
+			log.Printf("transport: loopy doesn't recognize the stream: %d", h.streamID)
 			return nil
 		}
 		// Case 1.A: Server is responding back with headers.
@@ -682,9 +668,7 @@ func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.He
 	l.hBuf.Reset()
 	for _, f := range hf {
 		if err := l.hEnc.WriteField(f); err != nil {
-			if logger.V(logLevel) {
-				logger.Warningf("transport: loopyWriter.writeHeader encountered error while encoding headers: %v", err)
-			}
+			log.Printf("transport: loopyWriter.writeHeader encountered error while encoding headers: %v", err)
 		}
 	}
 	var (
@@ -694,8 +678,8 @@ func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.He
 	first = true
 	for !endHeaders {
 		size := l.hBuf.Len()
-		if size > http2MaxFrameLen {
-			size = http2MaxFrameLen
+		if size > int(l.maxFrameSize) {
+			size = int(l.maxFrameSize)
 		} else {
 			endHeaders = true
 		}
@@ -769,32 +753,6 @@ func (l *loopyWriter) cleanupStreamHandler(c *cleanupStream) error {
 	return nil
 }
 
-func (l *loopyWriter) earlyAbortStreamHandler(eas *earlyAbortStream) error {
-	if l.side == clientSide {
-		return errors.New("earlyAbortStream not handled on client")
-	}
-	// In case the caller forgets to set the http status, default to 200.
-	if eas.httpStatus == 0 {
-		eas.httpStatus = 200
-	}
-	headerFields := []hpack.HeaderField{
-		{Name: ":status", Value: strconv.Itoa(int(eas.httpStatus))},
-		{Name: "content-type", Value: grpcutil.ContentType(eas.contentSubtype)},
-		{Name: "grpc-status", Value: strconv.Itoa(int(eas.status.Code()))},
-		{Name: "grpc-message", Value: encodeGrpcMessage(eas.status.Message())},
-	}
-
-	if err := l.writeHeader(eas.streamID, true, headerFields, nil); err != nil {
-		return err
-	}
-	if eas.rst {
-		if err := l.framer.fr.WriteRSTStream(eas.streamID, http2.ErrCodeNo); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (l *loopyWriter) incomingGoAwayHandler(*incomingGoAway) error {
 	if l.side == clientSide {
 		l.draining = true
@@ -833,8 +791,6 @@ func (l *loopyWriter) handle(i interface{}) error {
 		return l.registerStreamHandler(i)
 	case *cleanupStream:
 		return l.cleanupStreamHandler(i)
-	case *earlyAbortStream:
-		return l.earlyAbortStreamHandler(i)
 	case *incomingGoAway:
 		return l.incomingGoAwayHandler(i)
 	case *dataFrame:
@@ -890,12 +846,15 @@ func (l *loopyWriter) processData() (bool, error) {
 	// As an optimization to keep wire traffic low, data from d is copied to h to make as big as the
 	// maximum possilbe HTTP2 frame size.
 
-	if len(dataItem.h) == 0 && len(dataItem.d) == 0 { // Empty data frame
+	if len(dataItem.d) == 0 { // Empty data frame
 		// Client sends out empty data frame with endStream = true
 		if err := l.framer.fr.WriteData(dataItem.streamID, dataItem.endStream, nil); err != nil {
 			return false, err
 		}
 		str.itl.dequeue() // remove the empty data item from stream
+		if dataItem.onDone != nil {
+			dataItem.onDone <- dataItem
+		}
 		if str.itl.isEmpty() {
 			str.state = empty
 		} else if trailer, ok := str.itl.peek().(*headerFrame); ok { // the next item is trailers.
@@ -914,7 +873,7 @@ func (l *loopyWriter) processData() (bool, error) {
 		buf []byte
 	)
 	// Figure out the maximum size we can send
-	maxSize := http2MaxFrameLen
+	maxSize := int(l.maxFrameSize)
 	if strQuota := int(l.oiws) - str.bytesOutStanding; strQuota <= 0 { // stream-level flow control.
 		str.state = waitingOnStreamQuota
 		return false, nil
@@ -925,30 +884,16 @@ func (l *loopyWriter) processData() (bool, error) {
 		maxSize = int(l.sendQuota)
 	}
 	// Compute how much of the header and data we can send within quota and max frame length
-	hSize := min(maxSize, len(dataItem.h))
-	dSize := min(maxSize-hSize, len(dataItem.d))
-	if hSize != 0 {
-		if dSize == 0 {
-			buf = dataItem.h
-		} else {
-			// We can add some data to grpc message header to distribute bytes more equally across frames.
-			// Copy on the stack to avoid generating garbage
-			var localBuf [http2MaxFrameLen]byte
-			copy(localBuf[:hSize], dataItem.h)
-			copy(localBuf[hSize:], dataItem.d[:dSize])
-			buf = localBuf[:hSize+dSize]
-		}
-	} else {
-		buf = dataItem.d
-	}
+	dSize := min(maxSize, len(dataItem.d))
+	buf = dataItem.d
 
-	size := hSize + dSize
+	size := dSize
 
 	// Now that outgoing flow controls are checked we can replenish str's write quota
 	str.wq.replenish(size)
 	var endStream bool
 	// If this is the last data message on this stream and all of it can be written in this iteration.
-	if dataItem.endStream && len(dataItem.h)+len(dataItem.d) <= size {
+	if dataItem.endStream && len(dataItem.d) <= size {
 		endStream = true
 	}
 	if dataItem.onEachWrite != nil {
@@ -959,11 +904,13 @@ func (l *loopyWriter) processData() (bool, error) {
 	}
 	str.bytesOutStanding += size
 	l.sendQuota -= uint32(size)
-	dataItem.h = dataItem.h[hSize:]
 	dataItem.d = dataItem.d[dSize:]
 
-	if len(dataItem.h) == 0 && len(dataItem.d) == 0 { // All the data from that message was written out.
+	if len(dataItem.d) == 0 { // All the data from that message was written out.
 		str.itl.dequeue()
+		if dataItem.onDone != nil {
+			dataItem.onDone <- dataItem
+		}
 	}
 	if str.itl.isEmpty() {
 		str.state = empty
