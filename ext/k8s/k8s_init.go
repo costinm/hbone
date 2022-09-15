@@ -26,7 +26,7 @@ import (
 	"strings"
 
 	"github.com/costinm/hbone"
-	"gopkg.in/yaml.v3"
+	"sigs.k8s.io/yaml"
 )
 
 func kubeconfig2Rest(uk *hbone.HBone, name string, cluster *KubeCluster, user *KubeUser, ns string) (*hbone.Cluster, error) {
@@ -76,7 +76,7 @@ func kubeconfig2Rest(uk *hbone.HBone, name string, cluster *KubeCluster, user *K
 	}
 
 	//caCert := cluster.CertificateAuthorityData
-	rc.CACert = caCert
+	rc.CACert = string(caCert)
 
 	rc.Client = uk.HttpClient(caCert)
 
@@ -149,7 +149,7 @@ func AddKubeConfigClusters(uk *hbone.HBone, kc *KubeConfig) (*hbone.Cluster, map
 		user = &kc.Users[0].User
 		cluster = &kc.Clusters[0].Cluster
 		rc, err := kubeconfig2Rest(uk, "default", cluster, user, "default")
-		uk.AddCluster("k8s", rc)
+		uk.AddService(rc)
 
 		if err != nil {
 			return nil, nil, err
@@ -176,7 +176,7 @@ func AddKubeConfigClusters(uk *hbone.HBone, kc *KubeConfig) (*hbone.Cluster, map
 		if err != nil {
 			log.Println("Skipping incompatible cluster ", cc.Context.Cluster, err)
 		} else {
-			uk.AddCluster(rc.Id, rc)
+			uk.AddService(rc)
 			//cByLoc[rc.Location] = append(cByLoc[rc.Location], rc)
 			cByName[cc.Name] = rc
 		}
@@ -192,6 +192,6 @@ func AddKubeConfigClusters(uk *hbone.HBone, kc *KubeConfig) (*hbone.Cluster, map
 			break
 		}
 	}
-	uk.AddCluster("k8s", defc)
+	uk.AddService(defc)
 	return defc, cByName, nil
 }

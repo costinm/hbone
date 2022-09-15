@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/costinm/hbone"
+	"github.com/costinm/hbone/nio"
 )
 
 // Egress capture using SOCKS5, for whitebox mode.
@@ -75,19 +76,73 @@ const (
 */
 
 type Socks struct {
+	Dest     string
+	DestAddr *net.TCPAddr
+	w        io.WriteCloser
 }
 
-func HandleSocks(br *hbone.StreamBuffer, s *hbone.Stream, w io.WriteCloser) (done bool, err error) {
+// Must be called before sending any data.
+func (s *Socks) PostDialHandler(conn net.Conn, err error) {
+	if err != nil {
+		// TODO: write error code
+		s.w.Write([]byte{5, 1})
+		s.w.Close()
+		return
+	}
+	// Not accurate for tcp-over-http.
+	// TODO: pass a 'on connect' callback
+
+	localAddr := conn.LocalAddr()
+	tcpAddr := localAddr.(*net.TCPAddr)
+	r := make([]byte, len(tcpAddr.IP)+6)
+	r[0] = 5
+	r[1] = 0 // success
+	r[2] = 0 // rsv
+	off := 4
+	if tcpAddr.IP.To4() != nil {
+		r[3] = 1
+		copy(r[off:off+4], []byte(tcpAddr.IP))
+		off += 4
+	} else {
+		r[3] = 2
+		copy(r[off:off+16], []byte(tcpAddr.IP))
+		off += 16
+	}
+	binary.BigEndian.PutUint16(r[off:], uint16(tcpAddr.Port))
+	off += 2
+	s.w.Write(r[0:off])
+}
+
+func HandleSocksConn(hb *hbone.HBone, conn net.Conn) error {
+	brin := nio.NewBufferReader(conn)
+	s := &Socks{w: conn}
+	err := HandleSocks(brin, s, conn)
+	if err != nil {
+		return err
+	}
+
+	// s.Dest is now populated. Depending on client, s.DestAddr may be populated too.
+	nc, err := hb.Dial("tcp", s.Dest)
+	if err != nil {
+		s.PostDialHandler(nil, err)
+		return err
+	}
+	s.PostDialHandler(nc, nil)
+
+	return hbone.Proxy(nc, brin, conn, s.Dest)
+}
+
+func HandleSocks(br *nio.Buffer, s *Socks, w io.WriteCloser) (err error) {
 	// Fill the read buffer with one Read.
 	// Typically 3-4 bytes unless client is eager.
 
-	head, err := br.Fill(3)
+	head, err := br.Peek(3)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	if head[0] != 5 {
-		return false, errors.New("invalid header")
+		return errors.New("invalid header")
 	}
 	// Client: 0x05 0x01 0x00
 	//         0x05 0x02  0x00 0x01
@@ -96,9 +151,9 @@ func HandleSocks(br *hbone.StreamBuffer, s *hbone.Stream, w io.WriteCloser) (don
 	sz := int(head[off])
 	off++                   // 2
 	if len(head) < off+sz { // if it only read 2, probably malicious - 2 < 2 + 1
-		head, err = br.Fill(off + sz)
+		head, err = br.Peek(off + sz)
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 	off += sz // 3
@@ -107,23 +162,23 @@ func HandleSocks(br *hbone.StreamBuffer, s *hbone.Stream, w io.WriteCloser) (don
 
 	// We may have bytes in the buffer, in case sender didn't wait
 	if len(head) <= off+6 {
-		head, err = br.Fill(off + sz)
+		head, err = br.Peek(off + sz)
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 	// We have at least 6 bytes
 	if head[off] != 5 {
-		return false, errors.New("invalid header 2")
+		return errors.New("invalid header 2")
 	}
 	off++
 	if head[off] != 1 {
-		return false, errors.New("invalid method " + strconv.Itoa(int(head[off])))
+		return errors.New("invalid method " + strconv.Itoa(int(head[off])))
 	}
 	off++
 	off++ // rsvd
 
-	atyp := head[off+3]
+	atyp := head[off]
 	off++
 
 	destName := ""
@@ -132,14 +187,14 @@ func HandleSocks(br *hbone.StreamBuffer, s *hbone.Stream, w io.WriteCloser) (don
 	switch atyp {
 	case 1:
 		if len(head) <= off+6 {
-			head, err = br.Fill(off + 6)
+			head, err = br.Peek(off + 6)
 		}
 		destIP = make([]byte, 4)
 		copy(destIP, head[off:off+4])
 		off += 4
 	case 4:
 		if len(head) <= off+18 {
-			head, err = br.Fill(off + 18)
+			head, err = br.Peek(off + 18)
 		}
 		destIP = make([]byte, 16)
 		copy(destIP, head[off:off+16])
@@ -149,19 +204,19 @@ func HandleSocks(br *hbone.StreamBuffer, s *hbone.Stream, w io.WriteCloser) (don
 		dlen := int(head[off])
 		off++
 		if len(head) <= off+dlen+2 {
-			head, err = br.Fill(off + dlen + 2)
+			head, err = br.Peek(off + dlen + 2)
 		}
 		destName = string(head[off : off+dlen])
 		off += dlen
 	}
 	if err != nil {
-		return false, err
+		return err
 	}
 	port := binary.BigEndian.Uint16(head[off:])
 	off += 2
 
 	// Any reminding bytes are eager sent
-	br.Skip(off)
+	br.Discard(off)
 
 	if atyp == 3 {
 		s.Dest = net.JoinHostPort(destName, strconv.Itoa(int(port)))
@@ -170,36 +225,5 @@ func HandleSocks(br *hbone.StreamBuffer, s *hbone.Stream, w io.WriteCloser) (don
 		s.Dest = s.DestAddr.String()
 	}
 
-	// Must be called before sending any data.
-	s.PostDialHandler = func(conn net.Conn, err error) {
-		if err != nil || conn == nil {
-			// TODO: write error code
-			w.Write([]byte{5, 1})
-			w.Close()
-		}
-		// Not accurate for tcp-over-http.
-		// TODO: pass a 'on connect' callback
-
-		localAddr := conn.LocalAddr()
-		tcpAddr := localAddr.(*net.TCPAddr)
-		r := make([]byte, len(tcpAddr.IP)+6)
-		r[0] = 5
-		r[1] = 0 // success
-		r[2] = 0 // rsv
-		off := 4
-		if tcpAddr.IP.To4() != nil {
-			r[3] = 1
-			copy(r[off:off+4], []byte(tcpAddr.IP))
-			off += 4
-		} else {
-			r[3] = 2
-			copy(r[off:off+16], []byte(tcpAddr.IP))
-			off += 16
-		}
-		binary.BigEndian.PutUint16(r[off:], uint16(tcpAddr.Port))
-		off += 2
-		w.Write(r[0:off])
-	}
-
-	return true, nil
+	return nil
 }

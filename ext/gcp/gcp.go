@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/costinm/hbone"
+
 	"golang.org/x/oauth2/google"
 )
 
@@ -94,16 +95,22 @@ type HubCluster struct {
 }
 
 // Init GCP auth
+// Will init AuthProviders["gcp"].
+//
 // DefaultTokenSource will:
 // - check GOOGLE_APPLICATION_CREDENTIALS
 // - ~/.config/gcloud/application_default_credentials.json"
 // - use metadata
+//
+// This also works for K8S, using node MDS or GKE MDS - but only if the
+// ServiceAccount is annotated with a GSA (with permissions to use).
+// Also specific to GKE and GCP APIs.
 func InitDefaultTokenSource(ctx context.Context, uk *hbone.HBone) error {
 	ts, err := google.DefaultTokenSource(ctx, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {
 		return err
 	}
-	uk.AuthProviders["gcp"] = func(ctx context.Context, s string) (string, error) {
+	t := func(ctx context.Context, s string) (string, error) {
 		t, err := ts.Token()
 		if err != nil {
 			return "", err
@@ -111,6 +118,7 @@ func InitDefaultTokenSource(ctx context.Context, uk *hbone.HBone) error {
 		// TODO: cache, use expiry
 		return t.AccessToken, nil
 	}
+	uk.AuthProviders["gcp"] = t
 	return nil
 }
 
@@ -147,7 +155,7 @@ func GKE2RestCluster(ctx context.Context, uk *hbone.HBone, token string, p strin
 	for _, c := range cl.Clusters {
 		rc := &hbone.Cluster{
 			Client: uk.HttpClient(c.MasterAuth.ClusterCaCertificate),
-			CACert: c.MasterAuth.ClusterCaCertificate,
+			CACert: string(c.MasterAuth.ClusterCaCertificate),
 			// Endpoint is the IP typically
 			Addr:          c.Endpoint + ":443",
 			Location:      c.Location,
@@ -183,7 +191,7 @@ func GetCluster(ctx context.Context, uk *hbone.HBone, token, path string) (*hbon
 
 	rc := &hbone.Cluster{
 		Client:        uk.HttpClient(c.MasterAuth.ClusterCaCertificate),
-		CACert:        c.MasterAuth.ClusterCaCertificate,
+		CACert:        string(c.MasterAuth.ClusterCaCertificate),
 		Addr:          c.Endpoint + ":443",
 		Location:      c.Location,
 		TokenProvider: uk.AuthProviders["gcp"],
@@ -236,16 +244,17 @@ func Hub2RestClusters(ctx context.Context, uk *hbone.HBone, tok, p string) ([]*h
 // Get a GCP secrets - used for bootstraping the credentials and provisioning.
 //
 // Example for creating a secret:
-// gcloud secrets create ca \
-//   --data-file <PATH-TO-SECRET-FILE> \
-//   --replication-policy automatic \
-//   --project dmeshgate \
-//   --format json \
-//   --quiet
+//
+//	gcloud secrets create ca \
+//	  --data-file <PATH-TO-SECRET-FILE> \
+//	  --replication-policy automatic \
+//	  --project dmeshgate \
+//	  --format json \
+//	  --quiet
 func GcpSecret(ctx context.Context, uk *hbone.HBone, token, p, n, v string) ([]byte, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET",
 		"https://secretmanager.googleapis.com/v1/projects/"+p+"/secrets/"+n+
-			"/versions/"+v+":access", nil)
+				"/versions/"+v+":access", nil)
 	req.Header.Add("authorization", "Bearer "+token)
 
 	res, err := uk.Client.Do(req)
