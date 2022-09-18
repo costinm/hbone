@@ -14,10 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	"golang.org/x/net/http/httpguts"
-
-	"github.com/costinm/hbone/ext/transport/hpack"
-
+	"github.com/costinm/hbone/h2/hpack"
 	//"golang.org/x/net/http2/hpack"
 )
 
@@ -1536,9 +1533,9 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (*MetaHeadersFrame, error) {
 		if VerboseLogs && fr.logReads {
 			fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)
 		}
-		if !httpguts.ValidHeaderFieldValue(hf.Value) {
-			invalid = headerFieldValueError(hf.Value)
-		}
+		//if !httpguts.ValidHeaderFieldValue(hf.Value) {
+		//	invalid = headerFieldValueError(hf.Value)
+		//}
 		isPseudo := strings.HasPrefix(hf.Name, ":")
 		if isPseudo {
 			if sawRegular {

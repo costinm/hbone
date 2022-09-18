@@ -16,7 +16,7 @@
  *
  */
 
-package transport
+package h2
 
 import (
 	"bytes"
@@ -26,9 +26,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	http2 "github.com/costinm/hbone/ext/transport/frame"
-
-	"github.com/costinm/hbone/ext/transport/hpack"
+	"github.com/costinm/hbone/h2/frame"
+	"github.com/costinm/hbone/h2/hpack"
 )
 
 var updateHeaderTblSize = func(e *hpack.Encoder, v uint32) {
@@ -124,7 +123,7 @@ func (h *headerFrame) isTransportResponseFrame() bool {
 type cleanupStream struct {
 	streamID uint32
 	rst      bool
-	rstCode  http2.ErrCode
+	rstCode  frame.ErrCode
 	onWrite  func()
 }
 
@@ -163,13 +162,13 @@ func (*outgoingWindowUpdate) isTransportResponseFrame() bool {
 }
 
 type incomingSettings struct {
-	ss []http2.Setting
+	ss []frame.Setting
 }
 
 func (*incomingSettings) isTransportResponseFrame() bool { return true } // Results in a settings ACK
 
 type outgoingSettings struct {
-	ss []http2.Setting
+	ss []frame.Setting
 }
 
 func (*outgoingSettings) isTransportResponseFrame() bool { return false }
@@ -180,7 +179,7 @@ type incomingGoAway struct {
 func (*incomingGoAway) isTransportResponseFrame() bool { return false }
 
 type goAway struct {
-	code      http2.ErrCode
+	code      frame.ErrCode
 	debugData []byte
 	headsUp   bool
 	closeConn bool
@@ -685,7 +684,7 @@ func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.He
 		}
 		if first {
 			first = false
-			err = l.framer.fr.WriteHeaders(http2.HeadersFrameParam{
+			err = l.framer.fr.WriteHeaders(frame.HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: l.hBuf.Next(size),
 				EndStream:     endStream,
@@ -806,10 +805,10 @@ func (l *loopyWriter) handle(i interface{}) error {
 	}
 }
 
-func (l *loopyWriter) applySettings(ss []http2.Setting) error {
+func (l *loopyWriter) applySettings(ss []frame.Setting) error {
 	for _, s := range ss {
 		switch s.ID {
-		case http2.SettingInitialWindowSize:
+		case frame.SettingInitialWindowSize:
 			o := l.oiws
 			l.oiws = s.Val
 			if o < l.oiws {
@@ -821,7 +820,7 @@ func (l *loopyWriter) applySettings(ss []http2.Setting) error {
 					}
 				}
 			}
-		case http2.SettingHeaderTableSize:
+		case frame.SettingHeaderTableSize:
 			updateHeaderTblSize(l.hEnc, s.Val)
 		}
 	}

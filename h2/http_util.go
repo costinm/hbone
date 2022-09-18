@@ -16,7 +16,7 @@
  *
  */
 
-package transport
+package h2
 
 import (
 	"bufio"
@@ -33,9 +33,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	http2 "github.com/costinm/hbone/ext/transport/frame"
-
-	"github.com/costinm/hbone/ext/transport/hpack"
+	"github.com/costinm/hbone/h2/frame"
+	"github.com/costinm/hbone/h2/hpack"
 	//"golang.org/x/net/http2"
 	//"golang.org/x/net/http2/hpack"
 )
@@ -54,22 +53,22 @@ const (
 )
 
 var (
-	clientPreface   = []byte(http2.ClientPreface)
-	http2ErrConvTab = map[http2.ErrCode]Code{
-		http2.ErrCodeNo:                 Internal,
-		http2.ErrCodeProtocol:           Internal,
-		http2.ErrCodeInternal:           Internal,
-		http2.ErrCodeFlowControl:        ResourceExhausted,
-		http2.ErrCodeSettingsTimeout:    Internal,
-		http2.ErrCodeStreamClosed:       Internal,
-		http2.ErrCodeFrameSize:          Internal,
-		http2.ErrCodeRefusedStream:      Unavailable,
-		http2.ErrCodeCancel:             Canceled,
-		http2.ErrCodeCompression:        Internal,
-		http2.ErrCodeConnect:            Internal,
-		http2.ErrCodeEnhanceYourCalm:    ResourceExhausted,
-		http2.ErrCodeInadequateSecurity: PermissionDenied,
-		http2.ErrCodeHTTP11Required:     Internal,
+	clientPreface   = []byte(frame.ClientPreface)
+	http2ErrConvTab = map[frame.ErrCode]Code{
+		frame.ErrCodeNo:                 Internal,
+		frame.ErrCodeProtocol:           Internal,
+		frame.ErrCodeInternal:           Internal,
+		frame.ErrCodeFlowControl:        ResourceExhausted,
+		frame.ErrCodeSettingsTimeout:    Internal,
+		frame.ErrCodeStreamClosed:       Internal,
+		frame.ErrCodeFrameSize:          Internal,
+		frame.ErrCodeRefusedStream:      Unavailable,
+		frame.ErrCodeCancel:             Canceled,
+		frame.ErrCodeCompression:        Internal,
+		frame.ErrCodeConnect:            Internal,
+		frame.ErrCodeEnhanceYourCalm:    ResourceExhausted,
+		frame.ErrCodeInadequateSecurity: PermissionDenied,
+		frame.ErrCodeHTTP11Required:     Internal,
 	}
 	// HTTPStatusConvTab is the HTTP status code to gRPC error code conversion table.
 	HTTPStatusConvTab = map[int]Code{
@@ -371,7 +370,7 @@ func (w *bufWriter) Flush() error {
 
 type framer struct {
 	writer *bufWriter
-	fr     *http2.Framer
+	fr     *frame.Framer
 }
 
 func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderListSize uint32, maxFrame uint32) *framer {
@@ -385,7 +384,7 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderList
 	w := newBufWriter(conn, writeBufferSize)
 	f := &framer{
 		writer: w,
-		fr:     http2.NewFramer(w, r),
+		fr:     frame.NewFramer(w, r),
 	}
 	f.fr.SetMaxReadFrameSize(maxFrame)
 	// Opt-in to Frame reuse API on framer to reduce garbage.

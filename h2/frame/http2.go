@@ -26,8 +26,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"golang.org/x/net/http/httpguts"
 )
 
 var (
@@ -185,9 +183,9 @@ func validWireHeaderFieldName(v string) bool {
 		return false
 	}
 	for _, r := range v {
-		if !httpguts.IsTokenRune(r) {
-			return false
-		}
+		//if !httpguts.IsTokenRune(r) {
+		//	return false
+		//}
 		if 'A' <= r && r <= 'Z' {
 			return false
 		}

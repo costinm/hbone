@@ -19,7 +19,7 @@
 // Package transport defines and implements message oriented communication
 // channel to complete various transactions (e.g., an RPC).  It is meant for
 // grpc-internal usage and is not intended to be imported directly by users.
-package transport
+package h2
 
 import (
 	"bytes"
@@ -34,7 +34,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	http2 "github.com/costinm/hbone/ext/transport/frame"
+	http2 "github.com/costinm/hbone/h2/frame"
 	"github.com/costinm/hbone/nio"
 )
 
@@ -232,8 +232,9 @@ func (r *recvBufferReader) readClient(p []byte) (n int, err error) {
 		// we really want is to mark the stream as done, and return ctx error
 		// faster.
 		r.closeStream(ContextErr(r.ctx.Err()))
-		m := <-r.recv.get()
-		return r.readAdditional(m, p)
+		//m := <-r.recv.get()
+		//return r.readAdditional(m, p)
+		return 0, r.ctx.Err()
 	case m := <-r.recv.get():
 		return r.readAdditional(m, p)
 	}
@@ -325,7 +326,8 @@ type Stream struct {
 	// Also set after sending a trailer.
 	writeClosed uint32
 
-	status *Status
+	// Set when the trailer head is received. Data also available in Response.Trailers
+	Status *Status
 
 	bytesReceived uint32 // indicates whether any bytes have been received on this stream
 	unprocessed   uint32 // set if the server sends a refused stream or GOAWAY including this stream
@@ -336,8 +338,32 @@ type Stream struct {
 	// grpc is set if the stream is working in grpc mode, based on content type.
 	// Close will use trailer instead of end data, ordering of headers.
 	grpc bool
+
+	nio.Stats
 }
 
+func (s *Stream) Header() http.Header {
+	return s.Response.Header
+}
+
+func (s *Stream) WriteHeader(statusCode int) {
+	if !s.isHeaderSent() { // Headers haven't been written yet.
+		if s.st != nil {
+			if err := s.st.WriteHeader(s); err != nil {
+				log.Println("WriteHeader", err)
+				return
+			}
+		} else {
+			s.ct.Dial(s.Request)
+		}
+	}
+	// for request it's part of Dial/RoundTrip
+}
+
+// CloseError will close the stream with an error code.
+// This will result in a RST sent, reader will be closed as well.
+//
+// Will unblock Read and Write and cancel the stream context.
 func (s *Stream) CloseError(code uint32) {
 	// On error we remove the stream from active.
 	// In and out are also closed, s is canceled
@@ -348,25 +374,56 @@ func (s *Stream) CloseError(code uint32) {
 	}
 }
 
-// Part of ResponseStream Body (ReaderCloser).
-// Should this should send a RST if EOF was not received ?
-// Use CloseWrite for a sending FIN
+// TCP/IP shutdown allows control over closing the stream:
+//   - 0 unblock read() with err, in TCP any further received data is rejected with RST
+//     but if we received a FIN - all is good.
+//   - 1 same with CloseWrite()
+//   - 2 both directions.
+
+// Close() is one of the most complicated methods for H2 and TCP.
+//
+// Recommended close:
+//   - CloseWrite will send a FIN (data frame or trailer headers). Read continues
+//     until it receives FIN, at which point stream is closed. Close() is called internally.
+//   - CloseError will send a RST explicitly, with the given code. Read is closed as well,
+//     and Close() is called internally.
+//
+// Repeated calls to Close() have no effects.
+//
+// Unfortunately many net.Conn users treat Close() as CloseWrite() - since there
+// is no explicit method. TLS Conn does send closeNotify, and TCP Conn appears to
+// also send FIN. RST in TCP is only sent if data is received after close().
+//
+// The expectation is that Read() will also be unblocked by Close, if EOF not already
+// received - but it should not return EOF since it's not the real cause. Like
+// os close, there is no lingering by default.
+//
+// net.Close doc: Close closes the connection.
+// Any blocked Read or Write operations will be unblocked and return errors.
 func (s *Stream) Close() error {
-	// TODO(costin): RST
+	// Send a END_STREAM (if not already sent)
+
+	// TODO: if write buffers are not empty, still send RST, empty write buf and unblock.
 	if s.st == nil {
 		log.Println("Client Stream Read Close()", s.Id)
 
 		s.ct.Write(s, nil, nil, true)
+
 		s.ct.CloseStream(s, nil)
 	} else {
 		log.Println("Server stream Close()", s.Id)
-		if s.grpc {
-			return s.st.WriteStatus(s, &Status{})
-		} else {
-			s.CloseWrite()
-			s.st.closeStream(s, true, http2.ErrCode(0), true)
-		}
+		s.CloseWrite()
+
+		s.st.closeStream(s, false, http2.ErrCode(0), true)
 	}
+
+	s.setReadClosed(2)
+
+	// Will unblock reads/write waiting
+	if s.cancel != nil {
+		s.cancel()
+	}
+
 	// Unblock writes waiting to send
 	if s.writeDoneChanClosed == 0 {
 		s.writeDoneChanClosed = 1
@@ -407,6 +464,7 @@ func (s *Stream) Write(d []byte) (int, error) {
 // Client: send FIN
 // Server: send trailers and FIN
 func (s *Stream) CloseWrite() error {
+
 	if s.st == nil {
 		// Client mode, RoundTrip with request Body
 		if nio.Debug {
@@ -414,12 +472,19 @@ func (s *Stream) CloseWrite() error {
 		}
 		return s.ct.Write(s, nil, nil, true)
 	}
+	if !s.updateHeaderSent() { // No headers have been sent.
+		if err := s.st.writeHeaderLocked(s); err != nil {
+			s.hdrMu.Unlock()
+			return err
+		}
+	}
+
 	// TODO: use this only if trailer are present
-	if false {
+	if len(s.Response.Trailer) > 0 {
 		if nio.Debug {
 			log.Println("Server sends CloseWrite() with trailer", s.Id)
 		}
-		return s.st.WriteStatus(s, &Status{})
+		return s.st.writeStatus(s)
 	} else {
 		if nio.Debug {
 			log.Println("Server sends CloseWrite()", s.Id)
@@ -434,7 +499,6 @@ func (s *Stream) isHeaderSent() bool {
 }
 
 // updateHeaderSent updates headerSent and returns true
-// if it was alreay set. It is valid only on server-side.
 func (s *Stream) updateHeaderSent() bool {
 	return atomic.SwapUint32(&s.headerSent, 1) == 1
 }
@@ -479,13 +543,6 @@ func (s *Stream) waitOnHeader() {
 		<-s.headerChan
 	case <-s.headerChan:
 	}
-}
-
-// RecvCompress returns the compression algorithm applied to the inbound
-// message. It is empty string if there is no compression applied.
-func (s *Stream) RecvCompress() string {
-	s.waitOnHeader()
-	return s.recvCompress
 }
 
 // Done returns a channel which is closed when it receives the final status
@@ -822,6 +879,8 @@ func ContextErr(err error) error {
 	return &Status{Code: int(Internal), Message: fmt.Sprintf("Unexpected error from context packet: %v", err)}
 }
 
+// Status is the gRPC trailer. It can also be used in regular H2 (despite the grpc keys)
+// instead of inventing new names.
 type Status struct {
 
 	// The status code, which should be an enum value of [google.rpc.Code][google.rpc.Code].
@@ -835,6 +894,10 @@ type Status struct {
 	Details [][]byte
 
 	Err error
+}
+
+func (st *Stream) SetStatus(status *Status) {
+	// WIP: sent the trailers
 }
 
 func (s *Status) Error() string {

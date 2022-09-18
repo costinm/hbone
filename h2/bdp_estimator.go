@@ -16,7 +16,7 @@
  *
  */
 
-package transport
+package h2
 
 import (
 	"sync"

@@ -16,7 +16,7 @@
  *
  */
 
-package transport
+package h2
 
 import (
 	"context"
@@ -32,9 +32,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	http2 "github.com/costinm/hbone/ext/transport/frame"
-	"github.com/costinm/hbone/ext/transport/grpcutil"
-	"github.com/costinm/hbone/ext/transport/hpack"
+	"github.com/costinm/hbone/h2/frame"
+	"github.com/costinm/hbone/h2/grpcutil"
+	"github.com/costinm/hbone/h2/hpack"
 )
 
 // clientConnectionCounter counts the number of connections a client has
@@ -165,8 +165,8 @@ func (t *HTTP2ClientMux) newStream(ctx context.Context, callHdr *CallHdr) *Strea
 	return s
 }
 
-func (t *HTTP2ClientMux) createHeaderFields(ctx context.Context, callHdr *CallHdr) ([]hpack.HeaderField, error) {
-	r := callHdr.Req
+func (t *HTTP2ClientMux) createHeaderFields(ctx context.Context,
+		r *http.Request) ([]hpack.HeaderField, error) {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
 	// Make the slice of certain predictable size to reduce allocations made by append.
@@ -175,20 +175,22 @@ func (t *HTTP2ClientMux) createHeaderFields(ctx context.Context, callHdr *CallHd
 		r.Host = r.URL.Host
 	}
 	headerFields := make([]hpack.HeaderField, 0, hfLen)
-	headerFields = append(headerFields, hpack.HeaderField{Name: ":method", Value: r.Method})
-	headerFields = append(headerFields, hpack.HeaderField{Name: ":scheme", Value: "https"})
-	headerFields = append(headerFields, hpack.HeaderField{Name: ":path", Value: r.URL.Path})
 	headerFields = append(headerFields, hpack.HeaderField{Name: ":authority", Value: r.Host})
-
+	headerFields = append(headerFields, hpack.HeaderField{Name: ":method", Value: r.Method})
+	if r.Method != "CONNECT" {
+		headerFields = append(headerFields, hpack.HeaderField{Name: ":path", Value: r.URL.Path})
+		headerFields = append(headerFields, hpack.HeaderField{Name: ":scheme", Value: "https"})
+	}
 	ct := r.Header.Get("content-type")
 	headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: ct})
+
 	if strings.HasPrefix(ct, "application/grpc") {
 		headerFields = append(headerFields, hpack.HeaderField{Name: "te", Value: "trailers"})
 	}
 	// Send it to all requests, even if grpc specific
-	if callHdr.PreviousAttempts > 0 {
-		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-previous-rpc-attempts", Value: strconv.Itoa(callHdr.PreviousAttempts)})
-	}
+	//if callHdr.PreviousAttempts > 0 {
+	//	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-previous-rpc-attempts", Value: strconv.Itoa(callHdr.PreviousAttempts)})
+	//}
 
 	if dl, ok := ctx.Deadline(); ok {
 		// Send out timeout regardless its value. The server can detect timeout context by itself.
@@ -205,6 +207,7 @@ func (t *HTTP2ClientMux) createHeaderFields(ctx context.Context, callHdr *CallHd
 			headerFields = append(headerFields, hpack.HeaderField{Name: strings.ToLower(k), Value: encodeMetadataHeader(k, v)})
 		}
 	}
+	log.Println("Headers to sent:", headerFields)
 	return headerFields, nil
 }
 
@@ -232,12 +235,18 @@ func (e NewStreamError) Error() string {
 // NewStream creates a stream and registers it into the transport as "active"
 // streams.  All non-nil errors returned will be *NewStreamError.
 func (t *HTTP2ClientMux) NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error) {
-	headerFields, err := t.createHeaderFields(ctx, callHdr)
+	headerFields, err := t.createHeaderFields(ctx, callHdr.Req)
 	if err != nil {
 		return nil, &NewStreamError{Err: err, AllowTransparentRetry: false}
 	}
 
 	s := t.newStream(ctx, callHdr)
+
+	_, err = t.sendHeaders(s, headerFields)
+	return s, err
+}
+
+func (t *HTTP2ClientMux) sendHeaders(s *Stream, headerFields []hpack.HeaderField) (*Stream, error) {
 	cleanup := func(err error) {
 		if s.swapState(streamDone) == streamDone {
 			// If it was already done, return.
@@ -351,6 +360,7 @@ func (t *HTTP2ClientMux) NewStream(ctx context.Context, callHdr *CallHdr) (*Stre
 			return nil, &NewStreamError{Err: hdrListSizeErr}
 		}
 		firstTry = false
+		ctx := s.ctx
 		select {
 		case <-ch:
 		case <-ctx.Done():
@@ -369,19 +379,20 @@ func (t *HTTP2ClientMux) NewStream(ctx context.Context, callHdr *CallHdr) (*Stre
 func (t *HTTP2ClientMux) CloseStream(s *Stream, err error) {
 	var (
 		rst     bool
-		rstCode http2.ErrCode
+		rstCode frame.ErrCode
 	)
 	if err != nil {
 		rst = true
-		rstCode = http2.ErrCodeCancel
+		rstCode = frame.ErrCodeCancel
 	}
 	t.closeStream(s, err, rst, rstCode, &Status{Err: err}, nil, false)
 }
 
-func (t *HTTP2ClientMux) closeStream(s *Stream, err error, rst bool, rstCode http2.ErrCode,
-	st *Status, mdata map[string][]string, eosReceived bool) {
+func (t *HTTP2ClientMux) closeStream(s *Stream, err error, rst bool, rstCode frame.ErrCode,
+		st *Status, mdata map[string][]string, eosReceived bool) {
 
 	log.Println("Client closeStream", s.Id, err, rst, rstCode)
+
 	// Set stream status to done.
 	if s.swapState(streamDone) == streamDone {
 		// If it was already done, return.  If multiple closeStream calls
@@ -389,10 +400,11 @@ func (t *HTTP2ClientMux) closeStream(s *Stream, err error, rst bool, rstCode htt
 		<-s.done
 		return
 	}
+
 	// status and trailers can be updated here without any synchronization because the stream goroutine will
 	// only read it after it sees an io.EOF error from read or write and we'll write those errors
 	// only after updating this.
-	s.status = st
+	s.Status = st
 	if err != nil {
 		s.setReadClosed(2)
 		// This will unblock reads eventually.
@@ -484,7 +496,7 @@ func (t *HTTP2ClientMux) Close(err error) {
 
 	// Notify all active streams.
 	for _, s := range streams {
-		t.closeStream(s, err, false, http2.ErrCodeNo, st, nil, false)
+		t.closeStream(s, err, false, frame.ErrCodeNo, st, nil, false)
 	}
 	// TODO(telemetry): Handle conn end
 }
@@ -544,7 +556,7 @@ func (t *HTTP2ClientMux) Write(s *Stream, hdr []byte, data []byte, last bool) er
 	return nil
 }
 
-func (t *HTTP2ClientMux) getStream(f http2.Frame) *Stream {
+func (t *HTTP2ClientMux) getStream(f frame.Frame) *Stream {
 	t.mu.Lock()
 	s := t.activeStreams[f.Header().StreamID]
 	t.mu.Unlock()
@@ -569,6 +581,8 @@ func (t *HTTP2ClientMux) updateWindow(s *Stream, n uint32) {
 	}
 }
 
+const SettingH2R = 0xF051
+
 // updateFlowControl updates the incoming flow control windows
 // for the transport and the stream based on the current bdp
 // estimation.
@@ -584,16 +598,20 @@ func (t *HTTP2ClientMux) updateFlowControl(n uint32) {
 	}
 	t.controlBuf.executeAndPut(updateIWS, &outgoingWindowUpdate{streamID: 0, increment: t.fc.newLimit(n)})
 	t.controlBuf.put(&outgoingSettings{
-		ss: []http2.Setting{
+		ss: []frame.Setting{
 			{
-				ID:  http2.SettingInitialWindowSize,
+				ID:  frame.SettingInitialWindowSize,
 				Val: n,
+			},
+			{
+				ID:  SettingH2R,
+				Val: 1,
 			},
 		},
 	})
 }
 
-func (t *HTTP2ClientMux) handleData(f *http2.DataFrame) {
+func (t *HTTP2ClientMux) handleData(f *frame.DataFrame) {
 	size := f.Header().Length
 	var sendBDPPing bool
 	if t.bdpEst != nil {
@@ -634,10 +652,10 @@ func (t *HTTP2ClientMux) handleData(f *http2.DataFrame) {
 	}
 	if size > 0 {
 		if err := s.fc.onData(size); err != nil {
-			t.closeStream(s, io.EOF, true, http2.ErrCodeFlowControl, &Status{Err: err}, nil, false)
+			t.closeStream(s, io.EOF, true, frame.ErrCodeFlowControl, &Status{Err: err}, nil, false)
 			return
 		}
-		if f.Header().Flags.Has(http2.FlagDataPadded) {
+		if f.Header().Flags.Has(frame.FlagDataPadded) {
 			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
 				t.controlBuf.put(&outgoingWindowUpdate{s.Id, w})
 			}
@@ -661,7 +679,7 @@ func (t *HTTP2ClientMux) handleData(f *http2.DataFrame) {
 	}
 }
 
-func (t *HTTP2ClientMux) handleRSTStream(f *http2.RSTStreamFrame) {
+func (t *HTTP2ClientMux) handleRSTStream(f *frame.RSTStreamFrame) {
 	s := t.getStream(f)
 	if s == nil {
 		return
@@ -672,7 +690,7 @@ func (t *HTTP2ClientMux) handleRSTStream(f *http2.RSTStreamFrame) {
 	}
 	log.Println("Client RST received", f, f.ErrCode)
 
-	if f.ErrCode == http2.ErrCodeRefusedStream {
+	if f.ErrCode == frame.ErrCodeRefusedStream {
 		// The stream was unprocessed by the server.
 		atomic.StoreUint32(&s.unprocessed, 1)
 	}
@@ -700,27 +718,27 @@ func (t *HTTP2ClientMux) handleRSTStream(f *http2.RSTStreamFrame) {
 	//t.closeStream(s, io.EOF, false, http2.ErrCodeNo, &Status{Code: int(statusCode), Message: fmt.Sprintf("stream terminated by RST_STREAM with error code: %v", f.ErrCode)}, nil, false)
 }
 
-func (t *HTTP2ClientMux) handleSettings(f *http2.SettingsFrame, isFirst bool) {
+func (t *HTTP2ClientMux) handleSettings(f *frame.SettingsFrame, isFirst bool) {
 	if f.IsAck() {
 		return
 	}
 	var maxStreams *uint32
 	var fs *uint32
-	var ss []http2.Setting
+	var ss []frame.Setting
 	var updateFuncs []func()
-	f.ForeachSetting(func(s http2.Setting) error {
+	f.ForeachSetting(func(s frame.Setting) error {
 		switch s.ID {
-		case http2.SettingMaxConcurrentStreams:
+		case frame.SettingMaxConcurrentStreams:
 			maxStreams = new(uint32)
 			*maxStreams = s.Val
-		case http2.SettingMaxFrameSize:
+		case frame.SettingMaxFrameSize:
 			fs = new(uint32)
 			*fs = s.Val
 			rfs := *fs
 			if t.FrameSize > rfs {
 				t.FrameSize = rfs
 			}
-		case http2.SettingMaxHeaderListSize:
+		case frame.SettingMaxHeaderListSize:
 			updateFuncs = append(updateFuncs, func() {
 				t.maxSendHeaderListSize = new(uint32)
 				*t.maxSendHeaderListSize = s.Val
@@ -757,7 +775,7 @@ func (t *HTTP2ClientMux) handleSettings(f *http2.SettingsFrame, isFirst bool) {
 	}, sf)
 }
 
-func (t *HTTP2ClientMux) handlePing(f *http2.PingFrame) {
+func (t *HTTP2ClientMux) handlePing(f *frame.PingFrame) {
 	if f.IsAck() {
 		// Maybe it's a BDP ping.
 		if t.bdpEst != nil {
@@ -770,7 +788,7 @@ func (t *HTTP2ClientMux) handlePing(f *http2.PingFrame) {
 	t.controlBuf.put(pingAck)
 }
 
-func (t *HTTP2ClientMux) handleGoAway(f *http2.GoAwayFrame) {
+func (t *HTTP2ClientMux) handleGoAway(f *frame.GoAwayFrame) {
 	t.mu.Lock()
 	if t.state == closing {
 		t.mu.Unlock()
@@ -820,7 +838,7 @@ func (t *HTTP2ClientMux) handleGoAway(f *http2.GoAwayFrame) {
 		if streamID > id && streamID <= upperLimit {
 			// The stream was unprocessed by the server.
 			atomic.StoreUint32(&stream.unprocessed, 1)
-			t.closeStream(stream, errStreamDrain, false, http2.ErrCodeNo, statusGoAway, nil, false)
+			t.closeStream(stream, errStreamDrain, false, frame.ErrCodeNo, statusGoAway, nil, false)
 		}
 	}
 	t.prevGoAwayID = id
@@ -835,10 +853,10 @@ func (t *HTTP2ClientMux) handleGoAway(f *http2.GoAwayFrame) {
 // on the GoAway frame received.
 // It expects a lock on transport's mutext to be held by
 // the caller.
-func (t *HTTP2ClientMux) setGoAwayReason(f *http2.GoAwayFrame) {
+func (t *HTTP2ClientMux) setGoAwayReason(f *frame.GoAwayFrame) {
 	t.goAwayReason = GoAwayNoReason
 	switch f.ErrCode {
-	case http2.ErrCodeEnhanceYourCalm:
+	case frame.ErrCodeEnhanceYourCalm:
 		if string(f.DebugData()) == "too_many_pings" {
 			t.goAwayReason = GoAwayTooManyPings
 		}
@@ -856,7 +874,7 @@ func (t *HTTP2ClientMux) GetGoAwayReason() (GoAwayReason, string) {
 	return t.goAwayReason, t.goAwayDebugMessage
 }
 
-func (t *HTTP2ClientMux) handleWindowUpdate(f *http2.WindowUpdateFrame) {
+func (t *HTTP2ClientMux) handleWindowUpdate(f *frame.WindowUpdateFrame) {
 	t.controlBuf.put(&incomingWindowUpdate{
 		streamID:  f.Header().StreamID,
 		increment: f.Increment,
@@ -864,31 +882,31 @@ func (t *HTTP2ClientMux) handleWindowUpdate(f *http2.WindowUpdateFrame) {
 }
 
 // operateHeaders takes action on the decoded headers.
-func (t *HTTP2ClientMux) operateHeaders(frame *http2.MetaHeadersFrame) {
-	s := t.getStream(frame)
+func (t *HTTP2ClientMux) operateHeaders(f *frame.MetaHeadersFrame) {
+	s := t.getStream(f)
 	if s == nil {
 		return
 	}
-	endStream := frame.StreamEnded()
+	endStream := f.StreamEnded()
 	atomic.StoreUint32(&s.bytesReceived, 1)
 	initialHeader := atomic.LoadUint32(&s.headerChanClosed) == 0
 
 	if !initialHeader && !endStream {
 		// As specified by gRPC over HTTP2, a HEADERS frame (and associated CONTINUATION frames) can only appear at the start or end of a stream. Therefore, second HEADERS frame must have EOS bit set.
 		st := &Status{Message: "a HEADERS frame cannot appear in the middle of a stream"}
-		t.closeStream(s, st, true, http2.ErrCodeProtocol, st, nil, false)
+		t.closeStream(s, st, true, frame.ErrCodeProtocol, st, nil, false)
 		return
 	}
 
 	// frame.Truncated is set to true when framer detects that the current header
 	// list size hits MaxHeaderListSize limit.
-	if frame.Truncated {
+	if f.Truncated {
 		se := &Status{Message: "peer header list size exceeded limit"}
-		t.closeStream(s, se, true, http2.ErrCodeFrameSize, se, nil, endStream)
+		t.closeStream(s, se, true, frame.ErrCodeFrameSize, se, nil, endStream)
 		return
 	}
 
-	for _, hf := range frame.Fields {
+	for _, hf := range f.Fields {
 		switch hf.Name {
 		case ":status":
 			s.Response.Status = hf.Value
@@ -931,7 +949,7 @@ func (t *HTTP2ClientMux) operateHeaders(frame *http2.MetaHeadersFrame) {
 func (t *HTTP2ClientMux) reader() {
 	defer close(t.readerDone)
 	// Check the validity of server preface.
-	frame, err := t.framer.fr.ReadFrame()
+	f, err := t.framer.fr.ReadFrame()
 	if err != nil {
 		err = connectionErrorf(true, err, "error reading server preface: %v", err)
 		t.Close(err) // this kicks off resetTransport, so must be last before return
@@ -941,10 +959,10 @@ func (t *HTTP2ClientMux) reader() {
 	if t.keepaliveEnabled {
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 	}
-	sf, ok := frame.(*http2.SettingsFrame)
+	sf, ok := f.(*frame.SettingsFrame)
 	if !ok {
 		// this kicks off resetTransport, so must be last before return
-		t.Close(connectionErrorf(true, nil, "initial http2 frame from server is not a settings frame: %T", frame))
+		t.Close(connectionErrorf(true, nil, "initial http2 frame from server is not a settings frame: %T", f))
 		return
 	}
 	t.onPrefaceReceipt()
@@ -953,7 +971,7 @@ func (t *HTTP2ClientMux) reader() {
 	// loop to keep reading incoming messages on this transport.
 	for {
 		t.controlBuf.throttle()
-		frame, err := t.framer.fr.ReadFrame()
+		f, err := t.framer.fr.ReadFrame()
 		if t.keepaliveEnabled {
 			atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 		}
@@ -961,7 +979,7 @@ func (t *HTTP2ClientMux) reader() {
 			// Abort an active stream if the http2.Framer returns a
 			// http2.StreamError. This can happen only if the server's response
 			// is malformed http2.
-			if se, ok := err.(http2.StreamError); ok {
+			if se, ok := err.(frame.StreamError); ok {
 				t.mu.Lock()
 				s := t.activeStreams[se.StreamID]
 				t.mu.Unlock()
@@ -975,7 +993,7 @@ func (t *HTTP2ClientMux) reader() {
 					} else {
 						msg = "received invalid frame"
 					}
-					t.closeStream(s, &Status{Code: int(code), Message: msg}, true, http2.ErrCodeProtocol, &Status{Code: int(code), Message: msg}, nil, false)
+					t.closeStream(s, &Status{Code: int(code), Message: msg}, true, frame.ErrCodeProtocol, &Status{Code: int(code), Message: msg}, nil, false)
 				}
 				continue
 			} else {
@@ -984,20 +1002,20 @@ func (t *HTTP2ClientMux) reader() {
 				return
 			}
 		}
-		switch frame := frame.(type) {
-		case *http2.MetaHeadersFrame:
+		switch frame := f.(type) {
+		case *frame.MetaHeadersFrame:
 			t.operateHeaders(frame)
-		case *http2.DataFrame:
+		case *frame.DataFrame:
 			t.handleData(frame)
-		case *http2.RSTStreamFrame:
+		case *frame.RSTStreamFrame:
 			t.handleRSTStream(frame)
-		case *http2.SettingsFrame:
+		case *frame.SettingsFrame:
 			t.handleSettings(frame, false)
-		case *http2.PingFrame:
+		case *frame.PingFrame:
 			t.handlePing(frame)
-		case *http2.GoAwayFrame:
+		case *frame.GoAwayFrame:
 			t.handleGoAway(frame)
-		case *http2.WindowUpdateFrame:
+		case *frame.WindowUpdateFrame:
 			t.handleWindowUpdate(frame)
 		default:
 			log.Printf("transport: HTTP2ClientMux.reader got unhandled frame type %v.", frame)
@@ -1122,4 +1140,8 @@ func (t *HTTP2ClientMux) getOutFlowWindow() int64 {
 	case <-timer.C:
 		return -2
 	}
+}
+
+func (t *HTTP2ClientMux) CanTakeNewRequest() bool {
+	return t.state == reachable
 }
