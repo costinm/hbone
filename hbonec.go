@@ -15,12 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/costinm/hbone/ext/transport"
+	transport2 "github.com/costinm/hbone/h2"
 	"github.com/costinm/hbone/nio"
 	"github.com/costinm/hbone/nio/syscall"
-
-	//"golang.org/x/net/http2"
-	"github.com/costinm/hbone/ext/http2"
 )
 
 // Structs are yaml-friendly:
@@ -105,8 +102,8 @@ type Cluster struct {
 	// TLS config used when dialing using workload identity, shared
 	TLSClientConfig *tls.Config
 
-	// Shared by all endpoints for this cluster
-	H2T *http2.Transport
+	//// Shared by all endpoints for this cluster
+	//H2T *http2.Transport
 
 	// If set, will be used to select the next endpoint. Based on lb_policy
 	// May dial a new connection.
@@ -116,6 +113,7 @@ type Cluster struct {
 // Cluster and EndpointCon implements the Mux interface.
 type Mux interface {
 	Dial(ctx context.Context) (net.Conn, error)
+	WriteHeader(stream Stream)
 }
 
 // Endpoint represents a connection/association with a cluster.
@@ -378,7 +376,7 @@ func (c *Cluster) trustRoots() *x509.CertPool {
 //
 // The HTTPConn represents the HBone connection to the peer or to a proxy.
 func (hb *HBone) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	log.Println("Dial ", addr)
+	//log.Println("Dial ", addr)
 	c := hb.GetCluster(addr)
 	if c == nil {
 		// TODO: custom dialer
@@ -423,7 +421,7 @@ func (hb *HBone) DialRequest(ctx context.Context, req *http.Request) (net.Conn, 
 
 // Similar with HBone dial, if you already have the Cluster (by hostname).
 func (c *Cluster) Dial(ctx context.Context, r *http.Request) (net.Conn, error) {
-	epc, nc, err := c.dial(ctx, r)
+	_, nc, err := c.dial(ctx, r)
 	if err != nil {
 		return nc, err
 	}
@@ -436,26 +434,22 @@ func (c *Cluster) Dial(ctx context.Context, r *http.Request) (net.Conn, error) {
 	// We need to do another round of mTLS to connect to the end host.
 	// This is compatible with normal CONNECT and http_proxy - goes to the original destination port, not to the hbone
 	// port on the target.
-	if epc.Endpoint.Labels["http_proxy"] != "" {
-		// Do the mTLS handshake for the tunneled connection
-		// SNI is based on the service name - or the SNI override.
-		sni := c.SNI
-		if sni == "" {
-			sni, _, _ = net.SplitHostPort(c.Addr)
-		}
-		tlsClientConfig := c.hb.Auth.GenerateTLSConfigClientRoots(sni, c.trustRoots())
-
-		tlsTun := tls.Client(nc, //&nio.HTTPConn{Conn: epc.tlsCon, R: nc, W: nc, Cluster: c},
-			tlsClientConfig)
-		err = nio.HandshakeTimeout(tlsTun, c.hb.HandsahakeTimeout, nil)
-		if err != nil {
-			return nil, err
-		}
-		log.Println("client-rt tun handshake", tlsTun.ConnectionState())
-		return tlsTun, err
-	}
 
 	return nc, err
+}
+
+func (c *Cluster) AddToken(req *http.Request, aut string) error {
+	if c.TokenProvider != nil {
+		t, err := c.TokenProvider(req.Context(), "https://"+aut)
+		if err != nil {
+			return err
+		}
+		req.Header.Add("authorization", "Bearer "+t)
+	}
+	if c.Token != "" {
+		req.Header.Add("authorization", c.Token)
+	}
+	return nil
 }
 
 // TODO(costin): use the hostname, get IP override from x-original-dst header or cookie.
@@ -473,73 +467,15 @@ func (c *Cluster) dial(ctx context.Context, req *http.Request) (*EndpointCon, ne
 		// TODO: only POST mode supported right now, address not from label.
 
 		// Tunnel mode, untrusted proxy authentication.
-		i, o := io.Pipe()
-		req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+epc.Endpoint.HBoneAddress, i)
-		if c.TokenProvider != nil {
-			t, err := c.TokenProvider(req.Context(), "https://"+epc.Endpoint.HBoneAddress)
-			if err != nil {
-				return nil, nil, err
-			}
-			req.Header.Add("authorization", "Bearer "+t)
-		}
-		if c.Token != "" {
-			req.Header.Add("authorization", c.Token)
+		req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+epc.Endpoint.HBoneAddress, nil)
+
+		err = c.AddToken(req, epc.Endpoint.HBoneAddress)
+		if err != nil {
+			return nil, nil, err
 		}
 
-		// See:
-		//https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_conn_man/headers#config-http-conn-man-headers-downstream-service-cluster
-
-		// user-agent - based on service-cluster
-		// server - defaults to 'envoy'
-		// x-client-trace-id
-		// x-envoy-downstream-client-cluster
-		// x-envoy-downstream-client-node
-		// x-envoy-external-address
-		// x-envoy-force-trace
-		// x-envoy-internal
-		// x-envoy-original-dst-host - override original destination, if use_http_header option set
-		// x-forwarded-client-cert
-		// x-forwarded-for
-		// x-forwarded-host - original host in authority, if host is rewritten/replaced
-		// x-forwarded-proto
-		// x-request-id
-		// x-ot-span-context
-		// x-b3-* - for zipkin
-		//
-		// Envoy configs can set headers based on meta:
-		// DOWNSTREAM_REMOTE_ADDRESS - that's client address, possibly from x-f-f
-		// DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT
-		// DOWNSTREAM_REMOTE_PORT
-		// DOWNSTREAM_DIRECT_REMOTE_ADDRESS = IP address, direct, also _PORT and WITHOUT_PORT
-		// DOWNSTREAM_LOCAL_ADDRESS = local IP for direct, or original dest for REDIRECT. Original dst/port
-		// DOWNSTREAM_LOCAL_URI_SAN - SAN in the local certificate
-		// DOWNSTREAM_PEER_URI_SAN
-		// same for SUBJECT, ISSUER, TLS_SESSION_ID, TLS_CIPHER, TLS_VERSION, PEER_FINGERPRINT_256
-		// DOWNSTREAM_PEER_CERT
-		// ... V_START, V_END
-		// REQUESTED_SERVER_NAME - SNI
-		// UPSTREAM_METADATA("namespace", "key")
-		// DYNAMIC_METADATA
-		//
-		// UPSTREAM_REMOTE_ADDRESS - can't be added to requests (not known yet)
-		// PER_REQUEST_STATE ???
-		// REQ(header-name)
-		// START_TIME
-		// RESPONSE_FLAGS
-		// RESPONSE_CODE_DETAILS
-		// VIRTUAL_CLUSTER_NAME
-
-		req.Header.Add("X-Service", c.Addr)
-		req.Header.Add("X-tun", epc.Endpoint.Address)
-
-		// https://www.w3.org/TR/trace-context/
-		// https://w3c.github.io/baggage/
-		// version:0
-		// traceID: 16B hex
-		// parentID: 8B hex - span id, id of the request from caller
-		// flags: 01 = sampled
-		//req.Header.Add("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00")
-		//tracestate: congo=ucfJifl5GOE,rojo=00f067aa0ba902b7
+		req.Header.Add("x-service", c.Addr)
+		req.Header.Add("x-tun", epc.Endpoint.Address)
 
 		res, err := epc.rt.RoundTrip(req)
 		if err != nil {
@@ -547,62 +483,44 @@ func (c *Cluster) dial(ctx context.Context, req *http.Request) (*EndpointCon, ne
 			return nil, nil, err
 		}
 
-		return epc, &HTTPConn{R: res.Body, W: o, Conn: epc.tlsCon, Req: req, Res: res,
-			Cluster: c}, err
+		nc := res.Body.(net.Conn)
+		// Do the mTLS handshake for the tunneled connection
+		// SNI is based on the service name - or the SNI override.
+		sni := c.SNI
+		if sni == "" {
+			sni, _, _ = net.SplitHostPort(c.Addr)
+		}
+		tlsClientConfig := c.hb.Auth.GenerateTLSConfigClientRoots(sni, c.trustRoots())
+
+		tlsTun := tls.Client(nc, //&nio.HTTPConn{Conn: epc.tlsCon, R: nc, W: nc, Cluster: c},
+			tlsClientConfig)
+		err = nio.HandshakeTimeout(tlsTun, c.hb.HandsahakeTimeout, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		//log.Println("client-rt tun handshake", tlsTun.ConnectionState())
+		return epc, tlsTun, err
+
+		// TLS wrapper will be added on response.
+		//return epc, res.Body.(net.Conn), err //
+		// &HTTPConn{R: res.Body, W: o, Conn: epc.tlsCon, Req: req, Res: res,
+		//	Cluster: c}, err
 	}
 
-	if !useGrpcH2 {
-		return InitH2ClientConn(ctx, req, epc, c)
-	}
 	if req == nil {
 		req, _ = http.NewRequestWithContext(ctx, "CONNECT", "https://"+epc.Endpoint.Address, nil)
 	}
 
-	req.Header.Add("X-Service", c.Addr)
+	req.Header.Add("x-service", c.Addr)
 
-	res, tlsc, err := c.rt(epc, req)
+	res, _, err := c.rt(epc, req)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	nc := res.Body.(net.Conn)
 	// TODO: return nc directly instead of HTTPConn
-	return epc, &HTTPConn{
-		R:       res.Body,
-		W:       nc,
-		Conn:    tlsc.tlsCon,
-		Req:     req,
-		Res:     res,
-		Cluster: c}, err
-}
-
-/// temp
-
-func InitH2ClientConn(ctx context.Context, req *http.Request, epc *EndpointCon, c *Cluster) (*EndpointCon, net.Conn, error) {
-	// It is usually possible to pass stdin directly to NewRequest.
-	// Using a pipe allows getting stats.
-	var out io.Writer
-	if req == nil {
-		i, o := io.Pipe()
-		out = o
-		req, _ = http.NewRequestWithContext(ctx, "CONNECT", "https://"+epc.Endpoint.Address, i)
-	} else {
-		if req.Body == nil {
-			i, o := io.Pipe()
-			out = o
-			req.Body = i
-		}
-	}
-
-	req.Header.Add("X-Service", c.Addr)
-
-	res, tlsc, err := c.rt(epc, req)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return epc, &HTTPConn{R: res.Body, W: out, Conn: tlsc.tlsCon,
-		Req: req, Res: res, Cluster: c}, err
+	return epc, nc, err
 }
 
 //var InitH2ClientConn func(ctx context.Context, req *http.Request, epc *EndpointCon, c *Cluster) (*EndpointCon, net.Conn, error)
@@ -637,12 +555,6 @@ func (c *Cluster) rt(epc *EndpointCon, req *http.Request) (*http.Response, *Endp
 			if err != nil {
 				return nil, nil, err
 			}
-		}
-
-		if useGrpcH2 {
-
-		} else {
-
 		}
 
 		// IMPORTANT: some servers will not return the headers until the first byte of the response is sent, which
@@ -689,14 +601,15 @@ func (c *Cluster) findMux(ctx context.Context) (*EndpointCon, error) {
 		c.EndpointCon = append(c.EndpointCon, ep)
 	}
 	ep := c.EndpointCon[0]
-	if cc, ok := ep.rt.(*http2.ClientConn); ok {
+	if cc, ok := ep.rt.(*transport2.HTTP2ClientMux); ok {
 		if !cc.CanTakeNewRequest() {
 			ep.rt = nil
 		}
-		if cc.State().StreamsActive > 128 {
-			// TODO: create new endpoint
-		}
+		//if cc.State().StreamsActive > 128 {
+		//	// TODO: create new endpoint
+		//}
 	}
+
 	if ep.rt == nil {
 		// TODO: on failure, try another endpoint
 		err := ep.dialH2ClientConn(ctx)
@@ -734,36 +647,19 @@ func (ep *EndpointCon) dialH2ClientConn(ctx context.Context) error {
 		return err
 	}
 
-	if ep.c.H2T == nil {
-		ep.c.H2T = &http2.Transport{
-			ReadIdleTimeout:            10000 * time.Second,
-			StrictMaxConcurrentStreams: false,
-			AllowHTTP:                  true,
-		}
-	}
-	if useGrpcH2 {
-		hc, err := transport.NewHTTP2Client(ctx, ctx, ep.tlsCon, transport.ConnectOptions{
-			InitialConnWindowSize: 1 << 26,
-			InitialWindowSize:     1 << 25,
-			MaxFrameSize:          1 << 24,
-		}, func() {
-		}, func(reason transport.GoAwayReason) {
-		}, func() {
-		})
-		if err != nil {
-			return err
-		}
-		ep.rt = hc
-		return nil
-	}
-	// Multiplex the connection
-	rt, err := ep.c.H2T.NewClientConn(ep.tlsCon)
+	hc, err := transport2.NewHTTP2Client(ctx, ctx, ep.tlsCon, transport2.ConnectOptions{
+		InitialConnWindowSize: 1 << 26,
+		InitialWindowSize:     1 << 25,
+		MaxFrameSize:          1 << 24,
+	}, func() {
+	}, func(reason transport2.GoAwayReason) {
+	}, func() {
+	})
 	if err != nil {
 		return err
 	}
-	ep.rt = rt
-
-	return err
+	ep.rt = hc
+	return nil
 }
 
 func (hc *EndpointCon) Close() error {

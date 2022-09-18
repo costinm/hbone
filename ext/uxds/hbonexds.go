@@ -113,20 +113,16 @@ func GetCertificate(ctx context.Context, id *auth.MeshAuth, ca *hbone.Cluster) e
 	bb := ress.GetWriteFrame()
 	bout, _ := proto.MarshalOptions{}.MarshalAppend(bb.Bytes(), &req)
 	bb.UpdateAppend(bout)
-
 	err = ress.Send(bb)
 	ress.CloseWrite()
 
 	if err != nil {
 		return err
 	}
+
 	var res istioca.IstioCertificateResponse
-
 	f, err := ress.Recv(true)
-	//proto.Unmarshal(resd, &res)
 	proto.Unmarshal(f.Bytes(), &res)
-
-	//log.Println("Cert: ", res.CertChain)
 
 	err = id.SetKeysPEM(keyPEM, res.CertChain)
 	return err

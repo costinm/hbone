@@ -14,6 +14,13 @@ import (
 	"github.com/costinm/hbone/nio"
 )
 
+type Stream interface {
+	net.Conn
+	http.ResponseWriter
+	Request() *http.Request
+	Response() *http.Response
+}
+
 // HTTPConn wraps a http server request/response in a net.Conn, used as a parameter
 // to tls.Client and tls.Server, if the inner H2 stream uses (m)TLS.
 // It is also the result of Dial()
@@ -63,39 +70,6 @@ type HTTPConn struct {
 	// internal channel for roundtrip, for Recv thread to sync with response getting
 	// received.
 	rtCh chan error
-}
-
-const (
-	Event_Response = 0
-	Event_Data
-	Event_Sent
-	Event_FIN
-	Event_RST
-)
-
-type Event struct {
-	Type int
-	Conn *HTTPConn
-
-	Error error
-
-	Buffer *nio.Buffer
-}
-
-func NewHTTPConn(ctx context.Context, method, url string) *HTTPConn {
-	// TODO: non-blocking implementation, to avoid an extra gorutine for Write and RoundTrip.
-	in, out := io.Pipe()
-
-	req, _ := http.NewRequestWithContext(ctx, method, url, in)
-
-	//req.Header.Add("grpc-timeout", "10S")
-
-	r := &HTTPConn{
-		W:   out,
-		Req: req,
-	}
-
-	return r
 }
 
 // NewGRPCStream creates a HTTPConn with a request set using gRPC framing and headers,
@@ -167,12 +141,6 @@ func (hc *HTTPConn) Start() {
 
 		hc.rtCh <- err
 	}()
-}
-
-// NetConn returns the underlying network connection.
-// This will be a tls.Conn in most cases.
-func (hc *HTTPConn) NetConn() net.Conn {
-	return hc.Conn
 }
 
 func (hc *HTTPConn) Read(b []byte) (n int, err error) {

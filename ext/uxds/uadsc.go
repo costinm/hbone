@@ -227,10 +227,6 @@ func DialContext(ctx context.Context, url string, opts *Config) (*ADSC, error) {
 	}
 
 	adsc.node = adsc.makeNode()
-	//if dump {
-	//	n, _ := marshal.MarshalToString(adsc.node)
-	//	log.Printf("constructed node: %v", n)
-	//}
 	err := adsc.Run()
 	return adsc, err
 }

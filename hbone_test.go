@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -36,6 +37,16 @@ func TestHBone(t *testing.T) {
 	ctx, cf := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cf()
 
+	// Start an echo handler on bob. Equivalent with a pod listening on that port.
+	// The service is 'default.bob:8080'
+	eh := &echo.EchoHandler{Debug: Debug}
+	ehL, err := eh.Start(laddr(":14130"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The 'pod address' for the echo handler
+	bobEndpoint := ehL.Addr().String()
+
 	// New self-signed root CA
 	ca := auth.NewCA("cluster.local")
 	// Sign the certs and create the identities for the 2 workloads.
@@ -53,6 +64,7 @@ func TestHBone(t *testing.T) {
 	bobID2.AllowedNamespaces = []string{"*"}
 
 	bob := New(bobID2)
+	bob.Mux.Handle("/echo", eh)
 
 	// Start Bob's servers for testing.
 	// The H2 port is used to test serverless/trusted-net mode where TLS is terminated by another proxy.
@@ -61,22 +73,6 @@ func TestHBone(t *testing.T) {
 		t.Fatal(err)
 	}
 	bobHBAddr := l.Addr().String()
-
-	//lc, err := listenAndServeTCP(":0", bob.HandleAcceptedH2C)
-	//if err != nil {
-	//	t.Fatal(err)
-	//}
-	//bobHBCAddr := lc.Addr().String()
-
-	// Start an echo handler on bob. Equivalent with a pod listening on that port.
-	// The service is 'default.bob:8080'
-	eh := &echo.EchoHandler{Debug: Debug}
-	ehL, err := eh.Start(laddr(":14130"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The 'pod address' for the echo handler
-	bobEndpoint := ehL.Addr().String()
 
 	// Configure Alice with bob's information.
 	alice.AddService(&Cluster{Addr: "default.bob:8080"},
@@ -93,19 +89,47 @@ func TestHBone(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		EchoClient2(t, nc, nc)
+		EchoClient2(t, nc, nc, false)
 	})
 
-	// TUN mode - serverless.
+	// Test the http echo handler, with std http.
+	t.Run("alice-http", func(t *testing.T) {
+		i, o := io.Pipe()
+		req, _ := http.NewRequestWithContext(ctx, "POST", "https://default.bob:8080/echo", i)
+
+		bobc, _ := alice.Cluster(ctx, "default.bob:8080")
+
+		res, err := bobc.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		EchoClient2(t, o, res.Body, false)
+	})
+
+	t.Run("google", func(t *testing.T) {
+		req, _ := http.NewRequestWithContext(ctx, "GET", "https://www.google.com/", nil)
+
+		bobc, _ := alice.Cluster(ctx, "www.google.com:443")
+
+		res, err := bobc.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		log.Println(res.Header)
+	})
+
+	// TUN mode - request may be bounced trough infra, e2e mtls.
 	t.Run("alice-bob-tun", func(t *testing.T) {
 		nc, err := alice.DialContext(ctx, "", "default-tun.bob:8080")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		EchoClient2(t, nc, nc)
+		EchoClient2(t, nc, nc, false)
 	})
 
+	// Verify server close semantics.
 	t.Run("server-close", func(t *testing.T) {
 		for _, a := range []string{"default.bob:8080", "default-tun.bob:8080"} {
 			//nc, err := alice.DialContext(ctx, "", "")
@@ -114,7 +138,7 @@ func TestHBone(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			EchoClient2(t, nc, nc)
+			EchoClient2(t, nc, nc, false)
 			timeout := false
 			timer := time.AfterFunc(600*time.Second, func() {
 				timeout = true
@@ -160,6 +184,7 @@ func TestHBone(t *testing.T) {
 
 	})
 
+	// Check trust domain
 	t.Run("invalid-trust", func(t *testing.T) {
 		evieca := auth.NewCA("notcluster.local")
 		// Using the same root CA as bob/alice
@@ -176,34 +201,65 @@ func TestHBone(t *testing.T) {
 
 	})
 
-	// Verify server first protocols work
+	ehServerFirst := &echo.EchoHandler{ServerFirst: true, Debug: Debug}
+	ehSFL, err := ehServerFirst.Start(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice.AddService(&Cluster{Addr: "default.bob:6000"}, &Endpoint{Address: ehSFL.Addr().String(), HBoneAddress: bobHBAddr})
+	readB := make([]byte, 1024)
+
+	// Verify server first protocols work, use CloseWrite to finish
 	t.Run("plain-alice-bob-serverFirst", func(t *testing.T) {
-		ehServerFirst := &echo.EchoHandler{ServerFirst: true, Debug: Debug}
-		ehSFL, err := ehServerFirst.Start(":0")
+		nc, err := alice.DialContext(ctx, "tcp", "default.bob:6000")
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		alice.AddService(&Cluster{Addr: "default.bob:6000"}, &Endpoint{Address: ehSFL.Addr().String(), HBoneAddress: bobHBAddr})
-
-		nc, err := alice.Dial("", "default.bob:6000")
-		if err != nil {
-			t.Fatal(err)
-		}
-		b := make([]byte, 1024)
-		n, err := nc.Read(b)
-		if n == 0 || err != nil {
-			t.Fatal(n, err)
-		}
-		EchoClient2(t, nc, nc)
+		EchoClient2(t, nc, nc, true)
 
 		// Close client connection - expect FIN to be propagated to echo server, which will close it's out connection,
 		// and we should receive io.EOF
-		nc.Close()
+		if cw, ok := nc.(nio.CloseWriter); ok {
+			cw.CloseWrite()
+		}
 
-		n, err = nc.Read(b)
+		// Close will stop both write and read
+
+		n, err := nc.Read(readB)
+		if n == 0 {
+			t.Fatal("Read after close write failed")
+		}
+		n, err = nc.Read(readB)
 		if err == nil {
 			t.Fatal("Missing close")
+		}
+
+		// TODO: verify server and client removed from active
+		// TODO: check the headers, etc
+	})
+
+	// Verify server first protocols work, using Close
+	t.Run("plain-alice-bob-serverFirst-close", func(t *testing.T) {
+		nc, err := alice.DialContext(ctx, "tcp", "default.bob:6000")
+		if err != nil {
+			t.Fatal(err)
+		}
+		EchoClient2(t, nc, nc, true)
+
+		nc.Close()
+		// Close will stop both write and read
+
+		t0 := time.Now()
+		_, err = nc.Read(readB)
+		if err == nil {
+			t.Fatal("Missing close")
+		}
+		if err == io.EOF {
+			t.Fatal("EOF after Close")
+		}
+		if time.Since(t0) > 1*time.Second {
+			t.Fatal("Timeout instead of immediate read return")
 		}
 	})
 
@@ -223,11 +279,11 @@ func TestHBone(t *testing.T) {
 		HandleSNIConn(gate, conn)
 	})
 
-	// "Reverse" connections (original, SNI based)
-	gateH2RL, err := listenAndServeTCP(laddr(":14206"), gate.HandlerH2RConn)
-	if err != nil {
-		t.Fatal(err)
-	}
+	//// "Reverse" connections (original, SNI based)
+	//gateH2RL, err := listenAndServeTCP(laddr(":14206"), gate.HandlerH2RConn)
+	//if err != nil {
+	//	t.Fatal(err)
+	//}
 
 	gate.AddService(&Cluster{Addr: "sni.bob.svc:443"},
 		&Endpoint{
@@ -262,7 +318,7 @@ func TestHBone(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		EchoClient2(t, nc, nc)
+		EchoClient2(t, nc, nc, false)
 	})
 
 	t.Run("sni-h2r-alice-gate-bob", func(t *testing.T) {
@@ -275,7 +331,7 @@ func TestHBone(t *testing.T) {
 		// TODO: refactor h2r, use modified h2 stack
 		// May have multiple h2r endpoints, to different instances (or all instances, if the gate is a stateful
 		// set).
-		h2re := RemoteForward(bob, gateH2RL.Addr().String(), "default", "bob")
+		//		h2re := RemoteForward(bob, gateH2RL.Addr().String(), "default", "bob")
 
 		// Need to wait for the connection to show up - else the test is flaky
 		// TODO: add a callback for 'h2r connection change', will be used to update
@@ -325,18 +381,28 @@ func TestHBone(t *testing.T) {
 				})
 		*/
 		// Force close the tls con - server should terminate
-		h2re.Close()
+		//h2re.Close()
 
 	})
 }
 
-func EchoClient2(t *testing.T, lout io.WriteCloser, lin io.Reader) {
+// Verify using the basic echo server.
+func EchoClient2(t *testing.T, lout io.WriteCloser, lin io.Reader, serverFirst bool) {
 	b := make([]byte, 1024)
 	timer := time.AfterFunc(3*time.Second, func() {
 		log.Println("timeout")
 		//lin.CloseWithError(errors.New("timeout"))
 		lout.Close() // (errors.New("timeout"))
 	})
+
+	if serverFirst {
+		b := make([]byte, 1024)
+		n, err := lin.Read(b)
+		if n == 0 || err != nil {
+			t.Fatal(n, err)
+		}
+	}
+
 	lout.Write([]byte("Ping"))
 	n, err := lin.Read(b)
 	if n != 4 {

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -17,12 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/costinm/hbone/ext/transport"
+	transport2 "github.com/costinm/hbone/h2"
 	"github.com/costinm/hbone/nio"
 	"github.com/costinm/hbone/nio/syscall"
-
-	//"golang.org/x/net/http2"
-	"github.com/costinm/hbone/ext/http2"
 )
 
 // Auth is the interface expected by hbone for mTLS support.
@@ -133,10 +129,10 @@ type HBone struct {
 	rp *httputil.ReverseProxy
 
 	// h2Server is the server used for accepting HBONE connections
-	h2Server *http2.Server
+	//h2Server *http2.Server
 	// h2t is the transport used for all h2 connections used.
 	// hb is the connection pool, gets notified when con is closed.
-	h2t *http2.Transport
+	//h2t *http2.Transport
 
 	Mux http.ServeMux
 
@@ -146,8 +142,8 @@ type HBone struct {
 	EndpointResolver func(sni string) *EndpointCon
 
 	m           sync.RWMutex
-	H2RConn     map[*http2.ClientConn]*EndpointCon
-	H2RCallback func(string, *http2.ClientConn)
+	H2RConn     map[*transport2.HTTP2ClientMux]*EndpointCon
+	H2RCallback func(string, *transport2.HTTP2ClientMux)
 
 	// Transport returns a wrapper for the h2c RoundTripper.
 	Transport func(tripper http.RoundTripper) http.RoundTripper
@@ -156,7 +152,6 @@ type HBone struct {
 
 	Client *http.Client
 	DialF  func(context.Context, *Cluster, net.Conn) (Mux, error)
-	ServeF func(ctx context.Context, hb *HBone, conn net.Conn) error
 }
 
 type noAuth struct {
@@ -212,7 +207,7 @@ func NewMesh(ms *MeshSettings) *HBone {
 
 	hb := &HBone{
 		MeshSettings: ms,
-		H2RConn:      map[*http2.ClientConn]*EndpointCon{},
+		H2RConn:      map[*transport2.HTTP2ClientMux]*EndpointCon{},
 		//h2t:           h2,
 		Client:        http.DefaultClient,
 		AuthProviders: map[string]func(context.Context, string) (string, error){},
@@ -240,13 +235,6 @@ func NewMesh(ms *MeshSettings) *HBone {
 	}
 	if ms.ConnectTimeout == 0 {
 		ms.ConnectTimeout = 5 * time.Second
-	}
-
-	hb.h2Server = &http2.Server{
-		//MaxReadFrameSize: 1<<24 - 1, // 16M may be too much
-
-		MaxUploadBufferPerConnection: math.MaxInt32 / 2, // not uint32.
-		MaxUploadBufferPerStream:     math.MaxInt32 / 4,
 	}
 
 	// Init the HTTP reverse proxy, for apps listening for HTTP/1.1 on 8080
@@ -304,8 +292,6 @@ func (hb *HBone) SecureConn(ep *Endpoint) bool {
 	return ep.Secure
 }
 
-const useGrpcH2 = false
-
 // HandleAcceptedH2C handles a plain text H2 connection, for example
 // in case of secure networks.
 func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
@@ -313,77 +299,117 @@ func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
 		// only for TCPConn - if this is used for tls no effect
 		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
 	}
-	var hc http.Handler
-	hc = &HBoneAcceptedConn{hb: hb, conn: conn}
 
-	if hb.HandlerWrapper != nil {
-		hc = hb.HandlerWrapper(hc)
-	}
-
-	if hb.ServeF != nil {
-		hb.ServeF(context.Background(), hb, conn)
+	st, err := transport2.NewServerTransport(conn, &transport2.ServerConfig{
+		MaxFrameSize:          1 << 24,
+		InitialConnWindowSize: 1 << 26,
+		InitialWindowSize:     1 << 25,
+	})
+	if err != nil {
+		log.Println("H2 server err", err)
+		conn.Close()
 		return
 	}
 
-	if useGrpcH2 {
-		st, err := transport.NewServerTransport(conn, &transport.ServerConfig{
-			MaxFrameSize:          1 << 24,
-			InitialConnWindowSize: 1 << 26,
-			InitialWindowSize:     1 << 25,
-		})
-		if err != nil {
-			log.Println("H2 server err", err)
-			conn.Close()
+	// blocks - read frames
+	st.HandleStreams(func(stream *transport2.Stream) {
+		hb.handleH2Stream(st, stream)
+	}, func(ctx context.Context, s string) context.Context {
+		//log.Println("Trace", s)
+		return ctx
+	})
+}
+
+// handleH2Stream is called when a H2 stream header has been received.
+func (hb *HBone) handleH2Stream(st *transport2.HTTP2ServerMux, stream *transport2.Stream) {
+	// TODO: stats
+
+	go func() {
+		r := stream.Request
+
+		tunMode := r.Header.Get("x-tun")
+		if r.Method == "POST" && tunMode != "" {
+			_, p, err := net.SplitHostPort(tunMode)
+
+			stream.Response.Status = "200"
+			stream.Response.Header.Add("x-status", "200")
+			st.WriteHeader(stream)
+
+			// Create a stream, used for Proxy with caching.
+			conf := hb.Auth.GenerateTLSConfigServer()
+			tls := tls.Server(stream, conf)
+
+			err = nio.HandshakeTimeout(tls, hb.HandsahakeTimeout, nil)
+			if err != nil {
+				log.Println("HBD-MTLS: error inner mTLS ", err)
+				return
+			}
+			log.Println("HBD-MTLS:", tls.ConnectionState())
+
+			// TODO: All Istio checks go here. The TLS handshake doesn't check
+			// root cert or anything - this is proof of concept only, to eval
+			// perf.
+
+			// TODO: allow user to customize app port, protocol.
+			// TODO: if protocol is not matching wire protocol, convert.
+
+			hb.HandleTCPProxy(tls, tls, "localhost:"+p)
+
 			return
 		}
 
-		// blocks - read frames
-		st.HandleStreams(func(stream *transport.Stream) {
-			go func() {
+		// For connect, the requestURI is the same as host - probably for backward compat
+		hbSvc := r.Header.Get("x-service")
+		if r.Method == "CONNECT" || r.Method == "POST" && hbSvc != "" {
+			// TODO: verify host is endpoint IP ?
+			// TODO: support gateway mode
 
-				host := stream.Request.Host
-				_, p, _ := net.SplitHostPort(host)
-				// TODO: verify host is endpoint IP ?
-				// TODO: support gateway mode
+			host := stream.Request.Host
+			log.Println("HBone-START", stream.Id, host, r.Header)
 
-				hostPort := "localhost:" + p
+			_, p, _ := net.SplitHostPort(host)
+			// TODO: verify host is endpoint IP ?
+			// TODO: support gateway mode
 
-				log.Println("HBone-START", stream.Id, host, stream)
-				nc, err := net.Dial("tcp", hostPort)
-				if err != nil {
-					log.Println("Error dialing ", hostPort, err)
-					return
-				}
+			hostPort := "localhost:" + p
 
-				stream.Response.Status = "200"
-				stream.Response.Header.Add("x-status", "200")
-				st.WriteHeader(stream)
-				proxyErr := Proxy(nc, stream, stream, hostPort)
-				log.Println("HBone-END: ", stream.Id, host, proxyErr)
-			}()
+			nc, err := net.Dial("tcp", hostPort)
+			if err != nil {
+				log.Println("Error dialing ", hostPort, err)
+				return
+			}
 
-		}, func(ctx context.Context, s string) context.Context {
-			log.Println("Trace", s)
-			return ctx
-		})
-		return
-	}
+			stream.Response.Status = "200"
+			stream.Response.Header.Add("x-status", "200")
+			st.WriteHeader(stream)
 
-	hb.h2Server.ServeConn(
-		conn,
-		&http2.ServeConnOpts{
-			Handler: hc, // Also plain text, needs to be upgraded
-			Context: context.Background(),
-			//Raw:     hb,
-			//Context can be used to cancel, pass meta.
-			// h2 adds http.LocalAddrContextKey(NetAddr), ServerContextKey (*Server)
-		})
+			proxyErr := Proxy(nc, stream, stream, hostPort)
+			log.Println("HBone-END: ", stream.Id, host, proxyErr)
+
+			return
+		}
+
+		var hc http.Handler
+		hc = &HBoneAcceptedConn{hb: hb, stream: stream}
+		// Request Body is a read closer - appropriate for the Stream in server mode.
+		// The Write method and associated apply to the response writer.
+		// Stream is both the Request and Response body.
+		stream.Request.Body = stream
+
+		if hb.HandlerWrapper != nil {
+			hc = hb.HandlerWrapper(hc)
+		}
+		hc.ServeHTTP(stream, stream.Request)
+
+		// TODO: make sure all is closed and done
+
+	}()
 }
 
 // HBoneAcceptedConn keeps track of one accepted H2 connection.
 type HBoneAcceptedConn struct {
-	hb   *HBone
-	conn net.Conn
+	hb     *HBone
+	stream *transport2.Stream
 }
 
 // ServeHTTP implements the basic TCP-over-H2 and H2 proxy protocol.
@@ -391,7 +417,6 @@ type HBoneAcceptedConn struct {
 // if they don't match a handler may be forwarded by the reverse HTTP
 // proxy.
 func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Println("ServeHTTP", r.Header)
 	t0 := time.Now()
 	var proxyErr error
 	host := r.Host
@@ -432,57 +457,6 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	// Currently this is only used for 'terminal' connection
 	// TODO: support proxy/gateway mode, use host to forward to the proper pod
-	_, p, err := net.SplitHostPort(host)
-	if err != nil {
-		proxyErr = err
-		w.Header().Add("X-Error", err.Error())
-		return
-	}
-
-	w.(http.Flusher).Flush()
-
-	tunMode := r.Header.Get("X-tun")
-	if tunMode != "" {
-		_, p, err = net.SplitHostPort(tunMode)
-
-		// Create a stream, used for Proxy with caching.
-		conf := hac.hb.Auth.GenerateTLSConfigServer()
-
-		tls := tls.Server(&HTTPConn{R: r.Body,
-			W:    w,
-			Req:  r,
-			ResW: w,
-			Conn: hac.conn}, conf)
-
-		// TODO: replace with handshake with context
-		err := nio.HandshakeTimeout(tls, hac.hb.HandsahakeTimeout, nil)
-		if err != nil {
-			log.Println("HBD-MTLS: error inner mTLS ", err)
-			return
-		}
-		log.Println("HBD-MTLS:", tls.ConnectionState())
-
-		// TODO: All Istio checks go here. The TLS handshake doesn't check
-		// root cert or anything - this is proof of concept only, to eval
-		// perf.
-
-		// TODO: allow user to customize app port, protocol.
-		// TODO: if protocol is not matching wire protocol, convert.
-
-		hac.hb.HandleTCPProxy(w, tls, tls, "localhost:"+p)
-
-		return
-	}
-
-	// TODO: other indicators/headers to identify HBONE ?
-
-	// For connect, the requestURI is the same as host - probably for backward compat
-	if r.Method == "CONNECT" || r.URL.Path == "" {
-		// TODO: verify host is endpoint IP ?
-		// TODO: support gateway mode
-		proxyErr = hac.hb.HandleTCPProxy(w, w, r.Body, "localhost:"+p)
-		return
-	}
 
 	rh, pat := hac.hb.Mux.Handler(r)
 	if pat != "" {
@@ -496,7 +470,7 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 }
 
 // HandleTCPProxy connects and forwards r/w to the hostPort
-func (hb *HBone) HandleTCPProxy(hw http.ResponseWriter, w io.Writer, r io.Reader, hostPort string) error {
+func (hb *HBone) HandleTCPProxy(w io.Writer, r io.Reader, hostPort string) error {
 	log.Println("net.Dial", hostPort)
 	nc, err := net.Dial("tcp", hostPort)
 	if err != nil {
