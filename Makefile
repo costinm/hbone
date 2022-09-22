@@ -10,10 +10,10 @@ GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build -ldflags '-s -w -
 	(cd cmd/${NAME} && go build -o ${OUT}/${NAME} .)
 
 size-test:
-	NAME=hbone $(make) .go-build
-	NAME=hbone-min $(make) .go-build
-	NAME=hbone-oc $(make) .go-build
-	NAME=hbone-otel $(make) .go-build
+	NAME=hbone $(MAKE) .go-build
+	NAME=hbone-min $(MAKE) .go-build
+	NAME=hbone-oc $(MAKE) .go-build
+	NAME=hbone-otel $(MAKE) .go-build
 
 proto-gen: PATH:=${HOME}/go/bin:${PATH}
 proto-gen:

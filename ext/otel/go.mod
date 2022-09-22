@@ -1,4 +1,4 @@
-module otel
+module github.com/costinm/hbone/ext/otel
 
 go 1.16
 

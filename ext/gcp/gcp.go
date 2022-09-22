@@ -108,7 +108,12 @@ type HubCluster struct {
 func InitDefaultTokenSource(ctx context.Context, uk *hbone.HBone) error {
 	ts, err := google.DefaultTokenSource(ctx, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {
-		return err
+		sk, err := google.NewSDKConfig("")
+		if err != nil {
+			return err
+		}
+		// TODO: also try a
+		ts = sk.TokenSource(ctx)
 	}
 	t := func(ctx context.Context, s string) (string, error) {
 		t, err := ts.Token()

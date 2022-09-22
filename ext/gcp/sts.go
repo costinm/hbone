@@ -104,14 +104,6 @@ type STS struct {
 	// The KSA returned from K8S must have the IAM permissions
 	GSA string
 
-	AudOverride string
-
-	// K8S returns a token signed by k8s, no further exchanges.
-	K8S bool
-
-	// UseSTSExchange will return a token for an external service account.
-	UseSTSExchange bool
-
 	// UseAccessToken will force returning a GSA access token, regardless of audience.
 	UseAccessToken bool
 }
@@ -125,36 +117,28 @@ type STS struct {
 // Otherwise, the gsa must grant the KSA (kubernetes service account)
 // permission to act as the GSA.
 func NewGSATokenSource(kr *AuthConfig, gsa string) *STS {
-	sts, _ := NewSTS(kr)
-	sts.UseSTSExchange = true
+	sts := NewFederatedTokenSource(kr)
+	if gsa == "" {
+		// use the mesh default SA
+		// If not set, default to ASM default SA.
+		// This has stackdriver, TD, MCP permissions - and is available to all
+		// workloads. Only works for ASM clusters.
+		gsa = "service-" + kr.ProjectNumber + "@gcp-sa-meshdataplane.iam.gserviceaccount.com"
+	}
 	sts.GSA = gsa
-	sts.UseAccessToken = true
-	return sts
-}
-
-// NewK8STokenSource returns a oauth2 and grpc token source that returns
-// K8S signed JWTs with the given audience.
-func NewK8STokenSource(kr *AuthConfig, audOverride string) *STS {
-	sts, _ := NewSTS(kr)
-	sts.K8S = true
-	sts.AudOverride = audOverride
+	//sts.UseAccessToken = true
 	return sts
 }
 
 // NewFederatedTokenSource returns federated tokens - google access tokens
 // associated with the federated (k8s) identity. Can be used in some but not
 // all APIs - in particular MeshCA requires this token.
+//
+// https://cloud.google.com/iam/docs/reference/sts/rest/v1/TopLevel/token
 func NewFederatedTokenSource(kr *AuthConfig) *STS {
-	sts, _ := NewSTS(kr)
-	sts.K8S = false
-	sts.UseSTSExchange = false
-	return sts
-}
-
-func NewSTS(kr *AuthConfig) (*STS, error) {
 	caCertPool, err := x509.SystemCertPool()
 	if err != nil {
-		return nil, err
+		log.Fatal("Missing system cert pool")
 	}
 
 	return &STS{
@@ -167,32 +151,17 @@ func NewSTS(kr *AuthConfig) (*STS, error) {
 				},
 			},
 		},
-	}, nil
+	}
 }
-
-//// Implements oauth2.TokenSource - returning access tokens
-//// May return federated token or service account tokens
-//func (s *STS) Token() (*oauth2.Token, error) {
-//	mv, err := s.GetRequestMetadata(context.Background())
-//	if err != nil {
-//		return nil, err
-//	}
-//	a := mv["authorization"]
-//	// WIP - split, etc
-//	t := &oauth2.Token{
-//		AccessToken: a,
-//	}
-//	return t, nil
-//}
 
 func (s *STS) md(t string) map[string]string {
 	res := map[string]string{
 		"authorization": "Bearer " + t,
 	}
-	if s.kr.ProjectNumber != "" {
-		// Breaks MeshCA
-		//res["x-goog-user-project"] = s.kr.ProjectNumber
-	}
+	//if s.kr.ProjectNumber != "" {
+	// Breaks MeshCA
+	//res["x-goog-user-project"] = s.kr.ProjectNumber
+	//}
 	return res
 }
 
@@ -214,38 +183,25 @@ func (s *STS) GetRequestMetadata(ctx context.Context, aud ...string) (map[string
 }
 
 func (s *STS) GetToken(ctx context.Context, aud string) (string, error) {
-	// The K8S-signed JWT
-	kaud := s.kr.TrustDomain
-	if s.K8S {
-		if s.AudOverride != "" {
-			kaud = s.AudOverride
-		} else {
-			kaud = aud
-		}
-	}
-
-	kt, err := s.kr.TokenSource.GetToken(ctx, kaud)
+	// Get the K8S-signed JWT with audience based on the project-id. This is the required input to get access tokens.
+	kt, err := s.kr.TokenSource.GetToken(ctx, s.kr.TrustDomain)
 	if err != nil {
 		return "", err
 	}
 
-	if s.K8S {
-		return kt, err
-	}
+	// TODO: read from file as well - if TokenSource is not set for example.
 
-	// Federated token - a google token equivalent with the k8s JWT, using STS
+	// Federated token - a google access token equivalent with the k8s JWT, using STS
 	ft, err := s.TokenFederated(ctx, kt)
 	if err != nil {
 		return "", err
 	}
 
-	a0 := aud
-
-	if !s.UseSTSExchange {
+	if s.GSA == "" {
 		return ft, nil
 	}
 
-	token, err := s.TokenAccess(ctx, ft, a0)
+	token, err := s.TokenGSA(ctx, ft, aud)
 	return token, err
 }
 
@@ -253,7 +209,9 @@ func (s *STS) RequireTransportSecurity() bool {
 	return false
 }
 
-// TokenFederated exchanges the K8S JWT with a federated token
+// TokenFederated exchanges the K8S JWT with a federated token - an google access token representing
+// the K8S identity (and not a regular GSA!).
+//
 // (formerly called ExchangeToken)
 func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, error) {
 	if s.kr.ClusterAddress == "" {
@@ -263,6 +221,7 @@ func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, erro
 		_ = json.Unmarshal([]byte(payload), j)
 		s.kr.ClusterAddress = j.Iss
 	}
+	// Encodes trustDomain, projectid, clustername, location
 	stsAud := s.constructAudience(s.kr.TrustDomain)
 
 	jsonStr, err := s.constructFederatedTokenRequest(stsAud, k8sSAjwt)
@@ -304,7 +263,32 @@ func (s *STS) TokenFederated(ctx context.Context, k8sSAjwt string) (string, erro
 // the other direction.
 //
 // May return an ID token with aud or access token.
-func (s *STS) TokenAccess(ctx context.Context, federatedToken string, audience string) (string, error) {
+//
+// https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken
+//
+// constructFederatedTokenRequest returns an HTTP request for access token.
+// Example of an access token request:
+// POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/
+// service-<GCP project number>@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken
+// Content-Type: application/json
+// Authorization: Bearer <federated token>
+//
+//	{
+//	 "Delegates": [],
+//	 "Scope": [
+//	     https://www.googleapis.com/auth/cloud-platform
+//	 ],
+//	}
+//
+// This requires permission to impersonate:
+//
+//	gcloud iam service-accounts add-iam-policy-binding \
+//	 GSA_NAME@GSA_PROJECT_ID.iam.gserviceaccount.com \
+//	 --role=roles/iam.workloadIdentityUser \
+//	 --member="serviceAccount:WORKLOAD_IDENTITY_POOL[K8S_NAMESPACE/KSA_NAME]"
+//
+// The p4sa is auto-setup for all authenticated users.
+func (s *STS) TokenGSA(ctx context.Context, federatedToken string, audience string) (string, error) {
 	accessToken := isAccessToken(audience, s)
 	req, err := s.constructGenerateAccessTokenRequest(federatedToken, audience, accessToken)
 	if err != nil {
@@ -489,30 +473,7 @@ type idTokenResponse struct {
 	Token string `json:"token"`
 }
 
-// constructFederatedTokenRequest returns an HTTP request for access token.
-// Example of an access token request:
-// POST https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/
-// service-<GCP project number>@gcp-sa-meshdataplane.iam.gserviceaccount.com:generateAccessToken
-// Content-Type: application/json
-// Authorization: Bearer <federated token>
-// {
-//  "Delegates": [],
-//  "Scope": [
-//      https://www.googleapis.com/auth/cloud-platform
-//  ],
-// }
-//
-// This requires permission to impersonate:
-// gcloud iam service-accounts add-iam-policy-binding \
-//  GSA_NAME@GSA_PROJECT_ID.iam.gserviceaccount.com \
-//  --role=roles/iam.workloadIdentityUser \
-//  --member="serviceAccount:WORKLOAD_IDENTITY_POOL[K8S_NAMESPACE/KSA_NAME]"
-//
-// The p4sa is auto-setup for all authenticated users.
 func (s *STS) constructGenerateAccessTokenRequest(fResp string, audience string, accessToken bool) (*http.Request, error) {
-	if s.GSA == "" {
-		s.GSA = s.ExternalSA()
-	}
 	gsa := s.GSA
 	endpoint := ""
 	var err error
@@ -555,16 +516,6 @@ func (s *STS) constructGenerateAccessTokenRequest(fResp string, audience string,
 	return req, nil
 }
 
-func (s *STS) ExternalSA() string {
-	if s.GSA != "" {
-		return s.GSA
-	}
-	// If not set, default to ASM default SA.
-	// This has stackdriver, TD, MCP permissions - and is available to all
-	// workloads. Only works for ASM clusters.
-	return "service-" + s.kr.ProjectNumber + "@gcp-sa-meshdataplane.iam.gserviceaccount.com"
-}
-
 // ServeStsRequests handles STS requests and sends exchanged token in responses.
 func (s *STS) ServeStsRequests(w http.ResponseWriter, req *http.Request) {
 	reqParam, validationError := s.validateStsRequest(req)
@@ -582,7 +533,7 @@ func (s *STS) ServeStsRequests(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	at, err := s.TokenAccess(req.Context(), ft, "")
+	at, err := s.TokenGSA(req.Context(), ft, "")
 
 	if err != nil {
 		log.Printf("token manager fails to generate token: %v", err)
@@ -703,8 +654,6 @@ func (s *STS) sendSuccessfulResponse(w http.ResponseWriter, tokenData []byte) {
 
 // JWT includes minimal field for a JWT, primarily for extracting iss for the exchange.
 // This is used with K8S JWTs, which use multi-string.
-//
-//
 type JWT struct {
 	//An "aud" (Audience) claim in the token MUST include the Unicode
 	//serialization of the origin (Section 6.1 of [RFC6454]) of the push

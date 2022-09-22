@@ -10,7 +10,10 @@ import (
 
 	"github.com/costinm/hbone"
 	"github.com/costinm/hbone/auth"
+	meshca "github.com/costinm/hbone/ext/uxds/google/security/meshca/v1"
 	istioca "github.com/costinm/hbone/ext/uxds/istio/v1/auth"
+	"github.com/costinm/hbone/nio"
+	"github.com/google/uuid"
 
 	"github.com/costinm/hbone/ext/uxds/xds"
 
@@ -95,24 +98,45 @@ func HandleEDS(hb *hbone.HBone, eds map[string]*xds.ClusterLoadAssignment) {
 // getCertificate is using Istio CA gRPC protocol to get a certificate for the id.
 // Google implementation of the protocol is also supported.
 func GetCertificate(ctx context.Context, id *auth.MeshAuth, ca *hbone.Cluster) error {
-	// TODO: Add ClusterID header
-	var req istioca.IstioCertificateRequest
-
 	keyPEM, csr, err := id.NewCSR("spiffe://cluster.local/ns/default/sa/default")
-	req.Csr = string(csr)
 
-	// TODO: Add ClusterID header
+	var ress *hbone.HTTPConn
+	var bb *nio.Buffer
 
-	path := "/istio.v1.auth.IstioCertificateService/CreateCertificate"
 	if strings.Contains(ca.Addr, "meshca.googleapis.com") {
-		path = "/google.security.meshca.v1.MeshCertificateService/CreateCertificate"
+		var req meshca.MeshCertificateRequest
+
+		req.Csr = string(csr)
+		req.RequestId = uuid.New().String()
+		path := "/google.security.meshca.v1.MeshCertificateService/CreateCertificate"
+
+		ress = hbone.NewGRPCStream(ctx, ca, path)
+
+		ress.Request.Header.Add("x-goog-request-params", "location=locations/us-central1-c")
+		bb = ress.GetWriteFrame()
+		bout, _ := proto.MarshalOptions{}.MarshalAppend(bb.Bytes(), &req)
+		bb.UpdateAppend(bout)
+
+	} else {
+		// TODO: Add ClusterID header
+		var req istioca.IstioCertificateRequest
+
+		req.Csr = string(csr)
+		path := "/istio.v1.auth.IstioCertificateService/CreateCertificate"
+
+		//s := h2.NewGRPCStream(ctx, ca.Addr, path)
+
+		ress = hbone.NewGRPCStream(ctx, ca, path)
+
+		bb = ress.GetWriteFrame()
+		bout, _ := proto.MarshalOptions{}.MarshalAppend(bb.Bytes(), &req)
+		bb.UpdateAppend(bout)
 	}
 
-	ress := hbone.NewGRPCStream(ctx, ca, path)
+	//req.RequestId = ""
 
-	bb := ress.GetWriteFrame()
-	bout, _ := proto.MarshalOptions{}.MarshalAppend(bb.Bytes(), &req)
-	bb.UpdateAppend(bout)
+	// TODO: Add ClusterID header
+
 	err = ress.Send(bb)
 	ress.CloseWrite()
 

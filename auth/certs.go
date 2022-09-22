@@ -338,6 +338,23 @@ func (a *MeshAuth) initFromDir() error {
 	return nil
 }
 
+// Return the SPKI fingerprint of the key
+// https://www.rfc-editor.org/rfc/rfc7469#section-2.4
+//
+// Can be used with "ignore-certificate-errors-spki-list" in chrome
+//
+//	openssl x509 -pubkey -noout -in <path to PEM cert> | openssl pkey -pubin -outform der \
+//	  | openssl dgst -sha256 -binary | openssl enc -base64
+//
+// sha256/BASE64
+func SPKIFingerprint(key crypto.PublicKey) string {
+	d := MarshalPublicKey(key)
+	sum := sha256.Sum256(d)
+	pin := make([]byte, base64.StdEncoding.EncodedLen(len(sum)))
+	base64.StdEncoding.Encode(pin, sum[:])
+	return string(pin)
+}
+
 func MarshalPublicKey(key crypto.PublicKey) []byte {
 	if k, ok := key.(ed25519.PublicKey); ok {
 		return []byte(k)
@@ -662,11 +679,18 @@ func (a *MeshAuth) verifyServerCert(sni string, rawCerts [][]byte, _ [][]*x509.C
 		if sni == "" {
 			return nil
 		}
-		for _, n := range peerCert.DNSNames {
-			if n == sni {
+
+		if len(peerCert.DNSNames) > 0 {
+			err := peerCert.VerifyHostname(sni)
+			if err == nil {
 				return nil
 			}
 		}
+		//for _, n := range peerCert.DNSNames {
+		//	if n == sni {
+		//		return nil
+		//	}
+		//}
 		for _, n := range peerCert.IPAddresses {
 			if n.String() == sni {
 				return nil

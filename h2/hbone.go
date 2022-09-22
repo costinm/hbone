@@ -17,7 +17,8 @@ import (
 // newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
-func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, opts ConnectOptions, onPrefaceReceipt func(), onGoAway func(GoAwayReason), onClose func()) (_ *HTTP2ClientMux, err error) {
+func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, opts ConnectOptions,
+	onPrefaceReceipt func(*http2.SettingsFrame), onGoAway func(GoAwayReason), onClose func()) (_ *HTTP2ClientMux, err error) {
 	scheme := "http"
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
@@ -151,6 +152,11 @@ func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, opts Connect
 		ss = append(ss, http2.Setting{
 			ID:  http2.SettingMaxHeaderListSize,
 			Val: *opts.MaxHeaderListSize,
+		})
+	} else {
+		ss = append(ss, http2.Setting{
+			ID:  http2.SettingMaxHeaderListSize,
+			Val: 10485760,
 		})
 	}
 	err = t.framer.fr.WriteSettings(ss...)
@@ -292,7 +298,7 @@ func NewStreamReq(req *http.Request) *Stream {
 }
 
 // dial associates a Stream with a mux and sends the request.
-func (t *HTTP2ClientMux) dial(s *Stream) (*http.Response, error) {
+func (t *HTTP2ClientMux) DialStream(s *Stream) (*http.Response, error) {
 	s.ct = t
 	s.wq = newWriteQuota(defaultWriteQuota, s.done)
 	s.requestRead = func(n int) {

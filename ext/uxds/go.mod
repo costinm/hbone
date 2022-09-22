@@ -7,6 +7,7 @@ replace github.com/costinm/hbone => ../..
 require (
 	github.com/costinm/hbone v0.0.0-00010101000000-000000000000
 	github.com/golang/protobuf v1.5.2
+	github.com/google/uuid v1.3.0
 	google.golang.org/protobuf v1.28.1
 )
 

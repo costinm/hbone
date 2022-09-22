@@ -80,7 +80,7 @@ type HTTP2ClientMux struct {
 	// onPrefaceReceipt is a callback that client transport calls upon
 	// receiving server preface to signal that a succefull HTTP2
 	// connection was established.
-	onPrefaceReceipt func()
+	onPrefaceReceipt func(settingsFrame *frame.SettingsFrame)
 
 	maxConcurrentStreams  uint32
 	streamQuota           int64
@@ -166,7 +166,7 @@ func (t *HTTP2ClientMux) newStream(ctx context.Context, callHdr *CallHdr) *Strea
 }
 
 func (t *HTTP2ClientMux) createHeaderFields(ctx context.Context,
-		r *http.Request) ([]hpack.HeaderField, error) {
+	r *http.Request) ([]hpack.HeaderField, error) {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
 	// Make the slice of certain predictable size to reduce allocations made by append.
@@ -255,7 +255,7 @@ func (t *HTTP2ClientMux) sendHeaders(s *Stream, headerFields []hpack.HeaderField
 		// The stream was unprocessed by the server.
 		atomic.StoreUint32(&s.unprocessed, 1)
 		if s.getReadClosed() == 0 {
-			s.write(recvMsg{err: err})
+			s.queueReadBuf(recvMsg{err: err})
 		}
 		if s.getWriteClosed() == 0 {
 			// TODO(costin)
@@ -389,7 +389,7 @@ func (t *HTTP2ClientMux) CloseStream(s *Stream, err error) {
 }
 
 func (t *HTTP2ClientMux) closeStream(s *Stream, err error, rst bool, rstCode frame.ErrCode,
-		st *Status, mdata map[string][]string, eosReceived bool) {
+	st *Status, mdata map[string][]string, eosReceived bool) {
 
 	log.Println("Client closeStream", s.Id, err, rst, rstCode)
 
@@ -408,7 +408,7 @@ func (t *HTTP2ClientMux) closeStream(s *Stream, err error, rst bool, rstCode fra
 	if err != nil {
 		s.setReadClosed(2)
 		// This will unblock reads eventually.
-		s.write(recvMsg{err: err})
+		s.queueReadBuf(recvMsg{err: err})
 	}
 	// If headerChan isn't closed, then close it.
 	if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
@@ -603,10 +603,10 @@ func (t *HTTP2ClientMux) updateFlowControl(n uint32) {
 				ID:  frame.SettingInitialWindowSize,
 				Val: n,
 			},
-			{
-				ID:  SettingH2R,
-				Val: 1,
-			},
+			//{
+			//	ID:  SettingH2R,
+			//	Val: 1,
+			//},
 		},
 	})
 }
@@ -667,7 +667,10 @@ func (t *HTTP2ClientMux) handleData(f *frame.DataFrame) {
 			buffer := t.bufferPool.get()
 			buffer.Reset()
 			buffer.Write(f.Data())
-			s.write(recvMsg{buffer: buffer})
+			s.RcvdBytes += len(f.Data())
+			s.RcvdPackets++
+			s.LastRead = time.Now()
+			s.queueReadBuf(recvMsg{buffer: buffer})
 		}
 	}
 	// The server has closed the stream without sending trailers.  Record that
@@ -675,7 +678,7 @@ func (t *HTTP2ClientMux) handleData(f *frame.DataFrame) {
 	if f.StreamEnded() {
 		s.setReadClosed(1)
 		log.Println("Client CLOSE received", f)
-		s.write(recvMsg{err: io.EOF})
+		s.queueReadBuf(recvMsg{err: io.EOF})
 	}
 }
 
@@ -688,7 +691,7 @@ func (t *HTTP2ClientMux) handleRSTStream(f *frame.RSTStreamFrame) {
 	if s.getReadClosed() == 2 {
 		return
 	}
-	log.Println("Client RST received", f, f.ErrCode)
+	log.Println("Client RST received", f, f.ErrCode, s.getReadClosed())
 
 	if f.ErrCode == frame.ErrCodeRefusedStream {
 		// The stream was unprocessed by the server.
@@ -712,9 +715,12 @@ func (t *HTTP2ClientMux) handleRSTStream(f *frame.RSTStreamFrame) {
 	if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
 		close(s.headerChan)
 	}
-	if s.headerChanClosed == 0 {
-		s.write(recvMsg{err: errStreamRST})
-	}
+
+	//if s.headerChanClosed == 0 {
+	s.queueReadBuf(recvMsg{err: errStreamRST})
+	//} else {
+	//	s.write(recvMsg{err: io.EOF})
+	//}
 	//t.closeStream(s, io.EOF, false, http2.ErrCodeNo, &Status{Code: int(statusCode), Message: fmt.Sprintf("stream terminated by RST_STREAM with error code: %v", f.ErrCode)}, nil, false)
 }
 
@@ -906,21 +912,36 @@ func (t *HTTP2ClientMux) operateHeaders(f *frame.MetaHeadersFrame) {
 		return
 	}
 
+	trailer := false
+	// If headerChan hasn't been closed yet
+	if s.headerChanClosed != 0 {
+		trailer = true
+	}
+
 	for _, hf := range f.Fields {
 		switch hf.Name {
 		case ":status":
 			s.Response.Status = hf.Value
 			s.Response.StatusCode, _ = strconv.Atoi(hf.Value)
 		default:
-			if isReservedHeader(hf.Name) && !isWhitelistedHeader(hf.Name) {
-				break
+			if trailer {
+				v, err := decodeMetadataHeader(hf.Name, hf.Value)
+				if err != nil {
+					log.Printf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
+					break
+				}
+				s.Response.Trailer.Add(hf.Name, v)
+			} else {
+				if isReservedHeader(hf.Name) && !isWhitelistedHeader(hf.Name) {
+					break
+				}
+				v, err := decodeMetadataHeader(hf.Name, hf.Value)
+				if err != nil {
+					log.Printf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
+					break
+				}
+				s.Response.Header.Add(hf.Name, v)
 			}
-			v, err := decodeMetadataHeader(hf.Name, hf.Value)
-			if err != nil {
-				log.Printf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
-				break
-			}
-			s.Response.Header.Add(hf.Name, v)
 		}
 	}
 
@@ -935,7 +956,7 @@ func (t *HTTP2ClientMux) operateHeaders(f *frame.MetaHeadersFrame) {
 	}
 
 	s.setReadClosed(1)
-	s.write(recvMsg{err: io.EOF})
+	s.queueReadBuf(recvMsg{err: io.EOF})
 
 	// Old: if client received END_STREAM from server while stream was still active, send RST_STREAM
 }
@@ -965,8 +986,8 @@ func (t *HTTP2ClientMux) reader() {
 		t.Close(connectionErrorf(true, nil, "initial http2 frame from server is not a settings frame: %T", f))
 		return
 	}
-	t.onPrefaceReceipt()
 	t.handleSettings(sf, true)
+	t.onPrefaceReceipt(sf)
 
 	// loop to keep reading incoming messages on this transport.
 	for {

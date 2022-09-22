@@ -14,13 +14,6 @@ import (
 	"github.com/costinm/hbone/nio"
 )
 
-type Stream interface {
-	net.Conn
-	http.ResponseWriter
-	Request() *http.Request
-	Response() *http.Response
-}
-
 // HTTPConn wraps a http server request/response in a net.Conn, used as a parameter
 // to tls.Client and tls.Server, if the inner H2 stream uses (m)TLS.
 // It is also the result of Dial()
@@ -33,11 +26,11 @@ type HTTPConn struct {
 
 	nio.Stats
 
-	// Req holds the request object.
-	Req *http.Request
+	// Request holds the request object.
+	Request *http.Request
 
-	// Res holds the response, for client mode
-	Res *http.Response
+	// Response holds the response, for client mode
+	Response *http.Response
 	// ResW holds the response writer, in server mode.
 	ResW http.ResponseWriter
 
@@ -100,8 +93,8 @@ func NewGRPCStream(ctx context.Context, c *Cluster, path string) *HTTPConn {
 	//req.Header.Add("grpc-timeout", "10S")
 
 	r := &HTTPConn{
-		W:   out,
-		Req: req,
+		W:       out,
+		Request: req,
 	}
 	r.Cluster = c
 
@@ -109,24 +102,24 @@ func NewGRPCStream(ctx context.Context, c *Cluster, path string) *HTTPConn {
 }
 
 func (hc *HTTPConn) Start() {
-	if hc.rtCh != nil || hc.Res != nil {
+	if hc.rtCh != nil || hc.Response != nil {
 		return // already started
 	}
 	hc.rtCh = make(chan error)
 	// Needs to be in a go routine - Write is blocking until bytes are
 	// sent, which happens during roundtrip.
 	go func() {
-		hres, err := hc.Cluster.RoundTrip(hc.Req)
+		hres, err := hc.Cluster.RoundTrip(hc.Request)
 		if err != nil {
 			hc.RoundTripError = err
 		} else {
-			hc.Res = hres
+			hc.Response = hres
 
 			if hres.StatusCode >= 300 || hres.StatusCode < 200 {
 				err = errors.New(fmt.Sprintf("status code %v",
 					hres.StatusCode))
 			}
-			hc.readBuf = nio.NewBufferReader(hc.Res.Body)
+			hc.readBuf = nio.NewBufferReader(hc.Response.Body)
 		}
 
 		if err != nil {
@@ -145,7 +138,6 @@ func (hc *HTTPConn) Start() {
 
 func (hc *HTTPConn) Read(b []byte) (n int, err error) {
 	n, err = hc.R.Read(b)
-	hc.RcvdBytes += n
 	hc.LastRead = time.Now()
 	return n, err
 }
@@ -213,10 +205,10 @@ func (hc *HTTPConn) Close() error {
 }
 
 func (hc *HTTPConn) Recv(last bool) (*nio.Buffer, error) {
-	if hc.Res != nil {
-		if hc.Res.StatusCode >= 300 || hc.Res.StatusCode < 200 {
+	if hc.Response != nil {
+		if hc.Response.StatusCode >= 300 || hc.Response.StatusCode < 200 {
 			return nil, errors.New(fmt.Sprintf("status code %v",
-				hc.Res.StatusCode))
+				hc.Response.StatusCode))
 		}
 	}
 
@@ -262,15 +254,15 @@ func (hc *HTTPConn) Recv(last bool) (*nio.Buffer, error) {
 		// grpc-status
 		// grpc-message
 		// grpc-status-details-bin - base64 proto
-		if hc.Res != nil {
-			log.Println("Trailer", hc.Res.Trailer)
-			hc.Res.Body.Close()
+		if hc.Response != nil {
+			log.Println("Trailer", hc.Response.Trailer)
+			hc.Response.Body.Close()
 		}
 	} else if err != nil {
 		return nil, err
 	}
 
-	if hc.Res.Trailer.Get("") != "" {
+	if hc.Response.Trailer.Get("") != "" {
 
 	}
 

@@ -267,7 +267,7 @@ func (a *ADSC) Run() error {
 	gstr := hbone.NewGRPCStream(ctx, a.Config.Cluster, "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources")
 	if a.Config.XDSHeaders != nil {
 		for k, v := range a.Config.XDSHeaders {
-			gstr.Req.Header.Add(k, v)
+			gstr.Request.Header.Add(k, v)
 		}
 	}
 	a.stream = gstr

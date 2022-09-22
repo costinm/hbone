@@ -95,7 +95,9 @@ func TestURest(t *testing.T) {
 	t.Run("xdsc-system", func(t *testing.T) {
 		urstSys := hbone.NewMesh(&hbone.MeshSettings{})
 		gcp.InitDefaultTokenSource(ctx, urstSys)
-		catokenSystem := &k8s.K8STokenSource{Cluster: dk, AudOverride: "istio-ca", Namespace: "istio-system", KSA: urst.ServiceAccount}
+		catokenSystem := &k8s.K8STokenSource{Cluster: dk, AudOverride: "istio-ca",
+			Namespace: "istio-system",
+			KSA:       "default"}
 
 		istiodSystem := urstSys.AddService(&hbone.Cluster{
 			Addr:          istiodAddr + ":15012",
@@ -113,9 +115,12 @@ func TestURest(t *testing.T) {
 				"NAMESPACE":       "istio-system",
 			},
 			InitialDiscoveryRequests: []*xds.DiscoveryRequest{
-				&xds.DiscoveryRequest{TypeUrl: "istio/debug/events"},
+				{TypeUrl: "istio/debug/events"},
 			},
 		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		err = xdsc.Send(&xds.DiscoveryRequest{
 			TypeUrl: "istio/debug/events"})
@@ -123,7 +128,7 @@ func TestURest(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		xdsc.Wait("istio/debug/events", 10*time.Second)
+		xdsc.Wait("istio/debug/events", 5*time.Second)
 
 		if err != nil {
 			t.Fatal(err)
@@ -138,42 +143,39 @@ func TestURest(t *testing.T) {
 
 	urst.ProjectId = projectId
 
-	// Access tokens
-	tok, err := urst.AuthProviders["gcp"](ctx, "")
-	if err != nil {
-		t.Fatal("Failed to load k8s", err)
-	}
+	sts := gcp.NewFederatedTokenSource(&gcp.AuthConfig{
+		TrustDomain: projectId + ".svc.id.goog",
+		ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
+			projectId, clusterLocation, clusterName),
+
+		// Will use TokenRequest to get tokens with AudOverride
+		TokenSource: &k8s.K8STokenSource{
+			Cluster:     dk,
+			AudOverride: projectId + ".svc.id.goog",
+			Namespace:   urst.Namespace,
+			KSA:         urst.ServiceAccount},
+	})
+	urst.AuthProviders["sts"] = sts.GetToken
 
 	t.Run("meshca-cert", func(t *testing.T) {
 		meshCAID := auth.NewMeshAuth()
 
-		sts := gcp.NewFederatedTokenSource(&gcp.AuthConfig{
-			ProjectNumber: projectNumber,
-			TrustDomain:   projectId + ".svc.id.goog",
-			ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
-				projectId, clusterLocation, clusterName),
-
-			// Will use TokenRequest to get tokens with AudOverride
-			TokenSource: &k8s.K8STokenSource{
-				Cluster:     dk,
-				AudOverride: projectId + ".svc.id.goog",
-				Namespace:   urst.Namespace,
-				KSA:         urst.ServiceAccount},
-		})
-
 		meshca := urst.AddService(&hbone.Cluster{
 			Addr:          "meshca.googleapis.com:443",
 			TokenProvider: sts.GetToken,
-			// Used in the TLS request and to verify the DNS SANs
-			SNI: "meshca.googleapis.com",
 		})
 		err := uxds.GetCertificate(ctx, meshCAID, meshca)
 
 		if err != nil {
 			t.Fatal(err)
 		}
+		log.Println("Cert: ", meshCAID.String())
 	})
 
+	tok, err := urst.AuthProviders["gcp"](ctx, "")
+	if err != nil {
+		t.Fatal("Failed to load k8s", err)
+	}
 	t.Run("hublist", func(t *testing.T) {
 		cd, err := gcp.Hub2RestClusters(ctx, urst, tok, urst.ProjectId)
 		if err != nil {
@@ -228,6 +230,10 @@ func TestURest(t *testing.T) {
 	})
 
 	t.Run("secret", func(t *testing.T) {
+		tok, err := urst.AuthProviders["gcp"](ctx, "")
+		if err != nil {
+			t.Fatal("Failed to load k8s", err)
+		}
 		cd, err := gcp.GcpSecret(ctx, urst, tok, urst.ProjectId, "ca", "1")
 		if err != nil {
 			t.Fatal(err)

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -68,7 +69,7 @@ type MeshSettings struct {
 	// authentication.
 	Auth Auth
 
-	EnvironmentVariables map[string]string
+	Env map[string]string
 
 	// Internal ports
 
@@ -107,6 +108,19 @@ type MeshSettings struct {
 	ServiceNode string
 }
 
+func (ms *MeshSettings) GetEnv(k, def string) string {
+	v := os.Getenv(k)
+	if v != "" {
+		return v
+	}
+	v = ms.Env[k]
+	if v != "" {
+		return v
+	}
+
+	return def
+}
+
 // HBone represents a node using a HTTP/2 or HTTP/3 based overlay network environment.
 // This can act as a minimal REST client and server - or can be used as a RoundTripper, Dialer and Listener
 // compatible with HBONE protocol and mesh security.
@@ -122,8 +136,13 @@ type HBone struct {
 	// AuthProviders - matching kubeconfig user.authProvider.name
 	// It is expected to return tokens with the given audience - in case of GCP
 	// returns access tokens. If not set the cluster can't be created.
+	//
+	// A number of pre-defined token sources are used:
+	// - gcp - returns GCP access tokens using MDS or default credentials. Used for example by GKE clusters.
+	// - k8s - return K8S ID tokens with the given audience for default K8S cluster.
+	// - istio-ca - returns K8S tokens with istio-ca audience - used by Citadel and default Istiod
+	// - sts - federated google access tokens associated with GCP identity pools.
 	AuthProviders map[string]func(context.Context, string) (string, error)
-	TokenCallback func(ctx context.Context, host string) (string, error)
 
 	// rp is used when HBone is used to proxy to a local http/1.1 server.
 	rp *httputil.ReverseProxy
@@ -151,7 +170,6 @@ type HBone struct {
 	HandlerWrapper func(h http.Handler) http.Handler
 
 	Client *http.Client
-	DialF  func(context.Context, *Cluster, net.Conn) (Mux, error)
 }
 
 type noAuth struct {
@@ -301,9 +319,9 @@ func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
 	}
 
 	st, err := transport2.NewServerTransport(conn, &transport2.ServerConfig{
-		MaxFrameSize:          1 << 24,
-		InitialConnWindowSize: 1 << 26,
-		InitialWindowSize:     1 << 25,
+		//MaxFrameSize:          1 << 22,
+		//InitialConnWindowSize: 1 << 26,
+		//InitialWindowSize:     1 << 25,
 	})
 	if err != nil {
 		log.Println("H2 server err", err)
@@ -402,6 +420,8 @@ func (hb *HBone) handleH2Stream(st *transport2.HTTP2ServerMux, stream *transport
 		hc.ServeHTTP(stream, stream.Request)
 
 		// TODO: make sure all is closed and done
+		stream.CloseWrite()
+		stream.Close()
 
 	}()
 }

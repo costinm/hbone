@@ -26,10 +26,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +73,7 @@ type recvMsg struct {
 }
 
 // recvBuffer is an unbounded channel of recvMsg structs.
+// It can grow up to window size - flow control protects it.
 //
 // Note: recvBuffer differs from buffer.Unbounded only in the fact that it
 // holds a channel of recvMsg structs instead of objects implementing "item"
@@ -82,12 +83,15 @@ type recvBuffer struct {
 	c       chan recvMsg
 	mu      sync.Mutex
 	backlog []recvMsg
-	err     error
+
+	// err is set when a buffer with that error is put. backlog may have additional data,
+	// but no new data will be received
+	err error
 }
 
 func newRecvBuffer() *recvBuffer {
 	b := &recvBuffer{
-		c: make(chan recvMsg, 1),
+		c: make(chan recvMsg, 4),
 	}
 	return b
 }
@@ -113,6 +117,7 @@ func (b *recvBuffer) put(r recvMsg) {
 	b.mu.Unlock()
 }
 
+// load will send the first item from the backlog to the channel
 func (b *recvBuffer) load() {
 	b.mu.Lock()
 	if len(b.backlog) > 0 {
@@ -140,10 +145,13 @@ type recvBufferReader struct {
 	closeStream func(error) // Closes the client transport stream with the given error and nil trailer metadata.
 	ctx         context.Context
 	ctxDone     <-chan struct{} // cache of ctx.Done() (for performance).
-	recv        *recvBuffer
-	last        *bytes.Buffer // Stores the remaining data in the previous calls.
-	err         error
-	freeBuffer  func(*bytes.Buffer)
+
+	// recvMsg from the IO thread.
+	recv *recvBuffer
+
+	last *bytes.Buffer // Stores the remaining data in the previous calls.
+
+	freeBuffer func(*bytes.Buffer)
 }
 
 // Read reads the next len(p) bytes from last. If last is drained, it tries to
@@ -158,26 +166,32 @@ func (r *recvBufferReader) Read(p []byte) (n int, err error) {
 			r.freeBuffer(r.last)
 			r.last = nil
 		}
+		if copied == len(p) {
+			return copied, nil
+		}
 	}
 	// copy more data if already received and space in the p
 	more := true
 	for copied < len(p) && more {
 		select {
 		case m := <-r.recv.get():
-			r.recv.load()
-			if m.err != nil {
-				return 0, m.err
-			}
-			copied1, _ := m.buffer.Read(p[copied:])
-			if m.buffer.Len() == 0 {
-				r.freeBuffer(m.buffer)
-				r.last = nil
-			} else {
-				r.last = m.buffer
+			r.recv.load() // so r.recv works
+
+			if m.buffer != nil {
+				copied1, _ := m.buffer.Read(p[copied:])
+				if m.buffer.Len() == 0 {
+					r.freeBuffer(m.buffer)
+					r.last = nil
+				} else {
+					r.last = m.buffer
+					copied += copied1
+					break // we filled the buffer
+				}
 				copied += copied1
-				break // we filled the buffer
+				if copied == len(p) {
+					return copied, nil
+				}
 			}
-			copied += copied1
 			continue
 		default:
 			more = false
@@ -189,16 +203,28 @@ func (r *recvBufferReader) Read(p []byte) (n int, err error) {
 		return copied, nil
 	}
 
-	if r.err != nil {
-		return 0, r.err
+	// Done with the backlog, we'll not get any more data.
+	if r.recv.err != nil {
+		return copied, r.recv.err
 	}
+	//rc := s.getReadClosed()
+	//if rc != 0 {
+	//	if rc == 1 {
+	//		return 0, io.EOF
+	//	}
+	//	return 0, errStreamRST
+	//}
 
 	if r.closeStream != nil {
-		n, r.err = r.readClient(p[copied:])
+		n, _ = r.readClient(p[copied:])
 	} else {
-		n, r.err = r.read(p[copied:])
+		n, _ = r.read(p[copied:])
 	}
-	return copied + n, r.err
+	if copied+n > 0 {
+		return copied + n, nil
+	} else {
+		return 0, r.recv.err
+	}
 }
 
 // used in h2 server, blocks
@@ -236,6 +262,9 @@ func (r *recvBufferReader) readClient(p []byte) (n int, err error) {
 		//return r.readAdditional(m, p)
 		return 0, r.ctx.Err()
 	case m := <-r.recv.get():
+		if m.err != nil {
+			log.Println("readClient ", m.err)
+		}
 		return r.readAdditional(m, p)
 	}
 }
@@ -281,7 +310,9 @@ type Stream struct {
 	recvCompress string
 	//sendCompress string
 
-	buf      *recvBuffer
+	// List of DATA frame bufferss received, channel to get more (blocking)
+	buf *recvBuffer
+
 	trReader *transportReader
 	fc       *inFlow
 	wq       *writeQuota
@@ -347,6 +378,8 @@ func (s *Stream) Header() http.Header {
 }
 
 func (s *Stream) WriteHeader(statusCode int) {
+	s.Response.Status = strconv.Itoa(statusCode)
+
 	if !s.isHeaderSent() { // Headers haven't been written yet.
 		if s.st != nil {
 			if err := s.st.WriteHeader(s); err != nil {
@@ -557,7 +590,7 @@ func (s *Stream) Context() context.Context {
 }
 
 // Called when data frames are received (with a COPY of the data !!)
-func (s *Stream) write(m recvMsg) {
+func (s *Stream) queueReadBuf(m recvMsg) {
 	s.buf.put(m)
 }
 
@@ -583,17 +616,6 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 
 // Read reads all p bytes from the wire for this stream.
 func (s *Stream) Read(p []byte) (n int, err error) {
-	rc := s.getReadClosed()
-	if rc != 0 {
-		if rc == 1 {
-			return 0, io.EOF
-		}
-		return 0, errStreamRST
-	}
-	// Don't request a read if there was an error earlier
-	if s.trReader.er != nil {
-		return 0, s.trReader.er
-	}
 	// effectively t.adjustWindow(len(p)).
 	// This is clearly not right - read may be smaller.
 	// TODO(costin): fix, in gRPC Read reads the full p !
@@ -612,19 +634,17 @@ type h2transport interface {
 type transportReader struct {
 	s      *Stream
 	reader *recvBufferReader
+
 	// The handler to control the window update procedure for both this
 	// particular stream and the associated transport.
 	windowHandler h2transport
-	er            error
 }
 
 func (t *transportReader) Read(p []byte) (n int, err error) {
 	n, err = t.reader.Read(p)
-	if err != nil {
-		t.er = err
-		return
+	if n > 0 {
+		t.windowHandler.updateWindow(t.s, uint32(n))
 	}
-	t.windowHandler.updateWindow(t.s, uint32(n))
 	return
 }
 

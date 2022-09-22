@@ -359,7 +359,11 @@ func (t *HTTP2ServerMux) operateHeaders(frame *frame2.MetaHeadersFrame, handle f
 		case ":method":
 			s.Request.Method = hf.Value
 		case ":path":
-			s.Request.URL.Path = hf.Value
+			qp := strings.SplitN(hf.Value, "?", 2)
+			s.Request.URL.Path = qp[0]
+			if len(qp) > 1 {
+				s.Request.URL.RawQuery = qp[1]
+			}
 		case ":authority":
 			s.Request.Host = hf.Value
 			s.Request.URL.Host = hf.Value
@@ -630,13 +634,16 @@ func (t *HTTP2ServerMux) handleData(f *frame2.DataFrame) {
 			buffer := t.bufferPool.get()
 			buffer.Reset()
 			buffer.Write(f.Data())
-			s.write(recvMsg{buffer: buffer})
+			s.RcvdPackets++
+			s.RcvdBytes += len(f.Data())
+			s.LastRead = time.Now()
+			s.queueReadBuf(recvMsg{buffer: buffer})
 		}
 	}
 	if f.StreamEnded() {
 		// Received the end of stream from the client.
 		s.setReadClosed(1)
-		s.write(recvMsg{err: io.EOF})
+		s.queueReadBuf(recvMsg{err: io.EOF})
 	}
 }
 
@@ -645,7 +652,7 @@ func (t *HTTP2ServerMux) handleRSTStream(f *frame2.RSTStreamFrame) {
 	log.Println("Server RST received", f)
 	if s, ok := t.getStream(f); ok {
 		s.setReadClosed(2)
-		s.write(recvMsg{err: errStreamRST})
+		s.queueReadBuf(recvMsg{err: errStreamRST})
 
 		return
 	}
@@ -822,7 +829,11 @@ func (t *HTTP2ServerMux) writeHeaderLocked(s *Stream) error {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
 	headerFields := make([]hpack.HeaderField, 0, 2) // at least :status, content-type will be there if none else.
-	headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: s.Response.Status})
+	status := s.Response.Status
+	if status == "" {
+		status = "200"
+	}
+	headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: status})
 	headerFields = appendHeaderFieldsFromMD(headerFields, s.Response.Header)
 	success, err := t.controlBuf.executeAndPut(t.checkForHeaderListSize, &headerFrame{
 		streamID:  s.Id,

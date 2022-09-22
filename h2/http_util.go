@@ -41,7 +41,8 @@ import (
 
 const (
 	// http2MaxFrameLen specifies the max length of a HTTP2 frame.
-	http2MaxFrameLen = 16384 // 16KB frame
+	http2MaxFrameLen = 16384 // 16KB frame - default in the standard. Max is 2^24-1
+
 	// http://http2.github.io/http2-spec/#SettingValues
 	http2InitHeaderTableSize = 4096
 	// baseContentType is the base content-type for gRPC.  This is a valid
@@ -50,6 +51,7 @@ const (
 	// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests
 	// for more details.
 
+	// Curl: 100 streams, window 1073741824 (1G)
 )
 
 var (

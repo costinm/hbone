@@ -15,14 +15,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	transport2 "github.com/costinm/hbone/h2"
+	"github.com/costinm/hbone/h2"
+	"github.com/costinm/hbone/h2/frame"
 	"github.com/costinm/hbone/nio"
 	"github.com/costinm/hbone/nio/syscall"
 )
 
 // Structs are yaml-friendly:
 // lowercase used by yaml
-//
 
 // Cluster represents a set of endpoints, with a common configuration.
 // Can be a K8S Service with VIP and DNS name, an external service, etc.
@@ -92,6 +92,11 @@ type Cluster struct {
 	TCPUserTimeout           time.Duration
 	MaxRequestsPerConnection int
 
+	// Default values for initial window size, initial window, max frame size
+	InitialConnWindowSize int32
+	InitialWindowSize     int32
+	MaxFrameSize          uint32
+
 	// Client configured with the root CA of the K8S cluster, used
 	// for HTTP/1.1 requests. If set, the cluster is not HBone/H2 but a fallback
 	// or non-mesh destination.
@@ -108,12 +113,6 @@ type Cluster struct {
 	// If set, will be used to select the next endpoint. Based on lb_policy
 	// May dial a new connection.
 	//LB func(*Cluster) *EndpointCon
-}
-
-// Cluster and EndpointCon implements the Mux interface.
-type Mux interface {
-	Dial(ctx context.Context) (net.Conn, error)
-	WriteHeader(stream Stream)
 }
 
 // Endpoint represents a connection/association with a cluster.
@@ -601,7 +600,7 @@ func (c *Cluster) findMux(ctx context.Context) (*EndpointCon, error) {
 		c.EndpointCon = append(c.EndpointCon, ep)
 	}
 	ep := c.EndpointCon[0]
-	if cc, ok := ep.rt.(*transport2.HTTP2ClientMux); ok {
+	if cc, ok := ep.rt.(*h2.HTTP2ClientMux); ok {
 		if !cc.CanTakeNewRequest() {
 			ep.rt = nil
 		}
@@ -647,13 +646,27 @@ func (ep *EndpointCon) dialH2ClientConn(ctx context.Context) error {
 		return err
 	}
 
-	hc, err := transport2.NewHTTP2Client(ctx, ctx, ep.tlsCon, transport2.ConnectOptions{
-		InitialConnWindowSize: 1 << 26,
-		InitialWindowSize:     1 << 25,
-		MaxFrameSize:          1 << 24,
+	c := ep.c
+	if c.InitialWindowSize == 0 {
+		c.InitialWindowSize = 4194304 // 4M - max should bellow 1 << 24,
+	}
+	if c.InitialConnWindowSize == 0 {
+		c.InitialConnWindowSize = 4 * c.InitialWindowSize
+	}
+	if c.MaxFrameSize == 0 {
+		c.MaxFrameSize = 262144 // 2^18, 256k
+	}
+	hc, err := h2.NewHTTP2Client(ctx, ctx, ep.tlsCon, h2.ConnectOptions{
+		InitialConnWindowSize: c.InitialConnWindowSize,
+
+		InitialWindowSize: c.InitialWindowSize, // 1 << 25,
+		MaxFrameSize:      c.MaxFrameSize,      // 1 << 24,
+	}, func(sf *frame.SettingsFrame) {
+		log.Println("Muxc: Preface received ", sf)
+	}, func(reason h2.GoAwayReason) {
+		log.Println("Muxc: GoAway ", reason)
 	}, func() {
-	}, func(reason transport2.GoAwayReason) {
-	}, func() {
+		log.Println("Muxc: Close ")
 	})
 	if err != nil {
 		return err
