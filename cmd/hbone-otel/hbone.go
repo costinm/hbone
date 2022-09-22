@@ -20,29 +20,24 @@ import (
 	"os"
 
 	"github.com/costinm/hbone"
-	"github.com/costinm/hbone/tcpproxy"
-	"github.com/costinm/hbone/otel"
+	"github.com/costinm/hbone/auth"
+	"github.com/costinm/hbone/ext/otel"
 )
 
 // Same as hbone-min, plus OpenCensus instrumentation
 // Used for testing size impact of OC as well as perf testing, as client (-L )
 func main() {
-	auth := hbone.NewAuth()
-	hb := hbone.New(auth)
+	a := auth.NewMeshAuth()
+	hb := hbone.New(a)
 
 	otel.OTelEnable(hb)
 
 	dest := "127.0.0.1:15008"
-	connectorAddr := "127.0.0.1:15009"
 	lp := ":12001"
-	rp := ":12002"
-	if len(os.Args) > 1  {
+	if len(os.Args) > 1 {
 		dest = os.Args[0]
 	}
-	go func() {
-		tcpproxy.RemoteForwardPort(rp, hb, connectorAddr, "test", "rftest")
-	}()
-	err := tcpproxy.LocalForwardPort(lp, dest, hb, "", auth)
+	err := hbone.LocalForwardPort(lp, dest, hb)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error forwarding ", err)
 		log.Fatal(err)

@@ -78,6 +78,8 @@ func main() {
 
 	hb := hbone.NewHBone(hc, a)
 
+	// Initialize token-based auth.
+
 	// Create AuthProvider["gcp"], returning access tokens using ADC or MDS
 	// Not critical - will be used for clusters requiring google access tokens
 	// ( GKE, googleapis.com )
@@ -86,43 +88,74 @@ func main() {
 		log.Println("Missing GCP credentials", err)
 	}
 
-	hb.TokenCallback = hb.AuthProviders["gcp"]
-
 	id := hb.GetCluster("istiod.istio-system.svc:15012")
-	if id == nil {
-		// If available, init the k8s clusters - will be used for auth and as clusters
-		// Init credentials and discovery server.
-		k8sdefault, err := k8s.InitKubeconfig(hb, nil)
-		if err != nil {
-			log.Println("No k8s")
+	// If available, init the k8s clusters - will be used for auth and as clusters
+	// Init credentials and discovery server.
+	k8sdefault, err := k8s.InitKubeconfig(hb, nil)
+	if err != nil {
+		log.Println("No k8s")
+	} else {
+		// This token source returns tokens for "istio-ca" audience, used by default by istiod and citadel
+		catokenS := &k8s.K8STokenSource{Cluster: k8sdefault, AudOverride: "istio-ca",
+			Namespace: hb.Namespace, KSA: hb.ServiceAccount}
+		hb.AuthProviders["istio-ca"] = catokenS.GetToken
+
+		if id != nil {
+			id.TokenProvider = catokenS.GetToken
 		} else {
-			// Found a K8S cluster, try to locate configs in K8S
-			// Get a config map containing Istio properties
+			// Istiod cluster not configured - attempt to load it from k8s or env variables.
+			// If one env is set - assume all of them are from env.
+
+		}
+
+		istiodAddr := hb.GetEnv("MCON_ADDR", "")
+		if istiodAddr == "" {
+			// Found a K8S cluster, try to locate configs in K8S by getting a config map containing Istio properties
 			cm, err := k8s.GetConfigMap(ctx, k8sdefault, "istio-system", "mesh-env")
 			if err != nil {
 				log.Println("No mesh-env configuration", err)
 			} else {
 				// Tokens using istio-ca audience for Istio
 				// If certificates exist, namespace/sa are initialized from the cert SAN
+				for k, v := range cm {
+					hb.Env[k] = v
+				}
 
-				catokenS := &k8s.K8STokenSource{Cluster: k8sdefault, AudOverride: "istio-ca",
-					Namespace: hb.Namespace, KSA: hb.ServiceAccount}
-
-				istiodCA := cm["CAROOT_ISTIOD"]
-				istiodAddr := cm["MCON_ADDR"]
+				istiodCA := hb.GetEnv("CAROOT_ISTIOD", "")
+				istiodAddr = hb.GetEnv("MCON_ADDR", "")
 				//log.Println("Using " + istiodAddr + "\n" + istiodCA)
 
-				// Istiod cluster, using tokens
-				c := hb.AddService(&hbone.Cluster{
-					Addr:          istiodAddr + ":15012",
-					TokenProvider: catokenS.GetToken,
-					Id:            "istiod.istio-system.svc:15012",
-					SNI:           "istiod.istio-system.svc",
-					CACert:        istiodCA,
-				})
-				log.Println("XDS from k8s mesh-env", c.Addr, c.Id)
+				if id == nil {
+					// Istiod cluster, using tokens
+					c := hb.AddService(&hbone.Cluster{
+						Addr:          istiodAddr + ":15012",
+						TokenProvider: catokenS.GetToken,
+						Id:            "istiod.istio-system.svc:15012",
+						SNI:           "istiod.istio-system.svc",
+						CACert:        istiodCA,
+					})
+					log.Println("XDS from k8s mesh-env", c.Addr, c.Id)
+				}
+
+				projectNumber := cm["PROJECT_NUMBER"]
+				projectId := cm["PROJECT_ID"]
+				clusterLocation := cm["CLUSTER_LOCATION"]
+				clusterName := cm["CLUSTER_NAME"]
+				// This returns JWT tokens for k8s
+				//audTokenS := k8s.K8STokenSource{Cluster: k8sdefault, Namespace: hb.Namespace,
+				//	KSA: hb.ServiceAccount}
+				audTokenS := gcp.NewGSATokenSource(&gcp.AuthConfig{
+					ProjectNumber: projectNumber,
+					TrustDomain:   projectId + ".svc.id.goog",
+					ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
+						projectId, clusterLocation, clusterName),
+					TokenSource: &k8s.K8STokenSource{Cluster: k8sdefault, Namespace: hb.Namespace,
+						KSA: hb.ServiceAccount},
+				}, "")
+				hb.AuthProviders["aud"] = audTokenS.GetToken
 			}
 		}
+
 	}
 
 	// Control plane - must be configured. May setup the cert using Citadel or meshca
@@ -150,6 +183,32 @@ func main() {
 	//tokenProvider := sts.NewGSATokenSource(&sts.AuthConfig{}, "")
 	//tcache := sts.NewTokenCache(tokenProvider)
 	//hb.TokenCallback = tcache.Token
+
+	hb.Mux.HandleFunc("/computeMetadata/v1/instance/service-accounts/",
+		func(writer http.ResponseWriter, request *http.Request) {
+			// Envoy request: Metadata-Flavor:[Google] X-Envoy-Expected-Rq-Timeout-Ms:[1000] X-Envoy-Internal:[true]
+			pathc := strings.Split(request.URL.RawQuery, "=")
+			if len(pathc) != 2 {
+				log.Println("Token error", err, request.URL.RawQuery)
+				writer.WriteHeader(500)
+				return
+			}
+			aud := pathc[1]
+			tp := hb.AuthProviders["aud"]
+			if tp == nil {
+				writer.WriteHeader(500)
+				return
+			}
+			tok, err := tp(context.Background(), aud)
+			if err != nil {
+				log.Println("Token error", err, pathc)
+				writer.WriteHeader(500)
+				return
+			}
+			writer.WriteHeader(200)
+			log.Println(aud, tok)
+			fmt.Fprintf(writer, "%s", tok)
+		})
 
 	if len(flag.Args()) == 0 { // sidecar/server mode
 		listenServe(hc.HBone, ":15008", hb.HandleAcceptedH2)
