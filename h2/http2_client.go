@@ -123,48 +123,6 @@ type HTTP2ClientMux struct {
 	FrameSize uint32
 }
 
-func (t *HTTP2ClientMux) newStream(ctx context.Context, callHdr *CallHdr) *Stream {
-	// TODO(zhaoq): Handle uint32 overflow of Stream.id.
-	s := &Stream{
-		ct:            t,
-		done:          make(chan struct{}),
-		buf:           newRecvBuffer(),
-		writeDoneChan: make(chan *dataFrame),
-		headerChan:    make(chan struct{}),
-		doneFunc:      callHdr.DoneFunc,
-		Request:       callHdr.Req,
-		Response: &http.Response{
-			Header:  http.Header{},
-			Trailer: http.Header{},
-			Request: callHdr.Req,
-		},
-	}
-	s.Response.Body = s
-
-	s.wq = newWriteQuota(defaultWriteQuota, s.done)
-	s.requestRead = func(n int) {
-		t.adjustWindow(s, uint32(n))
-	}
-	// The client side stream context should have exactly the same life cycle with the user provided context.
-	// That means, s.ctx should be read-only. And s.ctx is done iff ctx is done.
-	// So we use the original context here instead of creating a copy.
-	s.ctx = ctx
-	s.trReader = &transportReader{
-		reader: &recvBufferReader{
-			ctx:     s.ctx,
-			ctxDone: s.ctx.Done(),
-			recv:    s.buf,
-			closeStream: func(err error) {
-				t.CloseStream(s, err)
-			},
-			freeBuffer: t.bufferPool.put,
-		},
-		windowHandler: t,
-		s:             s,
-	}
-	return s
-}
-
 func (t *HTTP2ClientMux) createHeaderFields(ctx context.Context,
 	r *http.Request) ([]hpack.HeaderField, error) {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
@@ -207,7 +165,6 @@ func (t *HTTP2ClientMux) createHeaderFields(ctx context.Context,
 			headerFields = append(headerFields, hpack.HeaderField{Name: strings.ToLower(k), Value: encodeMetadataHeader(k, v)})
 		}
 	}
-	log.Println("Headers to sent:", headerFields)
 	return headerFields, nil
 }
 
@@ -230,20 +187,6 @@ type NewStreamError struct {
 
 func (e NewStreamError) Error() string {
 	return e.Err.Error()
-}
-
-// NewStream creates a stream and registers it into the transport as "active"
-// streams.  All non-nil errors returned will be *NewStreamError.
-func (t *HTTP2ClientMux) NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error) {
-	headerFields, err := t.createHeaderFields(ctx, callHdr.Req)
-	if err != nil {
-		return nil, &NewStreamError{Err: err, AllowTransparentRetry: false}
-	}
-
-	s := t.newStream(ctx, callHdr)
-
-	_, err = t.sendHeaders(s, headerFields)
-	return s, err
 }
 
 func (t *HTTP2ClientMux) sendHeaders(s *Stream, headerFields []hpack.HeaderField) (*Stream, error) {
@@ -391,7 +334,7 @@ func (t *HTTP2ClientMux) CloseStream(s *Stream, err error) {
 func (t *HTTP2ClientMux) closeStream(s *Stream, err error, rst bool, rstCode frame.ErrCode,
 	st *Status, mdata map[string][]string, eosReceived bool) {
 
-	log.Println("Client closeStream", s.Id, err, rst, rstCode)
+	//log.Println("Client closeStream", s.Id, err, rst, rstCode)
 
 	// Set stream status to done.
 	if s.swapState(streamDone) == streamDone {
@@ -447,8 +390,8 @@ func (t *HTTP2ClientMux) closeStream(s *Stream, err error, rst bool, rstCode fra
 	t.controlBuf.executeAndPut(addBackStreamQuota, cleanup)
 	// This will unblock write.
 	close(s.done)
-	if s.doneFunc != nil {
-		s.doneFunc()
+	if s.DoneFunc != nil {
+		s.DoneFunc(s)
 	}
 }
 
@@ -677,7 +620,7 @@ func (t *HTTP2ClientMux) handleData(f *frame.DataFrame) {
 	// the read direction is closed, and set the status appropriately.
 	if f.StreamEnded() {
 		s.setReadClosed(1)
-		log.Println("Client CLOSE received", f)
+		//log.Println("Client CLOSE received", f)
 		s.queueReadBuf(recvMsg{err: io.EOF})
 	}
 }

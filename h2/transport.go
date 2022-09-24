@@ -302,7 +302,7 @@ type Stream struct {
 	cancel context.CancelFunc
 
 	done     chan struct{}   // closed at the end of stream to unblock writers. On the client side.
-	doneFunc func()          // invoked at the end of stream on client side.
+	DoneFunc func(*Stream)   // invoked at the end of stream on client side.
 	ctxDone  <-chan struct{} // same as done chan but for server side. Cache of ctx.Done() (for performance)
 
 	Path string // the associated RPC Path of the stream.
@@ -786,8 +786,6 @@ type Options struct {
 // CallHdr carries the information of a particular RPC.
 type CallHdr struct {
 	Req *http.Request
-
-	PreviousAttempts int // value of grpc-previous-rpc-attempts header to set
 
 	DoneFunc func() // called when the stream is finished
 }

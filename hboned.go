@@ -32,7 +32,7 @@ type Auth interface {
 // Debug for dev support, will log verbose info.
 // Avoiding dependency on logging - eventually a trace interface will be provided
 // so any logger can be used.
-var Debug = true
+var Debug = false
 
 // MeshSettings has common settings for all clients
 type MeshSettings struct {
@@ -222,6 +222,10 @@ func NewMesh(ms *MeshSettings) *HBone {
 	//h2.ReadIdleTimeout = 10 * time.Minute // TODO: much larger to support long-lived connections
 	//h2.AllowHTTP = true
 	//h2.StrictMaxConcurrentStreams = false
+
+	if ms.Env == nil {
+		ms.Env = map[string]string{}
+	}
 
 	hb := &HBone{
 		MeshSettings: ms,

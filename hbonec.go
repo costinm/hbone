@@ -113,6 +113,9 @@ type Cluster struct {
 	// If set, will be used to select the next endpoint. Based on lb_policy
 	// May dial a new connection.
 	//LB func(*Cluster) *EndpointCon
+
+	LastUsed time.Time
+	Dynamic  bool
 }
 
 // Endpoint represents a connection/association with a cluster.
@@ -154,7 +157,9 @@ type EndpointCon struct {
 	rt     http.RoundTripper // *http2.ClientConn or custom
 	tlsCon net.Conn
 	// The stream connection - may be a real TCP or not
-	streamCon net.Conn
+	streamCon       net.Conn
+	ConnectionStart time.Time
+	SSLEnd          time.Time
 }
 
 func (c *Cluster) UpdateEndpoints(ep []*Endpoint) {
@@ -220,9 +225,10 @@ func (hb *HBone) Cluster(ctx context.Context, addr string) (*Cluster, error) {
 	// TODO: use discovery to find info about service addr, populate from XDS on-demand or DNS
 	if !ok {
 		// TODO: on-demand, DNS lookups, etc
-		c = &Cluster{Addr: addr, hb: hb}
+		c = &Cluster{Addr: addr, hb: hb, Dynamic: true}
 		hb.AddService(c)
 	}
+	c.LastUsed = time.Now()
 	return c, nil
 }
 
@@ -240,10 +246,14 @@ func (hc *EndpointCon) dialTLS(ctx context.Context, addr string) (net.Conn, erro
 		// TODO: mangle the address of the hbone port and/or endpoint
 	}
 
+	// TODO: DNSStart/End
+
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+
+	hc.ConnectionStart = time.Now()
 
 	// If net connection is cut, by default the socket may linger for up to 20 min without detecting this.
 	// Extracted from gRPC - needs to apply at TCP socket level
@@ -284,41 +294,10 @@ func (hc *EndpointCon) dialTLS(ctx context.Context, addr string) (net.Conn, erro
 
 	// tlsCon.VerifyHostname(c.SNI) is handled in the verifier
 
+	hc.SSLEnd = time.Now()
+
 	hc.tlsCon = tlsCon
 	return tlsCon, nil
-}
-
-type debugTLSCon struct {
-	*tls.Conn
-}
-
-func (dc *debugTLSCon) Read(b []byte) (int, error) {
-	n, err := dc.Conn.Read(b)
-	log.Println("YYY TCPRead() ", n, err)
-	return n, err
-}
-
-type debugCon struct {
-	net.Conn
-}
-
-func (dc *debugCon) Read(b []byte) (int, error) {
-	n, err := dc.Conn.Read(b)
-	log.Println("YYY TLSRead() ", n, err)
-	return n, err
-}
-
-type debugConW struct {
-	net.Conn
-}
-
-func (dc *debugConW) Write(b []byte) (int, error) {
-	n, err := dc.Conn.Write(b)
-	log.Println("ZZZ TCPWrite() ", n, err)
-	if err != nil {
-		log.Println("ZZZ err TCPWrite() ", n, err)
-	}
-	return n, err
 }
 
 func (c *Cluster) DoRequest(req *http.Request) ([]byte, error) {
@@ -327,7 +306,7 @@ func (c *Cluster) DoRequest(req *http.Request) ([]byte, error) {
 
 	resp, err = c.RoundTrip(req) // Client.Do(req)
 	if Debug {
-		log.Println(req, resp, err)
+		log.Println("DoRequest", req, resp, err)
 	}
 
 	if err != nil {
@@ -337,7 +316,7 @@ func (c *Cluster) DoRequest(req *http.Request) ([]byte, error) {
 	defer resp.Body.Close()
 	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Println(err)
+		log.Println("readall", err)
 		return nil, err
 	}
 
@@ -375,7 +354,6 @@ func (c *Cluster) trustRoots() *x509.CertPool {
 //
 // The HTTPConn represents the HBone connection to the peer or to a proxy.
 func (hb *HBone) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	//log.Println("Dial ", addr)
 	c := hb.GetCluster(addr)
 	if c == nil {
 		// TODO: custom dialer
@@ -564,7 +542,7 @@ func (c *Cluster) rt(epc *EndpointCon, req *http.Request) (*http.Response, *Endp
 		// and wait for the Header frame to be received, and any metadata too.
 		resp, rterr = epc.rt.RoundTrip(req)
 		if Debug {
-			log.Println(req, resp, rterr)
+			log.Println("RoundTrip", req, resp, rterr)
 		}
 
 		if rterr != nil {
@@ -656,21 +634,28 @@ func (ep *EndpointCon) dialH2ClientConn(ctx context.Context) error {
 	if c.MaxFrameSize == 0 {
 		c.MaxFrameSize = 262144 // 2^18, 256k
 	}
-	hc, err := h2.NewHTTP2Client(ctx, ctx, ep.tlsCon, h2.ConnectOptions{
+	okch := make(chan int, 1)
+	hc, err := h2.NewHTTP2Client(ctx, ep.tlsCon, h2.ConnectOptions{
 		InitialConnWindowSize: c.InitialConnWindowSize,
 
 		InitialWindowSize: c.InitialWindowSize, // 1 << 25,
 		MaxFrameSize:      c.MaxFrameSize,      // 1 << 24,
 	}, func(sf *frame.SettingsFrame) {
+		okch <- 1
 		log.Println("Muxc: Preface received ", sf)
 	}, func(reason h2.GoAwayReason) {
-		log.Println("Muxc: GoAway ", reason)
+		ep.rt = nil
 	}, func() {
-		log.Println("Muxc: Close ")
+		log.Println("Muxc: Close ", addr)
+		ep.rt = nil
+		// TODO: close all associated pending streams ?
 	})
 	if err != nil {
 		return err
 	}
+
+	<-okch
+
 	ep.rt = hc
 	return nil
 }

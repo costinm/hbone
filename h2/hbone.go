@@ -17,7 +17,7 @@ import (
 // newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
-func NewHTTP2Client(connectCtx, ctx context.Context, conn net.Conn, opts ConnectOptions,
+func NewHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 	onPrefaceReceipt func(*http2.SettingsFrame), onGoAway func(GoAwayReason), onClose func()) (_ *HTTP2ClientMux, err error) {
 	scheme := "http"
 	ctx, cancel := context.WithCancel(ctx)
@@ -206,31 +206,11 @@ func (t *HTTP2ClientMux) RoundTrip(request *http.Request) (*http.Response, error
 }
 
 func (t *HTTP2ClientMux) Dial(request *http.Request) (*http.Response, error) {
-	s, err := t.NewStream(request.Context(), &CallHdr{
-		Req: request,
-		DoneFunc: func() {
-			log.Println("Dial ", request.Host, "done")
-		},
-	})
+	s := NewStreamReq(request)
+	_, err := t.DialStream(s)
+
 	if err != nil {
 		return nil, err
-	}
-	// TODO: special header or method to indicate the Body of Request supports optimized
-	// copy ( no io.Pipe !!)
-	if request.Body != nil {
-		go func() {
-			s1 := &nio.ReaderCopier{
-				ID:  fmt.Sprintf("req-body-%d", s.Id),
-				Out: s,
-				In:  request.Body,
-			}
-			s1.Copy(nil, false)
-			if s1.Err != nil {
-				s1.Close()
-			} else {
-				s.CloseWrite()
-			}
-		}()
 	}
 
 	return s.Response, nil
@@ -284,8 +264,6 @@ func NewStreamReq(req *http.Request) *Stream {
 	s := &Stream{
 		Request: req,
 		ctx:     req.Context(),
-		//ct:            t,
-		//doneFunc:      callHdr.DoneFunc,
 		Response: &http.Response{
 			Header:  http.Header{},
 			Trailer: http.Header{},
@@ -300,18 +278,19 @@ func NewStreamReq(req *http.Request) *Stream {
 // dial associates a Stream with a mux and sends the request.
 func (t *HTTP2ClientMux) DialStream(s *Stream) (*http.Response, error) {
 	s.ct = t
-	s.wq = newWriteQuota(defaultWriteQuota, s.done)
-	s.requestRead = func(n int) {
-		t.adjustWindow(s, uint32(n))
-	}
-	// The client side stream context should have exactly the same life cycle with the user provided context.
-	// That means, s.ctx should be read-only. And s.ctx is done iff ctx is done.
-	// So we use the original context here instead of creating a copy.
 	s.done = make(chan struct{})
 	s.buf = newRecvBuffer()
 	s.writeDoneChan = make(chan *dataFrame)
 	s.headerChan = make(chan struct{})
 
+	s.wq = newWriteQuota(defaultWriteQuota, s.done)
+	s.requestRead = func(n int) {
+		t.adjustWindow(s, uint32(n))
+	}
+
+	// The client side stream context should have exactly the same life cycle with the user provided context.
+	// That means, s.ctx should be read-only. And s.ctx is done iff ctx is done.
+	// So we use the original context here instead of creating a copy.
 	s.trReader = &transportReader{
 		reader: &recvBufferReader{
 			ctx:     s.ctx,
@@ -331,6 +310,7 @@ func (t *HTTP2ClientMux) DialStream(s *Stream) (*http.Response, error) {
 		return nil, err
 	}
 	t.sendHeaders(s, headerFields)
+
 	// TODO: special header or method to indicate the Body of Request supports optimized
 	// copy ( no io.Pipe !!)
 	if s.Request.Body != nil {

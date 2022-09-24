@@ -32,6 +32,7 @@ import (
 	"github.com/costinm/hbone/auth"
 	"github.com/costinm/hbone/ext/gcp"
 	"github.com/costinm/hbone/ext/k8s"
+	"github.com/costinm/hbone/ext/otel"
 	"github.com/costinm/hbone/ext/socks5"
 	"github.com/costinm/hbone/ext/uxds"
 	"github.com/costinm/hbone/nio"
@@ -77,6 +78,8 @@ func main() {
 	defer cf()
 
 	hb := hbone.NewHBone(hc, a)
+
+	otel.OTelEnable(hb)
 
 	// Initialize token-based auth.
 
