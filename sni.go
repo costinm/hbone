@@ -1,49 +1,21 @@
 package hbone
 
 import (
-	"context"
-	"crypto/tls"
 	"errors"
-	"io"
 	"log"
 	"net"
 	"strings"
+
+	"github.com/costinm/hbone/nio"
 )
 
-// Will start a SNI proxy, similar with Istio East-West or Gateway SNI router.
-// Accepted connections will decode the ServerName header, and use it to forward to either a HBONE
-// mTLS service or a H2R connection.
+// HandleSNIConn implements SNI based routing. This can be used for compat
+// with Istio. Was original method to tunnel for serverless.
 //
-
-func (hc *Endpoint) sniProxy(ctx context.Context, stdin io.Reader, stdout io.WriteCloser) error {
-	d := net.Dialer{} // TODO: customizations
-
-	conn, err := d.DialContext(ctx, "tcp", hc.SNIGate)
-	if Debug {
-		log.Println("sniProxyC: ", conn.RemoteAddr(), hc.URL, hc.SNIGate)
-	}
-	if err != nil {
-		return err
-	}
-
-	// Using the low-level interface, to keep control over TLS.
-	conf := hc.hb.Auth.MeshTLSConfig.Clone()
-
-	conf.ServerName = hc.SNI
-
-	defer conn.Close()
-
-	tlsCon := tls.Client(conn, conf)
-	err = HandshakeTimeout(tlsCon, hc.hb.HandsahakeTimeout, nil)
-	if err != nil {
-		return err
-	}
-
-	return proxy(ctx, stdin, stdout, tlsCon, tlsCon)
-}
-
-func (hb *HBone) HandleSNIConn(conn net.Conn) {
-	s := NewBufferReader(conn)
+// This can be used for a legacy CNI to HBone bridge. The old Istio client expects an mTLS connection
+// to the other end - the HBone proxy is untrusted.
+func HandleSNIConn(hb *HBone, conn net.Conn) {
+	s := nio.NewBufferReader(conn)
 	// will also close the conn ( which is the reader )
 	defer s.Close()
 
@@ -53,24 +25,37 @@ func (hb *HBone) HandleSNIConn(conn net.Conn) {
 		return
 	}
 
-	ok, err := hb.handleH2R(conn, s, sni)
-	if err != nil {
-		log.Println("SNI-H2R 500", sni, err)
-	}
-	if ok {
-		// Handled as h2r
-		return
+	// At this point we have a SNI service name. Need to convert it to a real service
+	// name, Dial and proxy.
+
+	addr := sni + ":443"
+	// Based on SNI, make a hbone request, using JWT auth.
+	if strings.HasPrefix(sni, "outbound_.") {
+		// Current Istio SNI looks like:
+		//
+		// outbound_.9090_._.prometheus-1-prometheus.mon.svc.cluster.local
+		// We need to map it to a cloudrun external address, add token based on the audience, and
+		// make the call using the tunnel.
+		//
+		// Also supports the 'natural' form and egress
+
+		//
+		//
+		parts := strings.SplitN(sni, ".", 4)
+		remoteService := parts[3]
+		// TODO: extract 'version' from URL, convert it to cloudrun revision ?
+		addr = net.JoinHostPort(remoteService, parts[1])
 	}
 
-	// Based on SNI, make a hbone request, using JWT auth.
-	if hb.EndpointResolver != nil {
-		dst := hb.EndpointResolver(sni)
-		if dst != nil {
-			err = dst.Proxy(context.Background(), s, conn)
-			if err != nil {
-				log.Println("SNI: error connecting to proxy", sni, err)
-			}
-		}
+	nc, err := hb.Dial("tcp", addr)
+	if err != nil {
+		log.Println("Error connecting ", err)
+		return
+	}
+	err = Proxy(nc, s, conn, addr)
+	if err != nil {
+		log.Println("Error proxy ", err)
+		return
 	}
 }
 
@@ -102,8 +87,8 @@ const (
 //
 // TODO: in mesh, use one cypher suite (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
 // maybe 2 ( since keys are ECDSA )
-func ParseTLS(acc *BufferReader) (string, error) {
-	buf, err := acc.Fill(5)
+func ParseTLS(acc *nio.Buffer) (string, error) {
+	buf, err := acc.Peek(5)
 	if err != nil {
 		return "", err
 	}
@@ -126,7 +111,7 @@ func ParseTLS(acc *BufferReader) (string, error) {
 	m := ClientHelloMsg{}
 
 	end := rlen + 5
-	buf, err = acc.Fill(end)
+	buf, err = acc.Peek(end)
 	if err != nil {
 		return "", err
 	}
