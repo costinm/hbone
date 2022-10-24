@@ -14,111 +14,36 @@ import (
 	"github.com/costinm/hbone/nio"
 )
 
-// newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
-// and starts to receive messages on it. Non-nil error returns if construction
-// fails.
-func NewHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
-	onPrefaceReceipt func(*http2.SettingsFrame), onGoAway func(GoAwayReason), onClose func()) (_ *HTTP2ClientMux, err error) {
-	scheme := "http"
-	ctx, cancel := context.WithCancel(ctx)
-	defer func() {
-		if err != nil {
-			cancel()
-		}
-	}()
+func (t *HTTP2ClientMux) StartConn(conn net.Conn) (err error) {
+	writeBufSize := t.opts.WriteBufferSize
+	readBufSize := t.opts.ReadBufferSize
+	maxHeaderListSize := defaultClientMaxHeaderListSize
+	if t.opts.MaxHeaderListSize != nil {
+		maxHeaderListSize = *t.opts.MaxHeaderListSize
+	}
+	fs := uint32(http2MaxFrameLen)
+	if t.opts.MaxFrameSize != 0 {
+		fs = t.opts.MaxFrameSize
+	}
 
+	t.conn = conn
+	t.framer = newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize, fs)
+
+	//
 	// Any further errors will close the underlying connection
 	defer func(conn net.Conn) {
 		if err != nil {
 			conn.Close()
 		}
 	}(conn)
-	kp := opts.KeepaliveParams
-	// Validate keepalive parameters.
-	if kp.Time == 0 {
-		kp.Time = defaultClientKeepaliveTime
-	}
-	if kp.Timeout == 0 {
-		kp.Timeout = defaultClientKeepaliveTimeout
-	}
-	keepaliveEnabled := false
-	if kp.Time != infinity {
-		//if err = syscall.SetTCPUserTimeout(conn, kp.Timeout); err != nil {
-		//	return nil, connectionErrorf(false, err, "transport: failed to set TCP_USER_TIMEOUT: %v", err)
-		//}
-		keepaliveEnabled = true
-	}
-	isSecure := true
-	//var (
-	//	authInfo credentials.AuthInfo
-	//)
-	//perRPCCreds := opts.PerRPCCredentials
 
-	dynamicWindow := true
-	icwz := int32(initialWindowSize)
-	if opts.InitialConnWindowSize >= defaultWindowSize {
-		icwz = opts.InitialConnWindowSize
-		dynamicWindow = false
-	}
-	writeBufSize := opts.WriteBufferSize
-	readBufSize := opts.ReadBufferSize
-	maxHeaderListSize := defaultClientMaxHeaderListSize
-	if opts.MaxHeaderListSize != nil {
-		maxHeaderListSize = *opts.MaxHeaderListSize
-	}
-	fs := uint32(http2MaxFrameLen)
-	if opts.MaxFrameSize != 0 {
-		fs = opts.MaxFrameSize
-	}
-	t := &HTTP2ClientMux{
-		ctx:           ctx,
-		ctxDone:       ctx.Done(), // Cache Done chan.
-		cancel:        cancel,
-		userAgent:     opts.UserAgent,
-		conn:          conn,
-		readerDone:    make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		goAway:        make(chan struct{}),
-		framer:        newFramer(conn, writeBufSize, readBufSize, maxHeaderListSize, fs),
-		fc:            &trInFlow{limit: uint32(icwz)},
-		scheme:        scheme,
-		activeStreams: make(map[uint32]*Stream),
-		isSecure:      isSecure,
-		//perRPCCreds:           perRPCCreds,
-		kp:                    kp,
-		initialWindowSize:     initialWindowSize,
-		onPrefaceReceipt:      onPrefaceReceipt,
-		nextID:                1,
-		maxConcurrentStreams:  defaultMaxStreamsClient,
-		streamQuota:           defaultMaxStreamsClient,
-		streamsQuotaAvailable: make(chan struct{}, 1),
-		czData:                new(channelzData),
-		onGoAway:              onGoAway,
-		onClose:               onClose,
-		keepaliveEnabled:      keepaliveEnabled,
-		bufferPool:            newBufferPool(),
-	}
+	t.controlBuf = newControlBuffer(&t.H2Transport, t.done)
 
-	t.controlBuf = newControlBuffer(t.ctxDone)
-	if opts.InitialWindowSize >= defaultWindowSize {
-		t.initialWindowSize = opts.InitialWindowSize
-		dynamicWindow = false
-	}
-	if dynamicWindow {
-		t.bdpEst = &bdpEstimator{
-			bdp:               initialWindowSize,
-			updateFlowControl: t.updateFlowControl,
-		}
-	}
-	//t.channelzID, err = channelz.RegisterNormalSocket(t, opts.ChannelzParentID, fmt.Sprintf("%s -> %s", t.localAddr, t.remoteAddr))
-	//if err != nil {
-	//	return nil, err
-	//}
 	if t.keepaliveEnabled {
 		t.kpDormancyCond = sync.NewCond(&t.mu)
 		go t.keepalive()
 	}
-	// Start the reader goroutine for incoming message. Each transport has
+	// RoundTripStart the reader goroutine for incoming message. Each transport has
 	// a dedicated goroutine which reads HTTP2 frame from network. Then it
 	// dispatches the frame to the corresponding stream entity.
 	go t.reader()
@@ -128,12 +53,12 @@ func NewHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 	if err != nil {
 		err = connectionErrorf(true, err, "transport: failed to write client preface: %v", err)
 		t.Close(err)
-		return nil, err
+		return err
 	}
 	if n != len(clientPreface) {
 		err = connectionErrorf(true, nil, "transport: preface mismatch, wrote %d bytes; want %d", n, len(clientPreface))
 		t.Close(err)
-		return nil, err
+		return err
 	}
 	var ss []http2.Setting
 
@@ -148,10 +73,10 @@ func NewHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 		Val: fs,
 	})
 	t.FrameSize = fs
-	if opts.MaxHeaderListSize != nil {
+	if t.opts.MaxHeaderListSize != nil {
 		ss = append(ss, http2.Setting{
 			ID:  http2.SettingMaxHeaderListSize,
-			Val: *opts.MaxHeaderListSize,
+			Val: *t.opts.MaxHeaderListSize,
 		})
 	} else {
 		ss = append(ss, http2.Setting{
@@ -163,24 +88,26 @@ func NewHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 	if err != nil {
 		err = connectionErrorf(true, err, "transport: failed to write initial settings frame: %v", err)
 		t.Close(err)
-		return nil, err
+		return err
 	}
 	// Adjust the connection flow control window if needed.
-	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
+	// limit is initialized to initial con window size
+	if delta := uint32(t.fc.limit - defaultWindowSize); delta > 0 {
 		if err := t.framer.fr.WriteWindowUpdate(0, delta); err != nil {
 			err = connectionErrorf(true, err, "transport: failed to write window update: %v", err)
 			t.Close(err)
-			return nil, err
+			return err
 		}
 	}
 
 	t.connectionID = atomic.AddUint64(&clientConnectionCounter, 1)
 
 	if err := t.framer.writer.Flush(); err != nil {
-		return nil, err
+		t.Close(err)
+		return err
 	}
 	go func() {
-		t.loopy = newLoopyWriter(clientSide, t.framer, t.controlBuf, t.bdpEst, fs)
+		t.loopy = newLoopyWriter(&t.H2Transport, clientSide, t.framer, t.controlBuf, t.bdpEst, fs)
 		err := t.loopy.run()
 		if err != nil {
 			log.Printf("transport: loopyWriter.run returning. Err: %v", err)
@@ -191,21 +118,24 @@ func NewHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 		t.controlBuf.finish()
 		close(t.writerDone)
 	}()
-	return t, nil
+	return nil
 }
 
-func (t *HTTP2ClientMux) RoundTrip(request *http.Request) (*http.Response, error) {
+func (t *H2Transport) RoundTrip(request *http.Request) (*http.Response, error) {
 	res, err := t.Dial(request)
 	if err != nil {
 		return nil, err
 	}
-	s := res.Body.(*Stream)
-	s.waitOnHeader()
+
+	s := res.Body.(*H2Stream)
+	s.WaitHeaders()
 
 	return res, err
 }
 
-func (t *HTTP2ClientMux) Dial(request *http.Request) (*http.Response, error) {
+// Dial sends a request (headers). Does not block waiting for response,
+// but waits for available stream.
+func (t *H2Transport) Dial(request *http.Request) (*http.Response, error) {
 	s := NewStreamReq(request)
 	_, err := t.DialStream(s)
 
@@ -214,23 +144,6 @@ func (t *HTTP2ClientMux) Dial(request *http.Request) (*http.Response, error) {
 	}
 
 	return s.Response, nil
-}
-
-const (
-	Event_Response = 0
-	Event_Data
-	Event_Sent
-	Event_FIN
-	Event_RST
-)
-
-type Event struct {
-	Type int
-	Conn *Stream
-
-	Error error
-
-	Buffer *nio.Buffer
 }
 
 // NewGRPCStream creates a HTTPConn with a request set using gRPC framing and headers,
@@ -250,7 +163,7 @@ type Event struct {
 // For response, the caller must handle headers like:
 //   - trailer grpc-status, grpc-message, grpc-status-details-bin, grpc-encoding
 //   - http status codes other than 200 (which is expected for gRPC)
-func NewGRPCStream(ctx context.Context, host, path string) *Stream {
+func NewGRPCStream(ctx context.Context, host, path string) *H2Stream {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+host+path, nil)
 	req.Header.Add("content-type", "application/grpc")
@@ -260,8 +173,8 @@ func NewGRPCStream(ctx context.Context, host, path string) *Stream {
 	return NewStreamReq(req)
 }
 
-func NewStreamReq(req *http.Request) *Stream {
-	s := &Stream{
+func NewStreamReq(req *http.Request) *H2Stream {
+	s := &H2Stream{
 		Request: req,
 		ctx:     req.Context(),
 		Response: &http.Response{
@@ -275,42 +188,35 @@ func NewStreamReq(req *http.Request) *Stream {
 	return s
 }
 
-// dial associates a Stream with a mux and sends the request.
-func (t *HTTP2ClientMux) DialStream(s *Stream) (*http.Response, error) {
+// dial associates a H2Stream with a mux and sends the request.
+func (t *H2Transport) DialStream(s *H2Stream) (*http.Response, error) {
 	s.ct = t
 	s.done = make(chan struct{})
-	s.buf = newRecvBuffer()
 	s.writeDoneChan = make(chan *dataFrame)
 	s.headerChan = make(chan struct{})
 
 	s.wq = newWriteQuota(defaultWriteQuota, s.done)
-	s.requestRead = func(n int) {
-		t.adjustWindow(s, uint32(n))
-	}
 
 	// The client side stream context should have exactly the same life cycle with the user provided context.
-	// That means, s.ctx should be read-only. And s.ctx is done iff ctx is done.
+	// That means, s.ctx should be readBlocking-only. And s.ctx is done iff ctx is done.
 	// So we use the original context here instead of creating a copy.
-	s.trReader = &transportReader{
-		reader: &recvBufferReader{
-			ctx:     s.ctx,
-			ctxDone: s.ctx.Done(),
-			recv:    s.buf,
-			closeStream: func(err error) {
-				t.CloseStream(s, err)
-			},
-			freeBuffer: t.bufferPool.put,
-		},
-		windowHandler: t,
-		s:             s,
-	}
+	s.trReader = nio.NewRecvBuffer(
+		s.ctx.Done(), t.bufferPool.put, func(err error) {
+			t.closeStream(s, err, true, http2.ErrCodeCancel)
+		})
 
+	t.streamEvent(EventStreamRequestStart, s)
 	headerFields, err := t.createHeaderFields(s.ctx, s.Request)
 	if err != nil {
 		return nil, err
 	}
-	t.sendHeaders(s, headerFields)
+	err = t.writeRequestHeaders(s, headerFields)
+	if err != nil {
+		return nil, err
+	}
+	s.updateHeaderSent()
 
+	t.streamEvent(EventStreamStart, s)
 	// TODO: special header or method to indicate the Body of Request supports optimized
 	// copy ( no io.Pipe !!)
 	if s.Request.Body != nil {
@@ -335,7 +241,7 @@ func (t *HTTP2ClientMux) DialStream(s *Stream) (*http.Response, error) {
 // Return a buffer with reserved front space to be used for appending.
 // If using functions like proto.Marshal, b.UpdateForAppend should be called
 // with the new []byte. App should not touch the prefix.
-func (hc *Stream) GetWriteFrame() *nio.Buffer {
+func (hc *H2Stream) GetWriteFrame() *nio.Buffer {
 	//if m.OutFrame != nil {
 	//	return m.OutFrame
 	//}
@@ -345,11 +251,20 @@ func (hc *Stream) GetWriteFrame() *nio.Buffer {
 	return b
 }
 
-// Framed sending/receiving.
-func (hc *Stream) Send(b *nio.Buffer) error {
-	if !hc.isHeaderSent() {
-		hc.WriteHeader(0)
+func (hc *H2Stream) Send(b []byte, start, end int, last bool) error {
+	hc.SentPackets++
+	return hc.Transport().Send(hc, b, start, end, last)
+}
+
+func (hc *H2Stream) Transport() *H2Transport {
+	if hc.ct != nil {
+		return hc.ct
 	}
+	return hc.st
+}
+
+// Framed sending/receiving.
+func (hc *H2Stream) SendDataFrame(b *nio.Buffer) error {
 
 	hc.SentPackets++
 	frameLen := b.Size() - 5

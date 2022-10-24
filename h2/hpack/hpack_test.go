@@ -579,7 +579,7 @@ func TestHuffmanDecodeFuzz(t *testing.T) {
 	for i := 0; i < n; i++ {
 		zbuf.Reset()
 		if i == 0 {
-			// Start with at least one invalid one.
+			// RoundTripStart with at least one invalid one.
 			zbuf.WriteString("00\x91\xff\xff\xff\xff\xc8")
 		} else {
 			for l := 0; l < Len; l++ {
@@ -756,7 +756,7 @@ func TestDynamicSizeUpdate(t *testing.T) {
 
 	d.Close()
 
-	// Start a new header
+	// RoundTripStart a new header
 	_, err = d.Write(buf.Bytes())
 	if err != nil {
 		t.Fatalf("unexpected error: got = %v", err)

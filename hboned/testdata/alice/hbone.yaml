@@ -1,0 +1,59 @@
+
+projectid: dmeshgate
+namespace: test
+serviceaccount: default
+location: us-central1
+
+socksAddr: 127.0.0.1:1180
+hbone: :15108
+hbonec: :15109
+sni: :15103
+adminport: :15100
+
+# TODO: Duration or use sec
+#connecttimeout: 5s
+
+# localforward are ports on localhost, forwarded to clusters or addresses.
+localforward:
+  # Proxy to Istiod, similar to agent
+  19999: istiod.istio-system.svc:15012
+
+  # mTLS iperf3
+  15201: bob.bob.svc:5201
+
+  # Plain text iperf3
+  15202: bob.bob.svc:5202
+
+# Ports define external listening ports.
+ports:
+  http: "8080"
+
+clusters:
+  bob.bob.svc:5201:
+    addr: 127.0.0.1:5201
+    endpoints:
+      - address: 127.0.0.1:5201
+        hboneaddress: 127.0.0.1:15208
+
+  bob.bob.svc:5202:
+    addr: 127.0.0.1:5202
+    endpoints:
+      - address: 127.0.0.1:5201
+        hboneaddress: 127.0.0.1:15209
+        secure: true
+
+  # If not set, will be loaded from mesh-env in default k8s cluster
+  # The addr should be a gateway address with SNI routing support or hbone
+  xistiod.istio-system.svc:15012:
+    #addr: "-"
+    addr: 34.69.72.163:15012
+    SNI: istiod.istio-system.svc
+
+  h2r:
+    addr: 127.0.0.1:15441
+
+  example.test.svc:8080:
+    id: example.test.svc:8080
+    addr: 1.2.3.4:8080
+
+

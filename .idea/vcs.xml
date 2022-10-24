@@ -5,5 +5,8 @@
     <mapping directory="$PROJECT_DIR$/../cert-ssh" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/../konfig" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/../ugate" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../../istio.io/cloud-run-mesh" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../../src/notes" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../../src/vm" vcs="Git" />
   </component>
 </project>

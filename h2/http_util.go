@@ -389,9 +389,6 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, maxHeaderList
 		fr:     frame.NewFramer(w, r),
 	}
 	f.fr.SetMaxReadFrameSize(maxFrame)
-	// Opt-in to Frame reuse API on framer to reduce garbage.
-	// Frames aren't safe to read from after a subsequent call to ReadFrame.
-	f.fr.SetReuseFrames()
 	f.fr.MaxHeaderListSize = maxHeaderListSize
 	f.fr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
 	return f

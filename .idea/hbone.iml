@@ -8,5 +8,8 @@
     <orderEntry type="module" module-name="krun" />
     <orderEntry type="module" module-name="cert-ssh" />
     <orderEntry type="module" module-name="ugate" />
+    <orderEntry type="module" module-name="vm" />
+    <orderEntry type="module" module-name="notes" />
+    <orderEntry type="module" module-name="cloud-run-mesh" />
   </component>
 </module>

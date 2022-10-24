@@ -27,7 +27,7 @@ type Stats struct {
 var StreamId uint32
 
 var (
-	VarzReadFrom  = expvar.NewInt("ugate.sReadFrom")
-	VarzReadFromC = expvar.NewInt("ugate.cReadFrom")
-	VarzMaxRead   = expvar.NewInt("ugate.maxRead")
+	VarzReadFrom  = expvar.NewInt("nio.sReadFrom")
+	VarzReadFromC = expvar.NewInt("nio.cReadFrom")
+	VarzMaxRead   = expvar.NewInt("nio.maxRead")
 )

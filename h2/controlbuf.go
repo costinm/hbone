@@ -133,6 +133,8 @@ type dataFrame struct {
 	streamID  uint32
 	endStream bool
 	d         []byte
+	start     int
+	end       int
 	// onEachWrite is called every time a part of d is written out.
 	// Used by server to determine activity and not generate pings ?
 	onEachWrite func()
@@ -140,7 +142,8 @@ type dataFrame struct {
 	// Typically per stream or global channel, associated with the stream.
 	// When all bytes from d have been sent, the frame is sent so it can be
 	// recycled and to unblock blocking Write()
-	onDone chan *dataFrame
+	onDone     chan *dataFrame
+	onDoneFunc func([]byte)
 }
 
 func (*dataFrame) isTransportResponseFrame() bool { return false }
@@ -276,6 +279,7 @@ func (l *outStreamList) dequeue() *outStream {
 // It shouldn't be confused with an HTTP2 frame, although some of the control frames
 // like dataFrame and headerFrame do go out on wire as HTTP2 frames.
 type controlBuffer struct {
+	mux             *H2Transport
 	ch              chan struct{}
 	done            <-chan struct{}
 	mu              sync.Mutex
@@ -292,11 +296,12 @@ type controlBuffer struct {
 	trfChan                 atomic.Value // chan struct{}
 }
 
-func newControlBuffer(done <-chan struct{}) *controlBuffer {
+func newControlBuffer(mux *H2Transport, done <-chan struct{}) *controlBuffer {
 	return &controlBuffer{
 		ch:   make(chan struct{}, 1),
 		list: &itemList{},
 		done: done,
+		mux:  mux,
 	}
 }
 
@@ -379,7 +384,7 @@ func (c *controlBuffer) get(block bool) (interface{}, error) {
 			h := c.list.dequeue().(cbItem)
 			if h.isTransportResponseFrame() {
 				if c.transportResponseFrames == maxQueuedTransportResponseFrames {
-					// We are removing the frame that put us over the
+					// We are removing the frame that Put us over the
 					// threshold; close and clear the throttling channel.
 					ch := c.trfChan.Load().(chan struct{})
 					close(ch)
@@ -451,6 +456,7 @@ const (
 // processing a stream, loopy writes out data bytes from this stream capped by the min
 // of http2MaxFrameLen, connection-level flow control and stream-level flow control.
 type loopyWriter struct {
+	mux       *H2Transport
 	side      side
 	cbuf      *controlBuffer
 	sendQuota uint32
@@ -476,9 +482,10 @@ type loopyWriter struct {
 	ssGoAwayHandler func(*goAway) (bool, error)
 }
 
-func newLoopyWriter(s side, fr *framer, cbuf *controlBuffer, bdpEst *bdpEstimator, maxFrameSize uint32) *loopyWriter {
+func newLoopyWriter(h2mux *H2Transport, s side, fr *framer, cbuf *controlBuffer, bdpEst *bdpEstimator, maxFrameSize uint32) *loopyWriter {
 	var buf bytes.Buffer
 	l := &loopyWriter{
+		mux:           h2mux,
 		side:          s,
 		cbuf:          cbuf,
 		sendQuota:     defaultWindowSize,
@@ -504,12 +511,12 @@ const minBatchSize = 1000
 // Loopy keeps all active streams with data to send in a linked-list.
 // All streams in the activeStreams linked-list must have both:
 // 1. Data to send, and
-// 2. Stream level flow control quota available.
+// 2. H2Stream level flow control quota available.
 //
 // In each iteration of run loop, other than processing the incoming control
 // frame, loopy calls processData, which processes one node from the activeStreams linked-list.
 // This results in writing of HTTP2 frames into an underlying write buffer.
-// When there's no more control frames to read from controlBuf, loopy flushes the write buffer.
+// When there's no more control frames to readBlocking from controlBuf, loopy flushes the write buffer.
 // As an optimization, to increase the batch size for each flush, loopy yields the processor, once
 // if the batch size is too low to give stream goroutines a chance to fill it up.
 func (l *loopyWriter) run() (err error) {
@@ -526,6 +533,8 @@ func (l *loopyWriter) run() (err error) {
 		if err = l.handle(it); err != nil {
 			return err
 		}
+
+		// Process pending data frame
 		if _, err = l.processData(); err != nil {
 			return err
 		}
@@ -540,6 +549,7 @@ func (l *loopyWriter) run() (err error) {
 				if err = l.handle(it); err != nil {
 					return err
 				}
+
 				if _, err = l.processData(); err != nil {
 					return err
 				}
@@ -646,12 +656,14 @@ func (l *loopyWriter) headerHandler(h *headerFrame) error {
 
 func (l *loopyWriter) originateStream(str *outStream) error {
 	hdr := str.itl.dequeue().(*headerFrame)
-	if err := hdr.initStream(str.id); err != nil {
-		if err == ErrConnClosing {
-			return err
+	if hdr.initStream != nil {
+		if err := hdr.initStream(str.id); err != nil {
+			if err == ErrConnClosing {
+				return err
+			}
+			// Other errors(errStreamDrain) need not close transport.
+			return nil
 		}
-		// Other errors(errStreamDrain) need not close transport.
-		return nil
 	}
 	if err := l.writeHeader(str.id, hdr.endStream, hdr.hf, hdr.onWrite); err != nil {
 		return err
@@ -771,6 +783,7 @@ func (l *loopyWriter) goAwayHandler(g *goAway) error {
 		}
 		l.draining = draining
 	}
+	l.mux.MuxEvent(Event_GoAway)
 	return nil
 }
 
@@ -827,23 +840,26 @@ func (l *loopyWriter) applySettings(ss []frame.Setting) error {
 	return nil
 }
 
-// processData removes the first stream from active streams, writes out at most 16KB
+// processData removes the first stream from active streams, writes out at most frameSize
 // of its data and then puts it at the end of activeStreams if there's still more data
 // to be sent and stream has some stream-level flow control.
+//
+// returns true if the connection is out of quota - caller will wait for more.
+// returns true of no more active streams - caller will wait for more.
 func (l *loopyWriter) processData() (bool, error) {
 	if l.sendQuota == 0 {
 		return true, nil
 	}
+
 	str := l.activeStreams.dequeue() // Remove the first stream.
 	if str == nil {
 		return true, nil
 	}
+
 	dataItem := str.itl.peek().(*dataFrame) // Peek at the first data item this stream.
+
 	// A data item is represented by a dataFrame, since it later translates into
 	// multiple HTTP2 data frames.
-	// Every dataFrame has two buffers; h that keeps grpc-message header and d that is acutal data.
-	// As an optimization to keep wire traffic low, data from d is copied to h to make as big as the
-	// maximum possilbe HTTP2 frame size.
 
 	if len(dataItem.d) == 0 { // Empty data frame
 		// Client sends out empty data frame with endStream = true
@@ -854,6 +870,10 @@ func (l *loopyWriter) processData() (bool, error) {
 		if dataItem.onDone != nil {
 			dataItem.onDone <- dataItem
 		}
+		if dataItem.onDoneFunc != nil {
+			dataItem.onDoneFunc(dataItem.d)
+		}
+
 		if str.itl.isEmpty() {
 			str.state = empty
 		} else if trailer, ok := str.itl.peek().(*headerFrame); ok { // the next item is trailers.
@@ -868,6 +888,7 @@ func (l *loopyWriter) processData() (bool, error) {
 		}
 		return false, nil
 	}
+
 	var (
 		buf []byte
 	)
@@ -890,27 +911,52 @@ func (l *loopyWriter) processData() (bool, error) {
 
 	// Now that outgoing flow controls are checked we can replenish str's write quota
 	str.wq.replenish(size)
+
 	var endStream bool
 	// If this is the last data message on this stream and all of it can be written in this iteration.
 	if dataItem.endStream && len(dataItem.d) <= size {
 		endStream = true
 	}
+
+	// Update keepalive timers.
 	if dataItem.onEachWrite != nil {
 		dataItem.onEachWrite()
 	}
-	if err := l.framer.fr.WriteData(dataItem.streamID, endStream, buf[:size]); err != nil {
-		return false, err
-	}
-	str.bytesOutStanding += size
-	l.sendQuota -= uint32(size)
-	dataItem.d = dataItem.d[dSize:]
 
-	if len(dataItem.d) == 0 { // All the data from that message was written out.
-		str.itl.dequeue()
-		if dataItem.onDone != nil {
-			dataItem.onDone <- dataItem
+	if dataItem.end != 0 {
+		if err := l.framer.fr.WriteDataNC(dataItem.streamID, endStream, dataItem.d,
+			dataItem.start, dataItem.start+size); err != nil {
+			return false, err
+		}
+		dataItem.start = dataItem.start + size
+
+		str.bytesOutStanding += size
+		l.sendQuota -= uint32(size)
+
+		if dataItem.start >= dataItem.end { // All the data from that message was written out.
+			str.itl.dequeue()
+			if dataItem.onDoneFunc != nil {
+				dataItem.onDoneFunc(dataItem.d)
+			}
+		}
+	} else {
+
+		if err := l.framer.fr.WriteData(dataItem.streamID, endStream, buf[:size]); err != nil {
+			return false, err
+		}
+		dataItem.d = dataItem.d[dSize:]
+
+		str.bytesOutStanding += size
+		l.sendQuota -= uint32(size)
+
+		if len(dataItem.d) == 0 { // All the data from that message was written out.
+			str.itl.dequeue()
+			if dataItem.onDone != nil {
+				dataItem.onDone <- dataItem
+			}
 		}
 	}
+
 	if str.itl.isEmpty() {
 		str.state = empty
 	} else if trailer, ok := str.itl.peek().(*headerFrame); ok { // The next item is trailers.
@@ -922,7 +968,8 @@ func (l *loopyWriter) processData() (bool, error) {
 		}
 	} else if int(l.oiws)-str.bytesOutStanding <= 0 { // Ran out of stream quota.
 		str.state = waitingOnStreamQuota
-	} else { // Otherwise add it back to the list of active streams.
+	} else {
+		// Otherwise add it back to the list of active streams.
 		l.activeStreams.enqueue(str)
 	}
 	return false, nil

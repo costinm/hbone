@@ -4,8 +4,6 @@ import (
 	"sync"
 )
 
-var bufSize = 32 * 1024
-
 // Buffer pool - based on http2/databuffer and valyala/bytebufferpool
 
 // Buffer chunks are allocated from a pool to reduce pressure on GC.
@@ -31,7 +29,7 @@ var (
 	}
 )
 
-func getDataBufferChunk(size int64) []byte {
+func GetDataBufferChunk(size int64) []byte {
 	i := 0
 	for ; i < len(dataChunkSizeClasses)-1; i++ {
 		if size <= int64(dataChunkSizeClasses[i]) {
@@ -41,7 +39,7 @@ func getDataBufferChunk(size int64) []byte {
 	return dataChunkPools[i].Get().([]byte)
 }
 
-func putDataBufferChunk(p []byte) {
+func PutDataBufferChunk(p []byte) {
 	for i, n := range dataChunkSizeClasses {
 		if len(p) == n {
 			dataChunkPools[i].Put(p)
@@ -49,6 +47,8 @@ func putDataBufferChunk(p []byte) {
 		}
 	}
 }
+
+// Old style buffer pool
 
 var (
 	// createBuffer to get a buffer. io.Copy uses 32k.
@@ -63,6 +63,9 @@ func GetBuffer() *Buffer {
 	return ioPool.GetBuffer()
 }
 
+// Default buffer size for the io pool
+var bufSize = 32 * 1024
+
 var ioPool = &BufferPool{
 	pool: sync.Pool{New: func() interface{} {
 		// Should hold a TLS handshake message
@@ -76,14 +79,9 @@ type BufferPool struct {
 	pool sync.Pool
 }
 
-func (*BufferPool) Read([]byte) (int, error) {
-	return 0, nil
-}
-
 func (bp *BufferPool) GetBuffer() *Buffer {
 	br := bp.pool.Get().(*Buffer)
 	br.off = 0
 	br.end = 0
-	br.Reader = nil
 	return br
 }

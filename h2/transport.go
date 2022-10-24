@@ -16,1081 +16,1166 @@
  *
  */
 
-// Package transport defines and implements message oriented communication
-// channel to complete various transactions (e.g., an RPC).  It is meant for
-// grpc-internal usage and is not intended to be imported directly by users.
 package h2
 
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	http2 "github.com/costinm/hbone/h2/frame"
+	"github.com/costinm/hbone/h2/frame"
+	"github.com/costinm/hbone/h2/grpcutil"
+	"github.com/costinm/hbone/h2/hpack"
 	"github.com/costinm/hbone/nio"
 )
 
-const logLevel = 2
-
-type bufferPool struct {
-	pool sync.Pool
-}
-
-func newBufferPool() *bufferPool {
-	return &bufferPool{
-		pool: sync.Pool{
-			New: func() interface{} {
-				return new(bytes.Buffer)
-			},
-		},
-	}
-}
-
-func (p *bufferPool) get() *bytes.Buffer {
-	return p.pool.Get().(*bytes.Buffer)
-}
-
-func (p *bufferPool) put(b *bytes.Buffer) {
-	p.pool.Put(b)
-}
-
-// recvMsg represents the received msg from the transport. All transport
-// protocol specific info has been removed.
-type recvMsg struct {
-	buffer *bytes.Buffer
-	// nil: received some data
-	// io.EOF: stream is completed. data is nil.
-	// other non-nil error: transport failure. data is nil.
-	err error
-}
-
-// recvBuffer is an unbounded channel of recvMsg structs.
-// It can grow up to window size - flow control protects it.
-//
-// Note: recvBuffer differs from buffer.Unbounded only in the fact that it
-// holds a channel of recvMsg structs instead of objects implementing "item"
-// interface. recvBuffer is written to much more often and using strict recvMsg
-// structs helps avoid allocation in "recvBuffer.put"
-type recvBuffer struct {
-	c       chan recvMsg
-	mu      sync.Mutex
-	backlog []recvMsg
-
-	// err is set when a buffer with that error is put. backlog may have additional data,
-	// but no new data will be received
-	err error
-}
-
-func newRecvBuffer() *recvBuffer {
-	b := &recvBuffer{
-		c: make(chan recvMsg, 4),
-	}
-	return b
-}
-
-func (b *recvBuffer) put(r recvMsg) {
-	b.mu.Lock()
-	if b.err != nil {
-		b.mu.Unlock()
-		// An error had occurred earlier, don't accept more
-		// data or errors.
-		return
-	}
-	b.err = r.err
-	if len(b.backlog) == 0 {
-		select {
-		case b.c <- r:
-			b.mu.Unlock()
-			return
-		default:
-		}
-	}
-	b.backlog = append(b.backlog, r)
-	b.mu.Unlock()
-}
-
-// load will send the first item from the backlog to the channel
-func (b *recvBuffer) load() {
-	b.mu.Lock()
-	if len(b.backlog) > 0 {
-		select {
-		case b.c <- b.backlog[0]:
-			b.backlog[0] = recvMsg{}
-			b.backlog = b.backlog[1:]
-		default:
-		}
-	}
-	b.mu.Unlock()
-}
-
-// get returns the channel that receives a recvMsg in the buffer.
-//
-// Upon receipt of a recvMsg, the caller should call load to send another
-// recvMsg onto the channel if there is any.
-func (b *recvBuffer) get() <-chan recvMsg {
-	return b.c
-}
-
-// recvBufferReader implements io.Reader interface to read the data from
-// recvBuffer.
-type recvBufferReader struct {
-	closeStream func(error) // Closes the client transport stream with the given error and nil trailer metadata.
-	ctx         context.Context
-	ctxDone     <-chan struct{} // cache of ctx.Done() (for performance).
-
-	// recvMsg from the IO thread.
-	recv *recvBuffer
-
-	last *bytes.Buffer // Stores the remaining data in the previous calls.
-
-	freeBuffer func(*bytes.Buffer)
-}
-
-// Read reads the next len(p) bytes from last. If last is drained, it tries to
-// read additional data from recv. It blocks if there no additional data available
-// in recv. If Read returns any non-nil error, it will continue to return that error.
-func (r *recvBufferReader) Read(p []byte) (n int, err error) {
-	copied := 0
-	if r.last != nil {
-		// Read remaining data left in last call.
-		copied, _ = r.last.Read(p)
-		if r.last.Len() == 0 {
-			r.freeBuffer(r.last)
-			r.last = nil
-		}
-		if copied == len(p) {
-			return copied, nil
-		}
-	}
-	// copy more data if already received and space in the p
-	more := true
-	for copied < len(p) && more {
-		select {
-		case m := <-r.recv.get():
-			r.recv.load() // so r.recv works
-
-			if m.buffer != nil {
-				copied1, _ := m.buffer.Read(p[copied:])
-				if m.buffer.Len() == 0 {
-					r.freeBuffer(m.buffer)
-					r.last = nil
-				} else {
-					r.last = m.buffer
-					copied += copied1
-					break // we filled the buffer
-				}
-				copied += copied1
-				if copied == len(p) {
-					return copied, nil
-				}
-			}
-			continue
-		default:
-			more = false
-			break
-		}
-	}
-
-	if copied > 0 || copied == len(p) {
-		return copied, nil
-	}
-
-	// Done with the backlog, we'll not get any more data.
-	if r.recv.err != nil {
-		return copied, r.recv.err
-	}
-	//rc := s.getReadClosed()
-	//if rc != 0 {
-	//	if rc == 1 {
-	//		return 0, io.EOF
-	//	}
-	//	return 0, errStreamRST
-	//}
-
-	if r.closeStream != nil {
-		n, _ = r.readClient(p[copied:])
-	} else {
-		n, _ = r.read(p[copied:])
-	}
-	if copied+n > 0 {
-		return copied + n, nil
-	} else {
-		return 0, r.recv.err
-	}
-}
-
-// used in h2 server, blocks
-func (r *recvBufferReader) read(p []byte) (n int, err error) {
-	select {
-	case <-r.ctxDone:
-		return 0, ContextErr(r.ctx.Err())
-	case m := <-r.recv.get():
-		return r.readAdditional(m, p)
-	}
-}
-
-// used in h2 client - closeStream is set to send FIN/RST on the other side
-func (r *recvBufferReader) readClient(p []byte) (n int, err error) {
-	// If the context is canceled, then closes the stream with nil metadata.
-	// closeStream writes its error parameter to r.recv as a recvMsg.
-	// r.readAdditional acts on that message and returns the necessary error.
-	select {
-	case <-r.ctxDone:
-		// Note that this adds the ctx error to the end of recv buffer, and
-		// reads from the head. This will delay the error until recv buffer is
-		// empty, thus will delay ctx cancellation in Recv().
-		//
-		// It's done this way to fix a race between ctx cancel and trailer. The
-		// race was, stream.Recv() may return ctx error if ctxDone wins the
-		// race, but stream.Trailer() may return a non-nil md because the stream
-		// was not marked as done when trailer is received. This closeStream
-		// call will mark stream as done, thus fix the race.
-		//
-		// TODO: delaying ctx error seems like a unnecessary side effect. What
-		// we really want is to mark the stream as done, and return ctx error
-		// faster.
-		r.closeStream(ContextErr(r.ctx.Err()))
-		//m := <-r.recv.get()
-		//return r.readAdditional(m, p)
-		return 0, r.ctx.Err()
-	case m := <-r.recv.get():
-		if m.err != nil {
-			log.Println("readClient ", m.err)
-		}
-		return r.readAdditional(m, p)
-	}
-}
-
-func (r *recvBufferReader) readAdditional(m recvMsg, p []byte) (n int, err error) {
-	r.recv.load()
-	if m.err != nil {
-		return 0, m.err
-	}
-	copied, _ := m.buffer.Read(p)
-	if m.buffer.Len() == 0 {
-		r.freeBuffer(m.buffer)
-		r.last = nil
-	} else {
-		r.last = m.buffer
-	}
-	return copied, nil
-}
-
-type streamState uint32
-
-const (
-	streamActive streamState = iota
-	streamDone               // the entire stream is finished.
-)
-
-// Stream represents an RPC in the transport layer.
-type Stream struct {
-	Id uint32
-
-	st *HTTP2ServerMux // nil for client side Stream
-	ct *HTTP2ClientMux // nil for server side Stream
-
-	ctx    context.Context // the associated context of the stream
-	cancel context.CancelFunc
-
-	done     chan struct{}   // closed at the end of stream to unblock writers. On the client side.
-	DoneFunc func(*Stream)   // invoked at the end of stream on client side.
-	ctxDone  <-chan struct{} // same as done chan but for server side. Cache of ctx.Done() (for performance)
-
-	Path string // the associated RPC Path of the stream.
-
-	recvCompress string
-	//sendCompress string
-
-	// List of DATA frame bufferss received, channel to get more (blocking)
-	buf *recvBuffer
-
-	trReader *transportReader
-	fc       *inFlow
-	wq       *writeQuota
-
-	// Callback to state application's intentions to read data. This
-	// is used to adjust flow control, if needed.
-	requestRead func(int)
-
-	writeDoneChan       chan *dataFrame
-	writeDoneChanClosed uint32
-
-	headerChan       chan struct{} // closed to indicate the end of header metadata.
-	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
-
-	// headerValid indicates whether a valid header was received.  Only
-	// meaningful after headerChan is closed (always call waitOnHeader() before
-	// reading its value).  Not valid on server side.
-	headerValid bool
-
-	// hdrMu protects header and trailer metadata on the server-side.
-	hdrMu sync.Mutex
-
-	Request  *http.Request
-	Response *http.Response
-
-	noHeaders bool // set if the client never received headers (set only after the stream is done).
-
-	// On the server-side, headerSent is atomically set to 1 when the headers are sent out.
-	headerSent uint32
-
-	// Old state - doesn't work if read/write can be closed independently.
-	state streamState
-
-	// A stream may still be in used when read and write are closed - client or server may process
-	// headers.
-
-	// Set when FIN or RST received. No frame should be received after.
-	// Also set after a trailer header
-	readClosed uint32
-
-	// Set when FIN or RST were sent. No frame should be written after.
-	// Also set after sending a trailer.
-	writeClosed uint32
-
-	// Set when the trailer head is received. Data also available in Response.Trailers
-	Status *Status
-
-	bytesReceived uint32 // indicates whether any bytes have been received on this stream
-	unprocessed   uint32 // set if the server sends a refused stream or GOAWAY including this stream
-
-	readDeadline  time.Time
-	writeDeadline time.Time
-
-	// grpc is set if the stream is working in grpc mode, based on content type.
-	// Close will use trailer instead of end data, ordering of headers.
-	grpc bool
-
-	nio.Stats
-}
-
-func (s *Stream) Header() http.Header {
-	return s.Response.Header
-}
-
-func (s *Stream) WriteHeader(statusCode int) {
-	s.Response.Status = strconv.Itoa(statusCode)
-
-	if !s.isHeaderSent() { // Headers haven't been written yet.
-		if s.st != nil {
-			if err := s.st.WriteHeader(s); err != nil {
-				log.Println("WriteHeader", err)
-				return
-			}
-		} else {
-			s.ct.Dial(s.Request)
-		}
-	}
-	// for request it's part of Dial/RoundTrip
-}
-
-// CloseError will close the stream with an error code.
-// This will result in a RST sent, reader will be closed as well.
-//
-// Will unblock Read and Write and cancel the stream context.
-func (s *Stream) CloseError(code uint32) {
-	// On error we remove the stream from active.
-	// In and out are also closed, s is canceled
-	if s.st != nil {
-		s.st.closeStream(s, true, http2.ErrCode(code), true)
-	} else {
-		s.ct.closeStream(s, nil, true, http2.ErrCode(code), nil, nil, true)
-	}
-}
-
-// TCP/IP shutdown allows control over closing the stream:
-//   - 0 unblock read() with err, in TCP any further received data is rejected with RST
-//     but if we received a FIN - all is good.
-//   - 1 same with CloseWrite()
-//   - 2 both directions.
-
-// Close() is one of the most complicated methods for H2 and TCP.
-//
-// Recommended close:
-//   - CloseWrite will send a FIN (data frame or trailer headers). Read continues
-//     until it receives FIN, at which point stream is closed. Close() is called internally.
-//   - CloseError will send a RST explicitly, with the given code. Read is closed as well,
-//     and Close() is called internally.
-//
-// Repeated calls to Close() have no effects.
-//
-// Unfortunately many net.Conn users treat Close() as CloseWrite() - since there
-// is no explicit method. TLS Conn does send closeNotify, and TCP Conn appears to
-// also send FIN. RST in TCP is only sent if data is received after close().
-//
-// The expectation is that Read() will also be unblocked by Close, if EOF not already
-// received - but it should not return EOF since it's not the real cause. Like
-// os close, there is no lingering by default.
-//
-// net.Close doc: Close closes the connection.
-// Any blocked Read or Write operations will be unblocked and return errors.
-func (s *Stream) Close() error {
-	// Send a END_STREAM (if not already sent)
-
-	// TODO: if write buffers are not empty, still send RST, empty write buf and unblock.
-	if s.st == nil {
-		log.Println("Client Stream Read Close()", s.Id)
-
-		s.ct.Write(s, nil, nil, true)
-
-		s.ct.CloseStream(s, nil)
-	} else {
-		log.Println("Server stream Close()", s.Id)
-		s.CloseWrite()
-
-		s.st.closeStream(s, false, http2.ErrCode(0), true)
-	}
-
-	s.setReadClosed(2)
-
-	// Will unblock reads/write waiting
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	// Unblock writes waiting to send
-	if s.writeDoneChanClosed == 0 {
-		s.writeDoneChanClosed = 1
-		select {
-		case s.writeDoneChan <- nil:
-		default:
-		}
-	}
-	return nil
-}
-
-// Return the underlying connection ( typically tcp ), for remote addr or other things.
-func (s *Stream) Conn() net.Conn {
-	if s.st == nil {
-		return s.ct.conn
-	}
-	return s.st.conn
-}
-
-func (s *Stream) Write(d []byte) (int, error) {
-	if s.st == nil {
-		// Client mode, RoundTrip with request Body
-		err := s.ct.Write(s, nil, d, false)
-		if err != nil {
-			return 0, err
-		}
-		return len(d), err
-	}
-	err := s.st.Write(s, nil, d, false)
-	if err != nil {
-		return 0, err
-	}
-	return len(d), err
-}
-
-// Normal write close.
-//
-// Client: send FIN
-// Server: send trailers and FIN
-func (s *Stream) CloseWrite() error {
-
-	if s.st == nil {
-		// Client mode, RoundTrip with request Body
-		if nio.Debug {
-			log.Println("Client sends CloseWrite()", s.Id)
-		}
-		return s.ct.Write(s, nil, nil, true)
-	}
-	if !s.updateHeaderSent() { // No headers have been sent.
-		if err := s.st.writeHeaderLocked(s); err != nil {
-			s.hdrMu.Unlock()
-			return err
-		}
-	}
-
-	// TODO: use this only if trailer are present
-	if len(s.Response.Trailer) > 0 {
-		if nio.Debug {
-			log.Println("Server sends CloseWrite() with trailer", s.Id)
-		}
-		return s.st.writeStatus(s)
-	} else {
-		if nio.Debug {
-			log.Println("Server sends CloseWrite()", s.Id)
-		}
-		return s.st.Write(s, nil, nil, true)
-	}
-}
-
-// isHeaderSent is only valid on the server-side.
-func (s *Stream) isHeaderSent() bool {
-	return atomic.LoadUint32(&s.headerSent) == 1
-}
-
-// updateHeaderSent updates headerSent and returns true
-func (s *Stream) updateHeaderSent() bool {
-	return atomic.SwapUint32(&s.headerSent, 1) == 1
-}
-
-func (s *Stream) swapState(st streamState) streamState {
-	return streamState(atomic.SwapUint32((*uint32)(&s.state), uint32(st)))
-}
-
-func (s *Stream) setReadClosed(mode uint32) bool {
-	return atomic.SwapUint32(&s.readClosed, mode) == mode
-}
-
-func (s *Stream) setWriteClosed(mode uint32) bool {
-	return atomic.SwapUint32(&s.writeClosed, 1) == 1
-}
-
-func (s *Stream) getWriteClosed() uint32 {
-	return atomic.LoadUint32((*uint32)(&s.writeClosed))
-}
-
-func (s *Stream) getReadClosed() uint32 {
-	return atomic.LoadUint32((*uint32)(&s.readClosed))
-}
-
-func (s *Stream) getState() streamState {
-	return streamState(atomic.LoadUint32((*uint32)(&s.state)))
-}
-
-func (s *Stream) waitOnHeader() {
-	if s.headerChan == nil {
-		// On the server headerChan is always nil since a stream originates
-		// only after having received headers.
-		return
-	}
-	select {
-	case <-s.ctx.Done():
-		// Close the stream to prevent headers/trailers from changing after
-		// this function returns.
-		s.ct.CloseStream(s, ContextErr(s.ctx.Err()))
-		// headerChan could possibly not be closed yet if closeStream raced
-		// with operateHeaders; wait until it is closed explicitly here.
-		<-s.headerChan
-	case <-s.headerChan:
-	}
-}
-
-// Done returns a channel which is closed when it receives the final status
-// from the server.
-func (s *Stream) Done() <-chan struct{} {
-	return s.done
-}
-
-// Context returns the context of the stream.
-func (s *Stream) Context() context.Context {
-	return s.ctx
-}
-
-// Called when data frames are received (with a COPY of the data !!)
-func (s *Stream) queueReadBuf(m recvMsg) {
-	s.buf.put(m)
-}
-
-func (s *Stream) LocalAddr() net.Addr {
-	return s.Conn().LocalAddr()
-}
-
-func (s *Stream) RemoteAddr() net.Addr {
-	return s.Conn().RemoteAddr()
-}
-
-func (s *Stream) SetDeadline(t time.Time) error {
-	return nil
-}
-func (s *Stream) SetReadDeadline(t time.Time) error {
-	s.readDeadline = t
-	return nil
-}
-func (s *Stream) SetWriteDeadline(t time.Time) error {
-	s.writeDeadline = t
-	return nil
-}
-
-// Read reads all p bytes from the wire for this stream.
-func (s *Stream) Read(p []byte) (n int, err error) {
-	// effectively t.adjustWindow(len(p)).
-	// This is clearly not right - read may be smaller.
-	// TODO(costin): fix, in gRPC Read reads the full p !
-	//s.requestRead(len(p))
-	return s.trReader.Read(p)
-}
-
-type h2transport interface {
-	updateWindow(*Stream, uint32)
-}
-
-// tranportReader reads all the data available for this Stream from the transport and
-// passes them into the decoder, which converts them into a gRPC message stream.
-// The error is io.EOF when the stream is done or another non-nil error if
-// the stream broke.
-type transportReader struct {
-	s      *Stream
-	reader *recvBufferReader
-
-	// The handler to control the window update procedure for both this
-	// particular stream and the associated transport.
-	windowHandler h2transport
-}
-
-func (t *transportReader) Read(p []byte) (n int, err error) {
-	n, err = t.reader.Read(p)
-	if n > 0 {
-		t.windowHandler.updateWindow(t.s, uint32(n))
-	}
-	return
-}
-
-// BytesReceived indicates whether any bytes have been received on this stream.
-func (s *Stream) BytesReceived() bool {
-	return atomic.LoadUint32(&s.bytesReceived) == 1
-}
-
-// Unprocessed indicates whether the server did not process this stream --
-// i.e. it sent a refused stream or GOAWAY including this stream ID.
-func (s *Stream) Unprocessed() bool {
-	return atomic.LoadUint32(&s.unprocessed) == 1
-}
-
-// GoString is implemented by Stream so context.String() won't
-// race when printing %#v.
-func (s *Stream) GoString() string {
-	return fmt.Sprintf("<stream: %p, %v>", s, s.Request.URL)
-}
-
-// state of transport
-type transportState int
-
-const (
-	reachable transportState = iota
-	closing
-	draining
-)
-
-// ServerConfig consists of all the configurations to establish a server transport.
-type ServerConfig struct {
-	MaxStreams            uint32
-	MaxFrameSize          uint32
-	KeepaliveParams       ServerParameters
-	KeepalivePolicy       EnforcementPolicy
-	InitialWindowSize     int32
-	InitialConnWindowSize int32
-	WriteBufferSize       int
-	ReadBufferSize        int
-	MaxHeaderListSize     *uint32
-	HeaderTableSize       *uint32
-}
-
-// ConnectOptions covers all relevant options for communicating with the server.
-type ConnectOptions struct {
-	// UserAgent is the application user agent.
-	UserAgent string
-	// Dialer specifies how to dial a network address.
-	Dialer func(context.Context, string) (net.Conn, error)
-	// FailOnNonTempDialError specifies if gRPC fails on non-temporary dial errors.
-	FailOnNonTempDialError bool
-	// KeepaliveParams stores the keepalive parameters.
-	KeepaliveParams ClientParameters
-	// InitialWindowSize sets the initial window size for a stream.
-	InitialWindowSize int32
-	// InitialConnWindowSize sets the initial window size for a connection.
-	InitialConnWindowSize int32
-	// WriteBufferSize sets the size of write buffer which in turn determines how much data can be batched before it's written on the wire.
-	WriteBufferSize int
-	// ReadBufferSize sets the size of read buffer, which in turn determines how much data can be read at most for one read syscall.
-	ReadBufferSize int
-	// MaxHeaderListSize sets the max (uncompressed) size of header list that is prepared to be received.
-	MaxHeaderListSize *uint32
-
-	MaxFrameSize uint32
-
-	// UseProxy specifies if a proxy should be used.
-	UseProxy bool
-}
-
-// ClientParameters is used to set keepalive parameters on the client-side.
-// These configure how the client will actively probe to notice when a
-// connection is broken and send pings so intermediaries will be aware of the
-// liveness of the connection. Make sure these parameters are set in
-// coordination with the keepalive policy on the server, as incompatible
-// settings can result in closing of connection.
-type ClientParameters struct {
-	// After a duration of this time if the client doesn't see any activity it
-	// pings the server to see if the transport is still alive.
-	// If set below 10s, a minimum value of 10s will be used instead.
-	Time time.Duration // The current default value is infinity.
-	// After having pinged for keepalive check, the client waits for a duration
-	// of Timeout and if no activity is seen even after that the connection is
-	// closed.
-	Timeout time.Duration // The current default value is 20 seconds.
-	// If true, client sends keepalive pings even with no active RPCs. If false,
-	// when there are no active RPCs, Time and Timeout will be ignored and no
-	// keepalive pings will be sent.
-	PermitWithoutStream bool // false by default.
-}
-
-// ServerParameters is used to set keepalive and max-age parameters on the
-// server-side.
-type ServerParameters struct {
-	// MaxConnectionIdle is a duration for the amount of time after which an
-	// idle connection would be closed by sending a GoAway. Idleness duration is
-	// defined since the most recent time the number of outstanding RPCs became
-	// zero or the connection establishment.
-	MaxConnectionIdle time.Duration // The current default value is infinity.
-	// MaxConnectionAge is a duration for the maximum amount of time a
-	// connection may exist before it will be closed by sending a GoAway. A
-	// random jitter of +/-10% will be added to MaxConnectionAge to spread out
-	// connection storms.
-	MaxConnectionAge time.Duration // The current default value is infinity.
-	// MaxConnectionAgeGrace is an additive period after MaxConnectionAge after
-	// which the connection will be forcibly closed.
-	MaxConnectionAgeGrace time.Duration // The current default value is infinity.
-	// After a duration of this time if the server doesn't see any activity it
-	// pings the client to see if the transport is still alive.
-	// If set below 1s, a minimum value of 1s will be used instead.
-	Time time.Duration // The current default value is 2 hours.
-	// After having pinged for keepalive check, the server waits for a duration
-	// of Timeout and if no activity is seen even after that the connection is
-	// closed.
-	Timeout time.Duration // The current default value is 20 seconds.
-}
-
-// EnforcementPolicy is used to set keepalive enforcement policy on the
-// server-side. Server will close connection with a client that violates this
-// policy.
-type EnforcementPolicy struct {
-	// MinTime is the minimum amount of time a client should wait before sending
-	// a keepalive ping.
-	MinTime time.Duration // The current default value is 5 minutes.
-	// If true, server allows keepalive pings even when there are no active
-	// streams(RPCs). If false, and client sends ping when there are no active
-	// streams, server will send GOAWAY and close the connection.
-	PermitWithoutStream bool // false by default.
-}
-
-// Options provides additional hints and information for message
-// transmission.
-type Options struct {
-	// Last indicates whether this write is the last piece for
-	// this stream.
-	Last bool
-}
-
-// CallHdr carries the information of a particular RPC.
-type CallHdr struct {
-	Req *http.Request
-
-	DoneFunc func() // called when the stream is finished
-}
-
-// connectionErrorf creates an ConnectionError with the specified error description.
-func connectionErrorf(temp bool, e error, format string, a ...interface{}) ConnectionError {
-	return ConnectionError{
-		Desc: fmt.Sprintf(format, a...),
-		temp: temp,
-		err:  e,
-	}
-}
-
-// ConnectionError is an error that results in the termination of the
-// entire connection and the retry of all the active streams.
-type ConnectionError struct {
-	Desc string
-	temp bool
-	err  error
-}
-
-func (e ConnectionError) Error() string {
-	return fmt.Sprintf("connection error: desc = %q", e.Desc)
-}
-
-// Temporary indicates if this connection error is temporary or fatal.
-func (e ConnectionError) Temporary() bool {
-	return e.temp
-}
-
-// Origin returns the original error of this connection error.
-func (e ConnectionError) Origin() error {
-	// Never return nil error here.
-	// If the original error is nil, return itself.
-	if e.err == nil {
-		return e
-	}
-	return e.err
-}
-
-// Unwrap returns the original error of this connection error or nil when the
-// origin is nil.
-func (e ConnectionError) Unwrap() error {
-	return e.err
-}
-
-var (
-	// ErrConnClosing indicates that the transport is closing.
-	ErrConnClosing = connectionErrorf(true, nil, "transport is closing")
-	// errStreamDrain indicates that the stream is rejected because the
-	// connection is draining. This could be caused by goaway or balancer
-	// removing the address.
-	errStreamDrain = &Status{Code: int(Unavailable), Message: "the connection is draining"}
-	// errStreamDone is returned from write at the client side to indiacte application
-	// layer of an error.
-	errStreamDone = errors.New("the stream is done")
-	errStreamRST  = errors.New("the stream is RST")
-	// StatusGoAway indicates that the server sent a GOAWAY that included this
-	// stream's ID in unprocessed RPCs.
-	statusGoAway = &Status{Code: int(Unavailable), Message: "the stream is rejected because server is draining the connection"}
-)
-
-// GoAwayReason contains the reason for the GoAway frame received.
-type GoAwayReason uint8
-
-const (
-	// GoAwayInvalid indicates that no GoAway frame is received.
-	GoAwayInvalid GoAwayReason = 0
-	// GoAwayNoReason is the default value when GoAway frame is received.
-	GoAwayNoReason GoAwayReason = 1
-	// GoAwayTooManyPings indicates that a GoAway frame with
-	// ErrCodeEnhanceYourCalm was received and that the debug data said
-	// "too_many_pings".
-	GoAwayTooManyPings GoAwayReason = 2
-)
-
-// channelzData is used to store channelz related data for HTTP2ClientMux and HTTP2ServerMux.
-// These fields cannot be embedded in the original structs (e.g. HTTP2ClientMux), since to do atomic
-// operation on int64 variable on 32-bit machine, user is responsible to enforce memory alignment.
-// Here, by grouping those int64 fields inside a struct, we are enforcing the alignment.
-type channelzData struct {
-	kpCount int64
+// clientConnectionCounter counts the number of connections a client has
+// initiated (equal to the number of http2Clients created). Must be accessed
+// atomically.
+var clientConnectionCounter uint64
+
+// H2Transport handles one TCP/TLS connection with a peer, implementing
+// client and server H2Streams. The goal is to support the full HTTPTransport.
+type H2Transport struct {
+	// Time when last frame was received.
+	LastRead int64 // Keep this field 64-bit aligned. Accessed atomically.
+
+	//kpCount  int64
 	// The number of streams that have started, including already finished ones.
-	streamsStarted int64
-	// Client side: The number of streams that have ended successfully by receiving
-	// EoS bit set frame from server.
-	// Server side: The number of streams that have ended successfully by sending
-	// frame with EoS bit set.
+	streamsStarted   int64
 	streamsSucceeded int64
 	streamsFailed    int64
 	// lastStreamCreatedTime stores the timestamp that the last stream gets created. It is of int64 type
 	// instead of time.Time since it's more costly to atomically update time.Time variable than int64
 	// variable. The same goes for lastMsgSentTime and lastMsgRecvTime.
-	lastStreamCreatedTime int64
-	msgSent               int64
-	msgRecv               int64
-	lastMsgSentTime       int64
-	lastMsgRecvTime       int64
+	LastStreamCreatedTime int64
+	// For framed, long-lived protocols (grpc, websocket) - keeps track of the frames.
+	// For streams - keeps track of Data frames
+	msgSent         int64
+	msgRecv         int64
+	lastMsgSentTime int64
+	lastMsgRecvTime int64
+
+	connectionID uint64
+	streamQuota  int64
+
+	// idle is the time instant when the connection went idle.
+	// This is either the beginning of the connection or when the number of
+	// RPCs go down to 0.
+	// When the connection is busy, this value is set to 0.
+	idle  time.Time
+	start time.Time
+
+	//
+	mu                sync.Mutex
+	initialWindowSize int32
+	activeStreams     map[uint32]*H2Stream
+
+	conn   net.Conn // underlying communication channel
+	ctx    context.Context
+	cancel context.CancelFunc
+	loopy  *loopyWriter
+
+	// Similar to net.http structure.
+	readerDone chan struct{} // sync point to enable testing.
+	writerDone chan struct{} // sync point to enable testing.
+	framer     *framer
+	// controlBuf delivers all the control related tasks (e.g., window
+	// updates, reset streams, and various settings) to the controller.
+	controlBuf *controlBuffer
+	done       chan struct{}
+	fc         *trInFlow
+	bdpEst     *bdpEstimator
+	bufferPool *bufferPool
+
+	streamsQuotaAvailable chan struct{}
+	waitingStreams        uint32
+
+	// configured by peer through SETTINGS_MAX_HEADER_LIST_SIZE
+	maxSendHeaderListSize *uint32
+
+	FrameSize    uint32
+	PeerSettings *frame.SettingsFrame
+
+	closing bool
+	closed  bool
+
+	Events
+
+	Handle   func(*H2Stream)
+	TraceCtx func(context.Context, string) context.Context
+
+	// ============= Server specific ====================
+	// maxStreamMu guards the maximum stream WorkloadID
+	// This lock may not be taken if mu is already held.
+	maxStreamMu sync.Mutex
+	maxStreamID uint32 // max stream WorkloadID ever seen
+	// The max number of concurrent streams.
+	maxStreams uint32
+
+	// Keepalive and max-age parameters for the server.
+	kp ServerParameters
+	// Keepalive enforcement policy.
+	kep EnforcementPolicy
+	// The time instance last ping was received.
+	lastPingAt time.Time
+	// Number of times the client has violated keepalive ping policy so far.
+	pingStrikes uint8
+	// Flag to signify that number of ping strikes should be reset to 0.
+	// This is set whenever data or header frames are sent.
+	// 1 means yes.
+	resetPingStrikes uint32 // Accessed atomically.
+
+	// drainChan is initialized when Drain() is called the first time.
+	// After which the server writes out the first GoAway(with WorkloadID 2^31-1) frame.
+	// Then an independent goroutine will be launched to later send the second GoAway.
+	// During this time we don't want to write another first GoAway(with WorkloadID 2^31 -1) frame.
+	// Thus call to Drain() will be a no-op if drainChan is already initialized since draining is
+	// already underway.
+	drainChan chan struct{}
+
+	// ======== Client specific
+	nextID uint32
+	// goAway is closed to notify the upper layer (i.e., addrConn.transportMonitor)
+	// that the server sent GoAway on this transport.
+	goAway chan struct{}
+	// A condition variable used to signal when the keepalive goroutine should
+	// go dormant. The condition for dormancy is based on the number of active
+	// streams and the `PermitWithoutStream` keepalive client parameter. And
+	// since the number of active streams is guarded by the above mutex, we use
+	// the same for this condition variable as well.
+	kpDormancyCond *sync.Cond
+	// A boolean to track whether the keepalive goroutine is dormant or not.
+	// This is checked before attempting to signal the above condition
+	// variable.
+	kpDormant bool
+	onClose   func()
+
+	// Error causing the close of the transport
+	Error error
+	opts  *H2Config
+
+	// Time of the accept() or tcp.RoundTripStart()
+	MuxConnStart time.Time
 }
 
-// ContextErr converts the error from context package into a status error.
-func ContextErr(err error) error {
-	switch err {
-	case context.DeadlineExceeded:
-		return &Status{Code: int(DeadlineExceeded), Message: err.Error()}
-	case context.Canceled:
-		return &Status{Code: int(Canceled), Message: err.Error()}
+// HTTP2ClientMux implements the ClientTransport interface with HTTP2.
+type HTTP2ClientMux struct {
+	H2Transport
+	userAgent string
+
+	// The scheme used: https if TLS is on, http otherwise.
+	scheme string
+
+	isSecure bool
+
+	KeepaliveParams  ClientParameters
+	keepaliveEnabled bool
+
+	onGoAway func(GoAwayReason)
+
+	maxConcurrentStreams uint32
+
+	// prevGoAway WorkloadID records the Last-H2Stream-WorkloadID in the previous GOAway frame.
+	prevGoAwayID uint32
+	// goAwayReason records the http2.ErrCode and debug data received with the
+	// GoAway frame.
+	goAwayReason GoAwayReason
+	// goAwayDebugMessage contains a detailed human readable string about a
+	// GoAway frame, useful for error messages.
+	goAwayDebugMessage string
+}
+
+// newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
+// and starts to receive messages on it. Non-nil error returns if construction
+// fails.
+func NewHTTP2Client(ctx context.Context, opts H2Config,
+		onGoAway func(GoAwayReason), onClose func()) (_ *HTTP2ClientMux, err error) {
+	scheme := "http"
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	kp := opts.KeepaliveParams
+	// Validate keepalive parameters.
+	if kp.Time == 0 {
+		kp.Time = defaultClientKeepaliveTime
 	}
-	return &Status{Code: int(Internal), Message: fmt.Sprintf("Unexpected error from context packet: %v", err)}
+	if kp.Timeout == 0 {
+		kp.Timeout = defaultClientKeepaliveTimeout
+	}
+	keepaliveEnabled := false
+	if kp.Time != infinity {
+		//if err = syscall.SetTCPUserTimeout(conn, kp.Timeout); err != nil {
+		//	return nil, connectionErrorf(false, err, "transport: failed to set TCP_USER_TIMEOUT: %v", err)
+		//}
+		keepaliveEnabled = true
+	}
+	isSecure := true
+	//var (
+	//	authInfo credentials.AuthInfo
+	//)
+	//perRPCCreds := opts.PerRPCCredentials
+
+	dynamicWindow := true
+	icwz := int32(initialWindowSize)
+	if opts.InitialConnWindowSize >= defaultWindowSize {
+		icwz = opts.InitialConnWindowSize
+		dynamicWindow = false
+	}
+	done := make(chan struct{})
+	h2m := H2Transport{
+		ctx:                   ctx,
+		readerDone:            make(chan struct{}),
+		writerDone:            make(chan struct{}),
+		fc:                    &trInFlow{limit: uint32(icwz)},
+		done:                  done,
+		initialWindowSize:     initialWindowSize,
+		activeStreams:         make(map[uint32]*H2Stream),
+		bufferPool:            newBufferPool(),
+		idle:                  time.Now(),
+		start:                 time.Now(),
+		streamQuota:           defaultMaxStreamsClient,
+		streamsQuotaAvailable: make(chan struct{}, 1),
+		goAway:                make(chan struct{}),
+		nextID:                1,
+		onClose:               onClose,
+		opts:                  &opts,
+	}
+
+	t := &HTTP2ClientMux{
+		H2Transport: h2m,
+		userAgent:   opts.UserAgent,
+		scheme:      scheme,
+		isSecure:    isSecure,
+		//perRPCCreds:           perRPCCreds,
+		KeepaliveParams:      kp,
+		maxConcurrentStreams: defaultMaxStreamsClient,
+		onGoAway:             onGoAway,
+		keepaliveEnabled:     keepaliveEnabled,
+	}
+
+	if opts.InitialWindowSize >= defaultWindowSize {
+		t.initialWindowSize = opts.InitialWindowSize
+		dynamicWindow = false
+	}
+	if dynamicWindow {
+		t.bdpEst = &bdpEstimator{
+			bdp:               initialWindowSize,
+			updateFlowControl: t.updateFlowControl,
+		}
+	}
+	return t, nil
 }
 
-// Status is the gRPC trailer. It can also be used in regular H2 (despite the grpc keys)
-// instead of inventing new names.
-type Status struct {
+func (t *H2Transport) createHeaderFields(ctx context.Context, r *http.Request) ([]hpack.HeaderField, error) {
+	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
+	// first and create a slice of that exact size.
+	// Make the slice of certain predictable size to reduce allocations made by append.
+	hfLen := 7 // :method, :scheme, :path, :authority, content-type, user-agent, te
+	if r.Host == "" {
+		r.Host = r.URL.Host
+	}
+	headerFields := make([]hpack.HeaderField, 0, hfLen)
+	headerFields = append(headerFields, hpack.HeaderField{Name: ":authority", Value: r.Host})
+	headerFields = append(headerFields, hpack.HeaderField{Name: ":method", Value: r.Method})
+	if r.Method != "CONNECT" {
+		headerFields = append(headerFields, hpack.HeaderField{Name: ":path", Value: r.URL.Path})
+		headerFields = append(headerFields, hpack.HeaderField{Name: ":scheme", Value: "https"})
+	}
+	ct := r.Header.Get("content-type")
+	headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: ct})
 
-	// The status code, which should be an enum value of [google.rpc.Code][google.rpc.Code].
-	Code int
-	// A developer-facing error message, which should be in English. Any
-	// user-facing error message should be localized and sent in the
-	// [google.rpc.Status.details][google.rpc.Status.details] field, or localized by the client.
-	Message string
-	// A list of messages that carry the error details.  There is a common set of
-	// message types for APIs to use.
-	Details [][]byte
+	if strings.HasPrefix(ct, "application/grpc") {
+		headerFields = append(headerFields, hpack.HeaderField{Name: "te", Value: "trailers"})
+	}
+	// Send it to all requests, even if grpc specific
+	//if callHdr.PreviousAttempts > 0 {
+	//	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-previous-rpc-attempts", Value: strconv.Itoa(callHdr.PreviousAttempts)})
+	//}
 
+	if dl, ok := ctx.Deadline(); ok {
+		// Send out timeout regardless its value. The server can detect timeout context by itself.
+		// TODO(mmukhi): Perhaps this field should be updated when actually writing out to the wire.
+		timeout := time.Until(dl)
+		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-timeout", Value: grpcutil.EncodeDuration(timeout)})
+	}
+
+	for k, vv := range r.Header {
+		if isReservedHeaderReq(k) {
+			continue
+		}
+		for _, v := range vv {
+			headerFields = append(headerFields, hpack.HeaderField{Name: strings.ToLower(k), Value: encodeMetadataHeader(k, v)})
+		}
+	}
+	return headerFields, nil
+}
+
+// NewStreamError wraps an error and reports additional information.  Typically
+// NewStream errors result in transparent retry, as they mean nothing went onto
+// the wire.  However, there are two notable exceptions:
+//
+//  1. If the stream headers violate the max header list size allowed by the
+//     server.  It's possible this could succeed on another transport, even if
+//     it's unlikely, but do not transparently retry.
+//  2. If the credentials errored when requesting their headers.  In this case,
+//     it's possible a retry can fix the problem, but indefinitely transparently
+//     retrying is not appropriate as it is likely the credentials, if they can
+//     eventually succeed, would need I/O to do so.
+type NewStreamError struct {
 	Err error
+
+	AllowTransparentRetry bool
 }
 
-func (st *Stream) SetStatus(status *Status) {
-	// WIP: sent the trailers
+func (e NewStreamError) Error() string {
+	return e.Err.Error()
 }
 
-func (s *Status) Error() string {
-	if s.Err != nil {
-		return s.Err.Error()
+// writeRequestHeaders send headers and registers the stream.
+func (t *H2Transport) writeRequestHeaders(s *H2Stream, headerFields []hpack.HeaderField) error {
+	// If it can't be sent or becomes orphan.
+	cleanup := func(err error) {
+		// TODO: stream.Close merge ?
+		if s.swapState(streamDone) == streamDone {
+			// If it was already done, return.
+			return
+		}
+		// The stream was unprocessed by the server.
+		atomic.StoreUint32(&s.unprocessed, 1)
+		s.setReadClosed(2, err)
+		if s.getWriteClosed() == 0 {
+			// TODO(costin)
+		}
+		close(s.done)
+		// If headerChan isn't closed, then close it.
+		if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
+			close(s.headerChan)
+		}
 	}
-	return s.Message
+	hdr := &headerFrame{
+		hf:        headerFields,
+		endStream: false,
+		initStream: func(id uint32) error {
+			t.mu.Lock()
+			if t.closing {
+				t.mu.Unlock()
+				// Do a quick cleanup.
+				err := ErrConnClosing
+				cleanup(err)
+				return err
+			}
+			t.activeStreams[id] = s
+			atomic.AddInt64(&t.streamsStarted, 1)
+			atomic.StoreInt64(&t.LastStreamCreatedTime, time.Now().UnixNano())
+			if t.kpDormant {
+				t.kpDormancyCond.Signal()
+			}
+			t.mu.Unlock()
+			return nil
+		},
+		onWrite: func() {
+			t.streamEvent(Event_WroteHeaders, s)
+		},
+		onOrphaned: cleanup,
+		wq:         s.wq,
+	}
+	firstTry := true
+	var ch chan struct{}
+	checkForStreamQuota := func(it interface{}) bool {
+		if t.streamQuota <= 0 { // Can go negative if server decreases it.
+			if firstTry {
+				t.waitingStreams++
+			}
+			ch = t.streamsQuotaAvailable
+			return false
+		}
+		if !firstTry {
+			t.waitingStreams--
+		}
+		t.streamQuota--
+		h := it.(*headerFrame)
+		h.streamID = t.nextID
+		t.nextID += 2
+		s.Id = h.streamID
+		s.fc = &inFlow{limit: uint32(t.initialWindowSize)}
+		if t.streamQuota > 0 && t.waitingStreams > 0 {
+			select {
+			case t.streamsQuotaAvailable <- struct{}{}:
+			default:
+			}
+		}
+		return true
+	}
+	var hdrListSizeErr error
+	checkForHeaderListSize := func(it interface{}) bool {
+		if t.maxSendHeaderListSize == nil {
+			return true
+		}
+		hdrFrame := it.(*headerFrame)
+		var sz int64
+		for _, f := range hdrFrame.hf {
+			if sz += int64(f.Size()); sz > int64(*t.maxSendHeaderListSize) {
+				hdrListSizeErr = &Status{Message: fmt.Sprintf("header list size to send violates the maximum size (%d bytes) set by server", *t.maxSendHeaderListSize)}
+				return false
+			}
+		}
+		return true
+	}
+	for {
+		success, err := t.controlBuf.executeAndPut(func(it interface{}) bool {
+			if !checkForStreamQuota(it) {
+				return false
+			}
+			if !checkForHeaderListSize(it) {
+				return false
+			}
+			return true
+		}, hdr)
+		if err != nil {
+			// Connection closed.
+			return &NewStreamError{Err: err, AllowTransparentRetry: true}
+		}
+		if success {
+			break
+		}
+		if hdrListSizeErr != nil {
+			return &NewStreamError{Err: hdrListSizeErr}
+		}
+		firstTry = false
+		ctx := s.ctx
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return &NewStreamError{Err: ContextErr(ctx.Err())}
+		case <-t.goAway:
+			return &NewStreamError{Err: errStreamDrain, AllowTransparentRetry: true}
+		case <-t.ctx.Done():
+			return &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
+		}
+	}
+	return nil
 }
 
-// A Code is an unsigned 32-bit error code as defined in the gRPC spec.
-type Code uint32
+// closeStream unblocks readBlocking/write, delete the stream from active, updates stats, etc.
+// Will be called once (guarded by streamDone)
+//
+// For all error conditions:
+// If rst and rstCode are set, will also send a RST frame.
+//
+//	for graceful close, part of stream.Close()
+//
+// Else it will send a RST frame if the reader has not received an EOF yet.
+//
+// err is the error causing the stream close - will be returned to Read() if blocking readBlocking is in
+// progress.
+func (t *H2Transport) closeStream(s *H2Stream, err error, rst bool, rstCode frame.ErrCode) {
 
-const (
-	// OK is returned on success.
-	OK Code = 0
+	if s.swapState(streamDone) == streamDone {
+		// If it was already done, return.  If multiple closeStream calls
+		// happen simultaneously, wait for the first to finish.
+		<-s.done
+		return
+	}
 
-	// Canceled indicates the operation was canceled (typically by the caller).
-	//
-	// The gRPC framework will generate this error code when cancellation
-	// is requested.
-	Canceled Code = 1
+	if s.Error == nil {
+		s.Error = err
+	}
 
-	// Unknown error. An example of where this error may be returned is
-	// if a Status value received from another address space belongs to
-	// an error-space that is not known in this address space. Also
-	// errors raised by APIs that do not return enough error information
-	// may be converted to this error.
-	//
-	// The gRPC framework will generate this error code in the above two
-	// mentioned cases.
-	Unknown Code = 2
+	// status and trailers can be updated here without any synchronization because the stream goroutine will
+	// only readBlocking it after it sees an io.EOF error from readBlocking or write and we'll write those errors
+	// only after updating this.
+	if err != nil { //&& s.trReader.Err == nil {
+		s.setReadClosed(2, err)
+	}
 
-	// InvalidArgument indicates client specified an invalid argument.
-	// Note that this differs from FailedPrecondition. It indicates arguments
-	// that are problematic regardless of the state of the system
-	// (e.g., a malformed file name).
-	//
-	// This error code will not be generated by the gRPC framework.
-	InvalidArgument Code = 3
+	// If headerChan isn't closed, then close it.
+	if s.headerChan != nil && atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
+		s.noHeaders = true
+		close(s.headerChan)
+	}
 
-	// DeadlineExceeded means operation expired before completion.
-	// For operations that change the state of the system, this error may be
-	// returned even if the operation has completed successfully. For
-	// example, a successful response from a server could have been delayed
-	// long enough for the deadline to expire.
-	//
-	// The gRPC framework will generate this error code when the deadline is
-	// exceeded.
-	DeadlineExceeded Code = 4
+	cleanup := &cleanupStream{
+		streamID: s.Id,
+		onWrite: func() {
+			t.deleteStream(s)
+		},
+		rst:     rst,
+		rstCode: rstCode,
+	}
 
-	// NotFound means some requested entity (e.g., file or directory) was
-	// not found.
-	//
-	// This error code will not be generated by the gRPC framework.
-	NotFound Code = 5
+	addBackStreamQuota := func(interface{}) bool {
+		t.streamQuota++
+		if t.streamQuota > 0 && t.waitingStreams > 0 {
+			select {
+			case t.streamsQuotaAvailable <- struct{}{}:
+			default:
+			}
+		}
+		return true
+	}
+	t.controlBuf.executeAndPut(addBackStreamQuota, cleanup)
+	// This will unblock write.
 
-	// AlreadyExists means an attempt to create an entity failed because one
-	// already exists.
-	//
-	// This error code will not be generated by the gRPC framework.
-	AlreadyExists Code = 6
+	if err == nil {
+		atomic.AddInt64(&t.streamsSucceeded, 1)
+	} else {
+		atomic.AddInt64(&t.streamsFailed, 1)
+	}
 
-	// PermissionDenied indicates the caller does not have permission to
-	// execute the specified operation. It must not be used for rejections
-	// caused by exhausting some resource (use ResourceExhausted
-	// instead for those errors). It must not be
-	// used if the caller cannot be identified (use Unauthenticated
-	// instead for those errors).
-	//
-	// This error code will not be generated by the gRPC core framework,
-	// but expect authentication middleware to use it.
-	PermissionDenied Code = 7
+	// In case stream sending and receiving are invoked in separate
+	// goroutines (e.g., bi-directional streaming), cancel needs to be
+	// called to interrupt the potential blocking on other goroutines.
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
 
-	// ResourceExhausted indicates some resource has been exhausted, perhaps
-	// a per-user quota, or perhaps the entire file system is out of space.
-	//
-	// This error code will be generated by the gRPC framework in
-	// out-of-memory and server overload situations, or when a message is
-	// larger than the configured maximum size.
-	ResourceExhausted Code = 8
+	if s.done != nil {
+		close(s.done)
+	}
+	s.StreamEvent(EventStreamClosed)
+}
 
-	// FailedPrecondition indicates operation was rejected because the
-	// system is not in a state required for the operation's execution.
-	// For example, directory to be deleted may be non-empty, an rmdir
-	// operation is applied to a non-directory, etc.
-	//
-	// A litmus test that may help a service implementor in deciding
-	// between FailedPrecondition, Aborted, and Unavailable:
-	//  (a) Use Unavailable if the client can retry just the failing call.
-	//  (b) Use Aborted if the client should retry at a higher-level
-	//      (e.g., restarting a read-modify-write sequence).
-	//  (c) Use FailedPrecondition if the client should not retry until
-	//      the system state has been explicitly fixed. E.g., if an "rmdir"
-	//      fails because the directory is non-empty, FailedPrecondition
-	//      should be returned since the client should not retry unless
-	//      they have first fixed up the directory by deleting files from it.
-	//  (d) Use FailedPrecondition if the client performs conditional
-	//      REST Get/Update/Delete on a resource and the resource on the
-	//      server does not match the condition. E.g., conflicting
-	//      read-modify-write on the same resource.
-	//
-	// This error code will not be generated by the gRPC framework.
-	FailedPrecondition Code = 9
+func (t *H2Transport) getStream(f frame.Frame) *H2Stream {
+	t.mu.Lock()
+	if t.activeStreams == nil {
+		t.mu.Unlock()
+		return nil
+	}
+	s := t.activeStreams[f.Header().StreamID]
+	t.mu.Unlock()
+	return s
+}
 
-	// Aborted indicates the operation was aborted, typically due to a
-	// concurrency issue like sequencer check failures, transaction aborts,
-	// etc.
-	//
-	// See litmus test above for deciding between FailedPrecondition,
-	// Aborted, and Unavailable.
-	//
-	// This error code will not be generated by the gRPC framework.
-	Aborted Code = 10
+func (t *H2Transport) adjustWindow(s *H2Stream, n uint32) {
+	if w := s.fc.maybeAdjust(n); w > 0 {
+		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.Id, increment: w})
+	}
+}
 
-	// OutOfRange means operation was attempted past the valid range.
-	// E.g., seeking or reading past end of file.
-	//
-	// Unlike InvalidArgument, this error indicates a problem that may
-	// be fixed if the system state changes. For example, a 32-bit file
-	// system will generate InvalidArgument if asked to read at an
-	// offset that is not in the range [0,2^32-1], but it will generate
-	// OutOfRange if asked to read from an offset past the current
-	// file size.
-	//
-	// There is a fair bit of overlap between FailedPrecondition and
-	// OutOfRange. We recommend using OutOfRange (the more specific
-	// error) when it applies so that callers who are iterating through
-	// a space can easily look for an OutOfRange error to detect when
-	// they are done.
-	//
-	// This error code will not be generated by the gRPC framework.
-	OutOfRange Code = 11
+// updateWindow adjusts the inbound quota for the stream.
+// Window updates will be sent out when the cumulative quota
+// exceeds the corresponding threshold.
+func (t *H2Transport) UpdateWindow(s *H2Stream, n uint32) {
+	if w := s.fc.onRead(n); w > 0 {
+		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.Id, increment: w})
+	}
+}
 
-	// Unimplemented indicates operation is not implemented or not
-	// supported/enabled in this service.
-	//
-	// This error code will be generated by the gRPC framework. Most
-	// commonly, you will see this error code when a method implementation
-	// is missing on the server. It can also be generated for unknown
-	// compression algorithms or a disagreement as to whether an RPC should
-	// be streaming.
-	Unimplemented Code = 12
+const SettingH2R = 0xF051
 
-	// Internal errors. Means some invariants expected by underlying
-	// system has been broken. If you see one of these errors,
-	// something is very broken.
-	//
-	// This error code will be generated by the gRPC framework in several
-	// internal error conditions.
-	Internal Code = 13
+// updateFlowControl updates the incoming flow control windows
+// for the transport and the stream based on the current bdp
+// estimation. BPD is used to determine initial window size for new
+// streams and connection based on the RTT. Only enabled if the initial
+// window size is not set explicitly
+func (t *H2Transport) updateFlowControl(n uint32) {
+	t.mu.Lock()
+	for _, s := range t.activeStreams {
+		s.fc.newLimit(n)
+	}
+	t.initialWindowSize = int32(n)
+	t.mu.Unlock()
 
-	// Unavailable indicates the service is currently unavailable.
-	// This is a most likely a transient condition and may be corrected
-	// by retrying with a backoff. Note that it is not always safe to retry
-	// non-idempotent operations.
-	//
-	// See litmus test above for deciding between FailedPrecondition,
-	// Aborted, and Unavailable.
-	//
-	// This error code will be generated by the gRPC framework during
-	// abrupt shutdown of a server process or network connection.
-	Unavailable Code = 14
+	t.controlBuf.put(
+		&outgoingWindowUpdate{streamID: 0, increment: t.fc.newLimit(n)})
 
-	// DataLoss indicates unrecoverable data loss or corruption.
-	//
-	// This error code will not be generated by the gRPC framework.
-	DataLoss Code = 15
+	t.controlBuf.put(&outgoingSettings{
+		ss: []frame.Setting{
+			{
+				ID:  frame.SettingInitialWindowSize,
+				Val: n,
+			},
+		},
+	})
+}
 
-	// Unauthenticated indicates the request does not have valid
-	// authentication credentials for the operation.
+func (t *H2Transport) handleData(f *frame.DataFrame) {
+	size := f.Header().Length
+	var sendBDPPing bool
+	if t.bdpEst != nil {
+		sendBDPPing = t.bdpEst.add(size)
+	}
+	// Decouple connection's flow control from application's readBlocking.
+	// An update on connection's flow control should not depend on
+	// whether user application has readBlocking the data or not. Such a
+	// restriction is already imposed on the stream's flow control,
+	// and therefore the sender will be blocked anyways.
+	// Decoupling the connection flow control will prevent other
+	// active(fast) streams from starving in presence of slow or
+	// inactive streams.
 	//
-	// The gRPC framework will generate this error code when the
-	// authentication metadata is invalid or a Credentials callback fails,
-	// but also expect authentication middleware to generate it.
-	Unauthenticated Code = 16
+	if w := t.fc.onData(size); w > 0 {
+		t.controlBuf.put(&outgoingWindowUpdate{
+			streamID:  0,
+			increment: w,
+		})
+	}
+	if sendBDPPing {
+		// Avoid excessive ping detection (e.g. in an L7 proxy)
+		// by sending a window update prior to the BDP ping.
+		if w := t.fc.reset(); w > 0 {
+			t.controlBuf.put(&outgoingWindowUpdate{
+				streamID:  0,
+				increment: w,
+			})
+		}
+		t.controlBuf.put(bdpPing)
+	}
+	// Select the right stream to dispatch.
+	s := t.getStream(f)
+	if s == nil {
+		return
+	}
+	if s.getReadClosed() == 2 {
+		t.closeStream(s, errStreamDone, true, frame.ErrCodeStreamClosed)
+		return
+	}
+	if size > 0 {
+		if err := s.fc.onData(size); err != nil {
+			t.closeStream(s, err, true, frame.ErrCodeFlowControl)
+			return
+		}
+		if f.Header().Flags.Has(frame.FlagDataPadded) {
+			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
+				t.controlBuf.put(&outgoingWindowUpdate{s.Id, w})
+			}
+		}
 
-	_maxCode = 17
-)
+		if s.OnData != nil {
+			s.OnData(f)
+			if f.StreamEnded() {
+				s.setReadClosed(1, io.EOF)
+			}
+			return
+		}
+
+		// Old code - with data frame reuse immediately:
+		// TODO(bradfitz, zhaoq): A copy is required here because there is no
+		// guarantee f.Data() is consumed before the arrival of next frame.
+		// Can this copy be eliminated?
+		if len(f.Data()) > 0 {
+			//buffer := t.bufferPool.get()
+			//buffer.Reset()
+			//buffer.Write(f.Data())
+
+			s.RcvdBytes += len(f.Data())
+			s.RcvdPackets++
+			s.LastRead = time.Now()
+			s.trReader.Put(nio.RecvMsg{Buffer: bytes.NewBuffer(f.Data())})
+		}
+	}
+	if f.StreamEnded() {
+		s.setReadClosed(1, io.EOF)
+	}
+}
+
+func (t *H2Transport) handleRSTStream(f *frame.RSTStreamFrame) {
+	s := t.getStream(f)
+	if s == nil {
+		// If the stream is already deleted from the active streams map, then Put a cleanupStream item into controlbuf to delete the stream from loopy writer's established streams map.
+		t.controlBuf.put(&cleanupStream{
+			streamID: f.Header().StreamID,
+			rst:      false,
+			rstCode:  0,
+			onWrite:  func() {},
+		})
+		return
+	}
+
+	if s.getReadClosed() == 1 {
+		// EOF received
+		return
+	}
+
+	if f.ErrCode == frame.ErrCodeRefusedStream {
+		// The stream was unprocessed by the server.
+		atomic.StoreUint32(&s.unprocessed, 1)
+	}
+
+	statusCode, ok := http2ErrConvTab[f.ErrCode]
+	if !ok {
+		statusCode = Unknown
+	}
+	if statusCode == Canceled {
+		if d, ok := s.ctx.Deadline(); ok && !d.After(time.Now()) {
+			// Our deadline was already exceeded, and that was likely the cause
+			// of this cancelation.  Alter the status code accordingly.
+			statusCode = DeadlineExceeded
+		}
+	}
+
+	s.setReadClosed(2, errStreamRST)
+
+	if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
+		if s.headerChan != nil {
+			close(s.headerChan)
+		}
+	}
+}
+
+func (t *HTTP2ClientMux) handleSettings(f *frame.SettingsFrame, isFirst bool) {
+	if f.IsAck() {
+		return
+	}
+
+	var maxStreams *uint32
+
+	var ss []frame.Setting
+	var updateFuncs []func()
+	var fs *uint32
+
+	f.ForeachSetting(func(s frame.Setting) error {
+		switch s.ID {
+		case frame.SettingMaxConcurrentStreams:
+			maxStreams = new(uint32)
+			*maxStreams = s.Val
+		case frame.SettingMaxFrameSize:
+			fs = new(uint32)
+			*fs = s.Val
+			rfs := *fs
+			if t.FrameSize > rfs {
+				t.FrameSize = rfs
+			}
+		case frame.SettingMaxHeaderListSize:
+			updateFuncs = append(updateFuncs, func() {
+				t.maxSendHeaderListSize = new(uint32)
+				*t.maxSendHeaderListSize = s.Val
+			})
+		default:
+			ss = append(ss, s)
+		}
+		return nil
+	})
+	if isFirst && maxStreams == nil {
+		maxStreams = new(uint32)
+		*maxStreams = math.MaxUint32
+	}
+	sf := &incomingSettings{
+		ss: ss,
+	}
+	if maxStreams != nil {
+		updateStreamQuota := func() {
+			delta := int64(*maxStreams) - int64(t.maxConcurrentStreams)
+			t.maxConcurrentStreams = *maxStreams
+			t.streamQuota += delta
+			if delta > 0 && t.waitingStreams > 0 {
+				close(t.streamsQuotaAvailable) // wake all of them up.
+				t.streamsQuotaAvailable = make(chan struct{}, 1)
+			}
+		}
+		updateFuncs = append(updateFuncs, updateStreamQuota)
+	}
+	t.controlBuf.executeAndPut(func(interface{}) bool {
+		for _, f := range updateFuncs {
+			f()
+		}
+		return true
+	}, sf)
+
+	t.MuxEvent(Event_Settings)
+}
+
+func (t *HTTP2ClientMux) handlePing(f *frame.PingFrame) {
+	if f.IsAck() {
+		// Maybe it's a BDP ping.
+		if t.bdpEst != nil {
+			t.bdpEst.calculate(f.Data)
+		}
+		return
+	}
+	pingAck := &ping{ack: true}
+	copy(pingAck.data[:], f.Data[:])
+	t.controlBuf.put(pingAck)
+}
+
+func (t *HTTP2ClientMux) handleGoAway(f *frame.GoAwayFrame) {
+	t.mu.Lock()
+	if t.closing {
+		t.mu.Unlock()
+		return
+	}
+	id := f.LastStreamID
+	if id > 0 && id%2 == 0 {
+		t.mu.Unlock()
+		t.Close(connectionErrorf(true, nil, "received goaway with non-zero even-numbered numbered stream id: %v", id))
+		return
+	}
+	// A client can receive multiple GoAways from the server (see
+	// https://github.com/grpc/grpc-go/issues/1387).  The idea is that the first
+	// GoAway will be sent with an WorkloadID of MaxInt32 and the second GoAway will be
+	// sent after an RTT delay with the WorkloadID of the last stream the server will
+	// process.
+	//
+	// Therefore, when we get the first GoAway we don't necessarily close any
+	// streams. While in case of second GoAway we close all streams created after
+	// the GoAwayId. This way streams that were in-flight while the GoAway from
+	// server was being sent don't get killed.
+	select {
+	case <-t.goAway: // t.goAway has been closed (i.e.,multiple GoAways).
+		// If there are multiple GoAways the first one should always have an WorkloadID greater than the following ones.
+		if id > t.prevGoAwayID {
+			t.mu.Unlock()
+			t.Close(connectionErrorf(true, nil, "received goaway with stream id: %v, which exceeds stream id of previous goaway: %v", id, t.prevGoAwayID))
+			return
+		}
+	default:
+		t.setGoAwayReason(f)
+		close(t.goAway)
+		t.controlBuf.put(&incomingGoAway{})
+		// Notify the clientconn about the GOAWAY before we set the state to
+		// draining, to allow the client to stop attempting to create streams
+		// before disallowing new streams on this connection.
+		t.onGoAway(t.goAwayReason)
+		t.closing = true
+	}
+	// All streams with IDs greater than the GoAwayId
+	// and smaller than the previous GoAway WorkloadID should be killed.
+	upperLimit := t.prevGoAwayID
+	if upperLimit == 0 { // This is the first GoAway Frame.
+		upperLimit = math.MaxUint32 // Kill all streams after the GoAway WorkloadID.
+	}
+	for streamID, stream := range t.activeStreams {
+		if streamID > id && streamID <= upperLimit {
+			// The stream was unprocessed by the server.
+			atomic.StoreUint32(&stream.unprocessed, 1)
+			t.closeStream(stream, errStreamDrain, false, frame.ErrCodeNo)
+		}
+	}
+	t.prevGoAwayID = id
+	active := len(t.activeStreams)
+	t.mu.Unlock()
+	if active == 0 {
+		t.Close(connectionErrorf(true, nil, "received goaway and there are no active streams"))
+	}
+}
+
+// setGoAwayReason sets the value of t.goAwayReason based
+// on the GoAway frame received.
+// It expects a lock on transport's mutext to be held by
+// the caller.
+func (t *HTTP2ClientMux) setGoAwayReason(f *frame.GoAwayFrame) {
+	t.goAwayReason = GoAwayNoReason
+	switch f.ErrCode {
+	case frame.ErrCodeEnhanceYourCalm:
+		if string(f.DebugData()) == "too_many_pings" {
+			t.goAwayReason = GoAwayTooManyPings
+		}
+	}
+	if len(f.DebugData()) == 0 {
+		t.goAwayDebugMessage = fmt.Sprintf("code: %s", f.ErrCode)
+	} else {
+		t.goAwayDebugMessage = fmt.Sprintf("code: %s, debug data: %q", f.ErrCode, string(f.DebugData()))
+	}
+}
+
+func (t *HTTP2ClientMux) GetGoAwayReason() (GoAwayReason, string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.goAwayReason, t.goAwayDebugMessage
+}
+
+func (t *H2Transport) handleWindowUpdate(f *frame.WindowUpdateFrame) {
+	t.controlBuf.put(&incomingWindowUpdate{
+		streamID:  f.Header().StreamID,
+		increment: f.Increment,
+	})
+}
+
+// operateResponseHeaders takes action on the decoded for a response.
+func (t *H2Transport) operateClientResponseHeaders(f *frame.MetaHeadersFrame) {
+	if f.StreamID%2 == 0 && t.loopy.side == clientSide {
+		// Push or h2r
+		t.operateAcceptHeaders(f)
+		return
+	}
+	t.operateResponseHeaders(f)
+}
+
+func (t *H2Transport) operateResponseHeaders(f *frame.MetaHeadersFrame) {
+	if f.StreamID%2 == 0 {
+		// Push or h2r
+
+	}
+	s := t.getStream(f)
+	if s == nil {
+		return
+	}
+	endStream := f.StreamEnded()
+	atomic.StoreUint32(&s.bytesReceived, 1)
+	initialHeader := atomic.LoadUint32(&s.headerChanClosed) == 0
+
+	if !initialHeader && !endStream {
+		// As specified by gRPC over HTTP2, a HEADERS frame (and associated CONTINUATION frames) can only appear at the start or end of a stream. Therefore, second HEADERS frame must have EOS bit set.
+		st := &Status{Message: "a HEADERS frame cannot appear in the middle of a stream"}
+		t.closeStream(s, st, true, frame.ErrCodeProtocol)
+		return
+	}
+
+	// frame.Truncated is set to true when framer detects that the current header
+	// list size hits MaxHeaderListSize limit.
+	if f.Truncated {
+		se := &Status{Message: "peer header list size exceeded limit"}
+		t.closeStream(s, se, true, frame.ErrCodeFrameSize)
+		return
+	}
+
+	trailer := false
+	// If headerChan hasn't been closed yet
+	if s.headerChanClosed != 0 {
+		trailer = true
+	}
+
+	for _, hf := range f.Fields {
+		switch hf.Name {
+		case ":status":
+			s.Response.Status = hf.Value
+			s.Response.StatusCode, _ = strconv.Atoi(hf.Value)
+		default:
+			if trailer {
+				v, err := decodeMetadataHeader(hf.Name, hf.Value)
+				if err != nil {
+					log.Printf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
+					break
+				}
+				s.Response.Trailer.Add(hf.Name, v)
+			} else {
+				if isReservedHeader(hf.Name) && !isWhitelistedHeader(hf.Name) {
+					break
+				}
+				v, err := decodeMetadataHeader(hf.Name, hf.Value)
+				if err != nil {
+					log.Printf("Failed to decode metadata header (%q, %q): %v", hf.Name, hf.Value, err)
+					break
+				}
+				s.Response.Header.Add(hf.Name, v)
+			}
+		}
+	}
+
+	// If headerChan hasn't been closed yet
+	if atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
+		s.headerValid = true
+		close(s.headerChan)
+	}
+
+	if !endStream {
+		return
+	}
+
+	s.setReadClosed(1, io.EOF)
+	s.queueReadBuf(nio.RecvMsg{Err: io.EOF})
+
+	// Old: if client received END_STREAM from server while stream was still active, send RST_STREAM
+}
+
+// reader runs as a separate goroutine in charge of reading data from network
+// connection.
+//
+// TODO(zhaoq): currently one reader per transport. Investigate whether this is
+// optimal.
+// TODO(zhaoq): Check the validity of the incoming frame sequence.
+func (t *HTTP2ClientMux) reader() {
+	defer close(t.readerDone)
+	// Check the validity of server preface.
+	f, err := t.framer.fr.ReadFrame()
+	if err != nil {
+		err = connectionErrorf(true, err, "error reading server preface: %v", err)
+		t.Close(err) // this kicks off resetTransport, so must be last before return
+		return
+	}
+	t.conn.SetReadDeadline(time.Time{}) // reset deadline once we get the settings frame (we didn't time out, yay!)
+	atomic.StoreInt64(&t.LastRead, time.Now().UnixNano())
+	sf, ok := f.(*frame.SettingsFrame)
+	if !ok {
+		// this kicks off resetTransport, so must be last before return
+		t.Close(connectionErrorf(true, nil, "initial http2 frame from server is not a settings frame: %T", f))
+		return
+	}
+	t.PeerSettings = sf
+	t.handleSettings(sf, true)
+
+	// loop to keep reading incoming messages on this transport.
+	for {
+		t.controlBuf.throttle()
+		f, err := t.framer.fr.ReadFrame()
+		atomic.StoreInt64(&t.LastRead, time.Now().UnixNano())
+		if err != nil {
+			// Abort an active stream if the http2.Framer returns a
+			// http2.StreamError. This can happen only if the server's response
+			// is malformed http2.
+			if se, ok := err.(frame.StreamError); ok {
+				t.mu.Lock()
+				s := t.activeStreams[se.StreamID]
+				t.mu.Unlock()
+				if s != nil {
+					// use error detail to provide better err message
+					code := http2ErrConvTab[se.Code]
+					errorDetail := t.framer.fr.ErrorDetail()
+					var msg string
+					if errorDetail != nil {
+						msg = errorDetail.Error()
+					} else {
+						msg = "received invalid frame"
+					}
+					t.closeStream(s, &Status{Code: int(code), Message: msg}, true, frame.ErrCodeProtocol)
+				}
+				continue
+			} else {
+				// Transport error.
+				t.Close(connectionErrorf(true, err, "error reading from server: %v", err))
+				return
+			}
+		}
+		switch frame := f.(type) {
+		case *frame.MetaHeadersFrame:
+			t.operateClientResponseHeaders(frame)
+		case *frame.DataFrame:
+			t.handleData(frame)
+		case *frame.RSTStreamFrame:
+			t.handleRSTStream(frame)
+		case *frame.SettingsFrame:
+			t.handleSettings(frame, false)
+		case *frame.PingFrame:
+			t.handlePing(frame)
+		case *frame.GoAwayFrame:
+			t.handleGoAway(frame)
+		case *frame.WindowUpdateFrame:
+			t.handleWindowUpdate(frame)
+		default:
+			log.Printf("transport: HTTP2ClientMux.reader got unhandled frame type %v.", frame)
+		}
+	}
+}
+
+func minTime(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// keepalive running in a separate goroutine makes sure the connection is alive by sending pings.
+func (t *HTTP2ClientMux) keepalive() {
+	p := &ping{data: [8]byte{}}
+	// True iff a ping has been sent, and no data has been received since then.
+	outstandingPing := false
+	// Amount of time remaining before which we should receive an ACK for the
+	// last sent ping.
+	timeoutLeft := time.Duration(0)
+	// Records the last value of t.lastRead before we go block on the timer.
+	// This is required to check for readBlocking activity since then.
+	prevNano := time.Now().UnixNano()
+	timer := time.NewTimer(t.KeepaliveParams.Time)
+	for {
+		select {
+		case <-timer.C:
+			lastRead := atomic.LoadInt64(&t.LastRead)
+			if lastRead > prevNano {
+				// There has been readBlocking activity since the last time we were here.
+				outstandingPing = false
+				// Next timer should fire at kp.Time seconds from lastRead time.
+				timer.Reset(time.Duration(lastRead) + t.KeepaliveParams.Time - time.Duration(time.Now().UnixNano()))
+				prevNano = lastRead
+				continue
+			}
+			if outstandingPing && timeoutLeft <= 0 {
+				t.Close(connectionErrorf(true, nil, "keepalive ping failed to receive ACK within timeout"))
+				return
+			}
+			t.mu.Lock()
+			if t.closing {
+				// If the transport is closing, we should exit from the
+				// keepalive goroutine here. If not, we could have a race
+				// between the call to Signal() from Close() and the call to
+				// Wait() here, whereby the keepalive goroutine ends up
+				// blocking on the condition variable which will never be
+				// signalled again.
+				t.mu.Unlock()
+				return
+			}
+			if len(t.activeStreams) < 1 && !t.KeepaliveParams.PermitWithoutStream {
+				// If a ping was sent out previously (because there were active
+				// streams at that point) which wasn't acked and its timeout
+				// hadn't fired, but we got here and are about to go dormant,
+				// we should make sure that we unconditionally send a ping once
+				// we awaken.
+				outstandingPing = false
+				t.kpDormant = true
+				t.kpDormancyCond.Wait()
+			}
+			t.kpDormant = false
+			t.mu.Unlock()
+
+			// We get here either because we were dormant and a new stream was
+			// created which unblocked the Wait() call, or because the
+			// keepalive timer expired. In both cases, we need to send a ping.
+			if !outstandingPing {
+				//if channelz.IsOn() {
+				//	atomic.AddInt64(&t.czData.kpCount, 1)
+				//}
+				t.controlBuf.put(p)
+				timeoutLeft = t.KeepaliveParams.Timeout
+				outstandingPing = true
+			}
+			// The amount of time to sleep here is the minimum of kp.Time and
+			// timeoutLeft. This will ensure that we wait only for kp.Time
+			// before sending out the next ping (for cases where the ping is
+			// acked).
+			sleepDuration := minTime(t.KeepaliveParams.Time, timeoutLeft)
+			timeoutLeft -= sleepDuration
+			timer.Reset(sleepDuration)
+		case <-t.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		}
+	}
+}
+
+func (t *HTTP2ClientMux) Error() <-chan struct{} {
+	return t.done
+}
+
+func (t *HTTP2ClientMux) GoAway() <-chan struct{} {
+	return t.goAway
+}
+
+func (t *HTTP2ClientMux) CanTakeNewRequest() bool {
+	return !t.closing
+}
+
+func (t *H2Transport) getOutFlowWindow() int64 {
+	resp := make(chan uint32, 1)
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	t.controlBuf.put(&outFlowControlSizeRequest{resp})
+	select {
+	case sz := <-resp:
+		return int64(sz)
+	case <-t.done:
+		return -1
+	case <-timer.C:
+		return -2
+	}
+}
+
+func (t *H2Transport) Conn() net.Conn {
+	return t.conn
+}

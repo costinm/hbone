@@ -3,10 +3,13 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/../cert-ssh/.idea/cert-ssh.iml" filepath="$PROJECT_DIR$/../cert-ssh/.idea/cert-ssh.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../istio.io/cloud-run-mesh/.idea/cloud-run-mesh.iml" filepath="$PROJECT_DIR$/../../istio.io/cloud-run-mesh/.idea/cloud-run-mesh.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/hbone.iml" filepath="$PROJECT_DIR$/.idea/hbone.iml" />
       <module fileurl="file://$PROJECT_DIR$/../konfig/.idea/konfig.iml" filepath="$PROJECT_DIR$/../konfig/.idea/konfig.iml" />
       <module fileurl="file://$PROJECT_DIR$/../krun/.idea/krun.iml" filepath="$PROJECT_DIR$/../krun/.idea/krun.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../src/notes/.idea/notes.iml" filepath="$PROJECT_DIR$/../../src/notes/.idea/notes.iml" />
       <module fileurl="file://$PROJECT_DIR$/../ugate/.idea/ugate.iml" filepath="$PROJECT_DIR$/../ugate/.idea/ugate.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../../src/vm/.idea/vm.iml" filepath="$PROJECT_DIR$/../../src/vm/.idea/vm.iml" />
     </modules>
   </component>
 </project>

@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	transport2 "github.com/costinm/hbone/h2"
+	"github.com/costinm/hbone/h2"
 	"github.com/costinm/hbone/nio"
 	"github.com/costinm/hbone/nio/syscall"
 )
@@ -36,22 +36,21 @@ var Debug = false
 
 // MeshSettings has common settings for all clients
 type MeshSettings struct {
-	// If TransportWrapper is set, the http clients will be wrapped
-	// This is intended for integration with OpenTelemetry or other transport wrappers.
-	TransportWrapper func(transport http.RoundTripper) http.RoundTripper
 
-	// Hub or user project ID. If set, will be used to lookup clusters.
-	ProjectId      string
+	// Hub or user project WorkloadID. If set, will be used to lookup clusters.
+	//ProjectId      string
 	Namespace      string
 	ServiceAccount string
 
 	// Location where the workload is running, to select local clusters.
-	Location string
+	//Location string
 
 	ConnectTimeout time.Duration
 	TCPUserTimeout time.Duration
 
-	// Clients by name
+	// Clients by name. The key is primarily a hostname:port, matching Istio/K8S Service name and ports.
+	// TODO: do we need the port ? With ztunnel all endpoins can be reached, and the service selector applies
+	// to all ports.
 	Clusters map[string]*Cluster
 
 	// Ports is the equivalent of container ports in k8s.
@@ -133,13 +132,17 @@ func (ms *MeshSettings) GetEnv(k, def string) string {
 type HBone struct {
 	*MeshSettings
 
+	// Event handlers will be copied to all created Mux and streams
+	// It is possible to add more to each individual mux/stream
+	h2.Events
+
 	// AuthProviders - matching kubeconfig user.authProvider.name
 	// It is expected to return tokens with the given audience - in case of GCP
 	// returns access tokens. If not set the cluster can't be created.
 	//
 	// A number of pre-defined token sources are used:
 	// - gcp - returns GCP access tokens using MDS or default credentials. Used for example by GKE clusters.
-	// - k8s - return K8S ID tokens with the given audience for default K8S cluster.
+	// - k8s - return K8S WorkloadID tokens with the given audience for default K8S cluster.
 	// - istio-ca - returns K8S tokens with istio-ca audience - used by Citadel and default Istiod
 	// - sts - federated google access tokens associated with GCP identity pools.
 	AuthProviders map[string]func(context.Context, string) (string, error)
@@ -161,15 +164,15 @@ type HBone struct {
 	EndpointResolver func(sni string) *EndpointCon
 
 	m           sync.RWMutex
-	H2RConn     map[*transport2.HTTP2ClientMux]*EndpointCon
-	H2RCallback func(string, *transport2.HTTP2ClientMux)
-
-	// Transport returns a wrapper for the h2c RoundTripper.
-	Transport func(tripper http.RoundTripper) http.RoundTripper
-
-	HandlerWrapper func(h http.Handler) http.Handler
+	H2RConn     map[*h2.H2Transport]*EndpointCon
+	H2RCallback func(string, *h2.H2Transport)
 
 	Client *http.Client
+
+	http1SChan chan net.Conn
+	http1CChan chan net.Conn
+
+	Http11Transport *http.Transport
 }
 
 type noAuth struct {
@@ -196,15 +199,12 @@ func (n noAuth) GenerateTLSConfigClientRoots(name string, pool *x509.CertPool) *
 }
 
 // New creates a new HBone node. It requires a workload identity, including mTLS certificates.
-func New(auth Auth) *HBone {
-	return NewMesh(&MeshSettings{
-		Auth: auth,
-	})
-}
-
-func NewHBone(ms *MeshSettings, auth Auth) *HBone {
+func New(auth Auth, ms *MeshSettings) *HBone {
 	if ms == nil {
 		ms = &MeshSettings{}
+	}
+	if auth == nil {
+		auth = &noAuth{}
 	}
 	ms.Auth = auth
 	return NewMesh(ms)
@@ -229,7 +229,7 @@ func NewMesh(ms *MeshSettings) *HBone {
 
 	hb := &HBone{
 		MeshSettings: ms,
-		H2RConn:      map[*transport2.HTTP2ClientMux]*EndpointCon{},
+		H2RConn:      map[*h2.H2Transport]*EndpointCon{},
 		//h2t:           h2,
 		Client:        http.DefaultClient,
 		AuthProviders: map[string]func(context.Context, string) (string, error){},
@@ -241,6 +241,18 @@ func NewMesh(ms *MeshSettings) *HBone {
 
 	}
 	//hb.h2t.ConnPool = hb
+
+	hb.Http11Transport = &http.Transport{
+		DialContext: hb.DialContext,
+		// If not set, DialContext and TLSClientConfig are used
+		DialTLSContext:        hb.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		Proxy:                 http.ProxyFromEnvironment,
+	}
 
 	if ms.Auth == nil {
 		ms.Auth = &noAuth{}
@@ -289,16 +301,62 @@ func (hb *HBone) HandleAcceptedH2(conn net.Conn) {
 	if hb.TCPUserTimeout != 0 {
 		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
 	}
+	t0 := time.Now()
+
 	conf := hb.Auth.GenerateTLSConfigServer()
 	defer conn.Close()
-	tls := tls.Server(conn, conf)
+	tlsConn := tls.Server(conn, conf)
 
-	err := nio.HandshakeTimeout(tls, hb.HandsahakeTimeout, conn)
+	err := nio.HandshakeTimeout(tlsConn, hb.HandsahakeTimeout, conn)
 	if err != nil {
 		return
 	}
 
-	hb.HandleAcceptedH2C(tls)
+	alpn := tlsConn.ConnectionState().NegotiatedProtocol
+	if alpn != "h2" {
+		log.Println("Invalid alpn")
+	}
+
+	hb.startH2ServerMux(tlsConn, t0)
+}
+
+// HandleAcceptedH2C handles a plain text H2 connection, for example
+// in case of secure networks.
+func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
+	if hb.TCPUserTimeout != 0 {
+		// only for TCPConn - if this is used for tls no effect
+		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
+	}
+	hb.startH2ServerMux(conn, time.Now())
+}
+
+func (hb *HBone) startH2ServerMux(conn net.Conn, startT time.Time) {
+	st, err := h2.NewServerTransport(conn, &h2.ServerConfig{
+		//MaxFrameSize:          1 << 22,
+		//InitialConnWindowSize: 1 << 26,
+		//InitialWindowSize:     1 << 25,
+	}, &hb.Events)
+	if err != nil {
+		log.Println("H2 server err", err)
+		conn.Close()
+		return
+	}
+
+	st.MuxConnStart = startT
+
+	st.Handle = func(stream *h2.H2Stream) {
+		hb.handleH2Stream(st, stream)
+	}
+
+	st.TraceCtx = func(ctx context.Context, s string) context.Context {
+		//log.Println("Trace", s)
+		return ctx
+	}
+
+	st.MuxEvent(h2.Event_Connect_Done)
+
+	// blocks - read frames
+	st.HandleStreams()
 }
 
 // SecureConn return true if the connection the the specific endpoint is over a secure network and doesn't
@@ -314,36 +372,8 @@ func (hb *HBone) SecureConn(ep *Endpoint) bool {
 	return ep.Secure
 }
 
-// HandleAcceptedH2C handles a plain text H2 connection, for example
-// in case of secure networks.
-func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
-	if hb.TCPUserTimeout != 0 {
-		// only for TCPConn - if this is used for tls no effect
-		syscall.SetTCPUserTimeout(conn, hb.TCPUserTimeout)
-	}
-
-	st, err := transport2.NewServerTransport(conn, &transport2.ServerConfig{
-		//MaxFrameSize:          1 << 22,
-		//InitialConnWindowSize: 1 << 26,
-		//InitialWindowSize:     1 << 25,
-	})
-	if err != nil {
-		log.Println("H2 server err", err)
-		conn.Close()
-		return
-	}
-
-	// blocks - read frames
-	st.HandleStreams(func(stream *transport2.Stream) {
-		hb.handleH2Stream(st, stream)
-	}, func(ctx context.Context, s string) context.Context {
-		//log.Println("Trace", s)
-		return ctx
-	})
-}
-
 // handleH2Stream is called when a H2 stream header has been received.
-func (hb *HBone) handleH2Stream(st *transport2.HTTP2ServerMux, stream *transport2.Stream) {
+func (hb *HBone) handleH2Stream(st *h2.H2Transport, stream *h2.H2Stream) {
 	// TODO: stats
 
 	go func() {
@@ -413,14 +443,11 @@ func (hb *HBone) handleH2Stream(st *transport2.HTTP2ServerMux, stream *transport
 
 		var hc http.Handler
 		hc = &HBoneAcceptedConn{hb: hb, stream: stream}
-		// Request Body is a read closer - appropriate for the Stream in server mode.
+		// Request Body is a read closer - appropriate for the H2Stream in server mode.
 		// The Write method and associated apply to the response writer.
-		// Stream is both the Request and Response body.
+		// H2Stream is both the Request and Response body.
 		stream.Request.Body = stream
 
-		if hb.HandlerWrapper != nil {
-			hc = hb.HandlerWrapper(hc)
-		}
 		hc.ServeHTTP(stream, stream.Request)
 
 		// TODO: make sure all is closed and done
@@ -433,7 +460,7 @@ func (hb *HBone) handleH2Stream(st *transport2.HTTP2ServerMux, stream *transport
 // HBoneAcceptedConn keeps track of one accepted H2 connection.
 type HBoneAcceptedConn struct {
 	hb     *HBone
-	stream *transport2.Stream
+	stream *h2.H2Stream
 }
 
 // ServeHTTP implements the basic TCP-over-H2 and H2 proxy protocol.
@@ -495,7 +522,7 @@ func (hac *HBoneAcceptedConn) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 // HandleTCPProxy connects and forwards r/w to the hostPort
 func (hb *HBone) HandleTCPProxy(w io.Writer, r io.Reader, hostPort string) error {
-	log.Println("net.Dial", hostPort)
+	log.Println("net.RoundTripStart", hostPort)
 	nc, err := net.Dial("tcp", hostPort)
 	if err != nil {
 		log.Println("Error dialing ", hostPort, err)
@@ -507,7 +534,7 @@ func (hb *HBone) HandleTCPProxy(w io.Writer, r io.Reader, hostPort string) error
 
 // HttpClient returns a http.Client configured with the specified root CA, and reasonable settings.
 // The URest wrapper is added, for telemetry or other interceptors.
-func (uK8S *HBone) HttpClient(caCert []byte) *http.Client {
+func (hb *HBone) HttpClient(caCert []byte) *http.Client {
 	// The 'max idle conns, idle con timeout, etc are shorter - this is meant for
 	// fast initial config, not as a general purpose client.
 	tr := &http.Transport{
@@ -535,10 +562,6 @@ func (uK8S *HBone) HttpClient(caCert []byte) *http.Client {
 
 	var rt http.RoundTripper
 	rt = tr
-	if uK8S.TransportWrapper != nil {
-		rt = uK8S.TransportWrapper(rt)
-	}
-
 	return &http.Client{
 		Transport: rt,
 	}
@@ -551,8 +574,8 @@ func (uK8S *HBone) HttpClient(caCert []byte) *http.Client {
 //			log.Println(ioe.Type, ioe.Frame)
 //			switch fh2.FrameType(ioe.Type) {
 //			case fh2.FrameHeaders:
-//				ioe.Stream.IOChannel = ioch // will not use a go-routine per stream
-//				go hb.handleIOStream(ioch, ioe.Stream, ioe)
+//				ioe.H2Stream.IOChannel = ioch // will not use a go-routine per stream
+//				go hb.handleIOStream(ioch, ioe.H2Stream, ioe)
 //			case fh2.FrameData:
 //
 //			case fh2.FrameWindowUpdate:
@@ -565,12 +588,67 @@ func (uK8S *HBone) HttpClient(caCert []byte) *http.Client {
 //
 //}
 //
-//func (hb *HBone) handleIOStream(ioch chan *fh2.IOEvent, s *fh2.Stream, ioe *fh2.IOEvent) {
+//func (hb *HBone) handleIOStream(ioch chan *fh2.IOEvent, s *fh2.H2Stream, ioe *fh2.IOEvent) {
 //
 //	fh := ioe.Frame.Body().(*fh2.Headers)
 //	h := http.Header{}
 //	s.ProcessHeaders(fh.Headers(), h)
 //
-//	ioe.Stream.SendHeaders(true, &http.Header{})
+//	ioe.H2Stream.SendHeaders(true, &http.Header{})
 //
 //}
+
+// Listener represents the configuration for a real port listener.
+// uGate has a set of special listeners that multiplex requests:
+// - socks5 dest
+// - iptables original dst ( may be combined with DNS interception )
+// - NAT dst address
+// - SNI for TLS
+// - :host header for HTTP
+// - ALPN - after TLS handshake
+//
+// Multiplexed channels do an additional lookup to find the listener
+// based on the channel address.
+type Listener struct {
+
+	// Address address (ex :8080). This is the requested address.
+	//
+	// BTS, SOCKS, HTTP_PROXY and IPTABLES have default ports and bindings, don't
+	// need to be configured here.
+	Address string `json:"address,omitempty"`
+
+	// Port can have multiple protocols:
+	// If missing or other value, this is a dedicated port, specific to a single
+	// destination.
+	Protocol string `json:"proto,omitempty"`
+
+	// ForwardTo where to forward the proxied connections.
+	// Used for accepting on a dedicated port. Will be set as Dest in
+	// the stream, can be mesh node.
+	// host:port format.
+	ForwardTo string `json:"forwardTo,omitempty"`
+
+	// Must block until the connection is fully handled !
+	Handler nio.Handler `json:-`
+
+	// ALPN to announce, for TLS listeners
+	ALPN []string
+
+	// Certificates to use.
+	// Key is a domain, *.domain or *.
+	Certs map[string]string
+
+	NetListener net.Listener `json:-`
+	PortHandler nio.Handler  `json:-`
+}
+
+func (l *Listener) Accept() (net.Conn, error) {
+	return l.NetListener.Accept()
+}
+
+func (l *Listener) Close() error {
+	return l.NetListener.Close()
+}
+func (l *Listener) Addr() net.Addr {
+	return l.NetListener.Addr()
+}

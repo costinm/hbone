@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/costinm/hbone/auth"
-	"github.com/costinm/hbone/echo"
 	"github.com/costinm/hbone/nio"
+	"github.com/costinm/hbone/tools/echo"
+	auth "github.com/costinm/meshauth"
 )
 
 func listenAndServeTCP(addr string, f func(conn net.Conn)) (net.Listener, error) {
@@ -37,7 +37,7 @@ func TestHBone(t *testing.T) {
 	ctx, cf := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cf()
 
-	// Start an echo handler on bob. Equivalent with a pod listening on that port.
+	// RoundTripStart an echo handler on bob. Equivalent with a pod listening on that port.
 	// The service is 'default.bob:8080'
 	eh := &echo.EchoHandler{Debug: Debug}
 	ehL, err := eh.Start(laddr(":14130"))
@@ -54,7 +54,7 @@ func TestHBone(t *testing.T) {
 	bobID := ca.NewID("bob", "default")
 
 	// Create the mesh node based on the identity (directly from CA).
-	alice := New(aliceID)
+	alice := New(aliceID, nil)
 	aliceID.AllowedNamespaces = []string{"*"}
 
 	// Normal process for loading identity:
@@ -63,10 +63,10 @@ func TestHBone(t *testing.T) {
 	bobID2.SetTLSCertificate(bobID.Cert)
 	bobID2.AllowedNamespaces = []string{"*"}
 
-	bob := New(bobID2)
+	bob := New(bobID2, nil)
 	bob.Mux.Handle("/echo", eh)
 
-	// Start Bob's servers for testing.
+	// RoundTripStart Bob's servers for testing.
 	// The H2 port is used to test serverless/trusted-net mode where TLS is terminated by another proxy.
 	l, err := listenAndServeTCP(laddr(":14108"), bob.HandleAcceptedH2)
 	if err != nil {
@@ -151,7 +151,7 @@ func TestHBone(t *testing.T) {
 			data := make([]byte, 1024)
 			r, err := nc.Read(data)
 			if err != io.EOF {
-				t.Fatal("EOF not received")
+				t.Fatal("EOF not received", err)
 			}
 			log.Println("Read EOF ok: ", r, err)
 
@@ -174,7 +174,7 @@ func TestHBone(t *testing.T) {
 	t.Run("invalid-root", func(t *testing.T) {
 		evieca := auth.NewCA("cluster.local")
 
-		evie := New(evieca.NewID("alice", "default"))
+		evie := New(evieca.NewID("alice", "default"), nil)
 		evie.AddService(&Cluster{Addr: "default.bob:8080"}, &Endpoint{Address: bobEndpoint, HBoneAddress: bobHBAddr})
 
 		_, err = evie.Dial("", "default.bob:8080")
@@ -191,7 +191,7 @@ func TestHBone(t *testing.T) {
 		evieca.Private = ca.Private
 		evieca.CACert = ca.CACert
 
-		evie := New(evieca.NewID("alice", "default"))
+		evie := New(evieca.NewID("alice", "default"), nil)
 		evie.AddService(&Cluster{Addr: "default.bob:8080"}, &Endpoint{Address: bobEndpoint, HBoneAddress: bobHBAddr})
 
 		_, err = evie.Dial("", "default.bob:8080")
@@ -251,9 +251,9 @@ func TestHBone(t *testing.T) {
 		// Close will stop both write and read
 
 		t0 := time.Now()
-		_, err = nc.Read(readB)
+		n, err := nc.Read(readB)
 		if err == nil {
-			t.Fatal("Missing close")
+			t.Fatal("Missing close", n)
 		}
 		if err == io.EOF {
 			t.Fatal("EOF after Close")
@@ -266,7 +266,7 @@ func TestHBone(t *testing.T) {
 	// ======== Gateway tests ============
 	// SNI and H2R gate
 	gateID := ca.NewID("gate", "default")
-	gate := New(gateID)
+	gate := New(gateID, nil)
 	gateID.AllowedNamespaces = []string{"*"}
 
 	gateH2, err := listenAndServeTCP(laddr(":14209"), gate.HandleAcceptedH2)
@@ -275,9 +275,9 @@ func TestHBone(t *testing.T) {
 	}
 
 	// Old-style Istio SNI routing - should only be used on VPC, not exposed to internet
-	gateSNIL, err := listenAndServeTCP(laddr(":14207"), func(conn net.Conn) {
-		HandleSNIConn(gate, conn)
-	})
+	//gateSNIL, err := listenAndServeTCP(laddr(":14207"), func(conn net.Conn) {
+	//	setup.HandleSNIConn(gate, conn)
+	//})
 
 	//// "Reverse" connections (original, SNI based)
 	//gateH2RL, err := listenAndServeTCP(laddr(":14206"), gate.HandlerH2RConn)
@@ -300,13 +300,13 @@ func TestHBone(t *testing.T) {
 		})
 
 	// 13022 is the SNI port of the gateway. It'll pass-through to the resolved address.
-	alice.AddService(&Cluster{Addr: "sni.bob.svc:443"}, &Endpoint{
-		Address: bobEndpoint, // the echo server we want to reach
-
-		SNIGate: gateSNIL.Addr().String(),
-		// Use the SNI gate as dest address
-		HBoneAddress: gateSNIL.Addr().String(),
-	})
+	//alice.AddService(&Cluster{Addr: "sni.bob.svc:443"}, &Endpoint{
+	//	Address: bobEndpoint, // the echo server we want to reach
+	//
+	//	SNIGate: gateSNIL.Addr().String(),
+	//	// Use the SNI gate as dest address
+	//	HBoneAddress: gateSNIL.Addr().String(),
+	//})
 
 	alice.AddService(&Cluster{Addr: "h2g.bob.svc:443"}, &Endpoint{
 		Address:      bobEndpoint, // the echo server we want to reach

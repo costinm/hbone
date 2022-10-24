@@ -263,14 +263,14 @@ func closeWriter(dst io.Writer) error {
 //func Proxy(ctx context.Context, cin io.Reader, cout io.WriteCloser, sin io.Reader, sout io.WriteCloser) error {
 //	ch := make(chan int)
 //	s1 := &ReaderCopier{
-//		ID:  "client-o",
+//		WorkloadID:  "client-o",
 //		Out: sout,
 //		In:  cin,
 //	}
 //	go s1.Copy(ch, true)
 //
 //	s2 := &ReaderCopier{
-//		ID:  "client-i",
+//		WorkloadID:  "client-i",
 //		Out: cout,
 //		In:  sin,
 //	}
@@ -346,3 +346,18 @@ func ServeListener(l net.Listener, f func(conn net.Conn)) error {
 		go f(remoteConn)
 	}
 }
+
+// ErrDeadlineExceeded is returned for an expired deadline.
+// This is exported by the os package as os.ErrDeadlineExceeded.
+var ErrDeadlineExceeded error = &DeadlineExceededError{}
+
+// DeadlineExceededError is returned for an expired deadline.
+type DeadlineExceededError struct{}
+
+// Implement the net.Error interface.
+// The string is "i/o timeout" because that is what was returned
+// by earlier Go versions. Changing it may break programs that
+// match on error strings.
+func (e *DeadlineExceededError) Error() string   { return "i/o timeout" }
+func (e *DeadlineExceededError) Timeout() bool   { return true }
+func (e *DeadlineExceededError) Temporary() bool { return true }

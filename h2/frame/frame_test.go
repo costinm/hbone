@@ -815,13 +815,13 @@ func TestReadFrameOrder(t *testing.T) {
 			},
 		},
 		8: {
-			wantErr: "HEADERS frame with stream ID 0",
+			wantErr: "HEADERS frame with stream WorkloadID 0",
 			w: func(f *Framer) {
 				head(f, 0, true)
 			},
 		},
 		9: {
-			wantErr: "CONTINUATION frame with stream ID 0",
+			wantErr: "CONTINUATION frame with stream WorkloadID 0",
 			w: func(f *Framer) {
 				cont(f, 0, true)
 			},
@@ -875,53 +875,6 @@ func TestReadFrameOrder(t *testing.T) {
 		}
 		if n < tt.atLeast {
 			t.Errorf("%d. framer only read %d frames; want at least %d\n%s", i, n, tt.atLeast, log.Bytes())
-		}
-	}
-}
-
-func TestSetReuseFrames(t *testing.T) {
-	fr, buf := testFramer()
-	fr.SetReuseFrames()
-
-	// Check that DataFrames are reused. Note that
-	// SetReuseFrames only currently implements reuse of DataFrames.
-	firstDf := readAndVerifyDataFrame("ABC", 3, fr, buf, t)
-
-	for i := 0; i < 10; i++ {
-		df := readAndVerifyDataFrame("XYZ", 3, fr, buf, t)
-		if df != firstDf {
-			t.Errorf("Expected Framer to return references to the same DataFrame. Have %v and %v", &df, &firstDf)
-		}
-	}
-
-	for i := 0; i < 10; i++ {
-		df := readAndVerifyDataFrame("", 0, fr, buf, t)
-		if df != firstDf {
-			t.Errorf("Expected Framer to return references to the same DataFrame. Have %v and %v", &df, &firstDf)
-		}
-	}
-
-	for i := 0; i < 10; i++ {
-		df := readAndVerifyDataFrame("HHH", 3, fr, buf, t)
-		if df != firstDf {
-			t.Errorf("Expected Framer to return references to the same DataFrame. Have %v and %v", &df, &firstDf)
-		}
-	}
-}
-
-func TestSetReuseFramesMoreThanOnce(t *testing.T) {
-	fr, buf := testFramer()
-	fr.SetReuseFrames()
-
-	firstDf := readAndVerifyDataFrame("ABC", 3, fr, buf, t)
-	fr.SetReuseFrames()
-
-	for i := 0; i < 10; i++ {
-		df := readAndVerifyDataFrame("XYZ", 3, fr, buf, t)
-		// SetReuseFrames should be idempotent
-		fr.SetReuseFrames()
-		if df != firstDf {
-			t.Errorf("Expected Framer to return references to the same DataFrame. Have %v and %v", &df, &firstDf)
 		}
 	}
 }

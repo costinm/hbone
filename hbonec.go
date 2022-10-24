@@ -16,13 +16,9 @@ import (
 	"time"
 
 	"github.com/costinm/hbone/h2"
-	"github.com/costinm/hbone/h2/frame"
 	"github.com/costinm/hbone/nio"
 	"github.com/costinm/hbone/nio/syscall"
 )
-
-// Structs are yaml-friendly:
-// lowercase used by yaml
 
 // Cluster represents a set of endpoints, with a common configuration.
 // Can be a K8S Service with VIP and DNS name, an external service, etc.
@@ -30,18 +26,22 @@ import (
 // Similar with Envoy Cluster or K8S service, can also represent single
 // endpoint with multiple paths/IPs.
 type Cluster struct {
-	// Cluster ID - the cluster name in kube config, hub, gke - cluster name in XDS
+	// Cluster WorkloadID - the cluster name in kube config, hub, gke - cluster name in XDS
 	// Defaults to Base addr - but it is possible to have multiple clusters for
 	// same address ( ex. different users / token providers).
-	// Naming:
-	// GKE: gke_PROJECT_LOCATION_NAME
-	Id string
+	//
+	// Examples:
+	// GKE cluster: gke_PROJECT_LOCATION_NAME
+	ID string `json:"id,omitempty"`
 
 	// ServiceAddr is the TCP address of the cluster - VIP:port or DNS:port
 	// For K8S service it should be in the form serviceName.namespace.svc:svcPort
 	//
 	// This can also be an 'original dst' address for single-endpoint clusters.
-	Addr string
+	// Can be a DNS name that resolves, or some other node.
+	// Individual IPs (relay, etc) will be in the info.addrs field
+	// May also be a URL (webpush endpoint).
+	Addr string `json:"addr,omitempty"`
 
 	// VIP for the cluster. In case of workload, the IP of the workload.
 	// May be empty - Addr will be used.
@@ -69,18 +69,32 @@ type Cluster struct {
 	// May include multiple concatenated roots.
 	CACert string
 
+	// Primary public key of the node.
+	// EC256: 65 bytes, uncompressed format
+	// RSA: DER
+	// ED25519: 32B
+	// Used for sending encryted webpush message
+	// If not known, will be populated after the connection.
+	PublicKey []byte `json:"pub,omitempty"`
+
 	// cached value
 	roots *x509.CertPool
 
 	// TODO: UserAgent, DefaultHeaders
 
+	// If set, a token source with this name is used.
+	// If not found, no tokens will be added. If found, errors getting tokens will result
+	// in errors connecting.
+	TokenSource string
+
 	// Optional TokenProvider - not needed if client wraps google oauth
 	// or mTLS is used.
 	TokenProvider func(context.Context, string) (string, error)
 
+	// Static token to use. May be a long lived K8S service account secret or other long-lived creds.
 	Token string
 
-	// For GKE K8S clusters - extracted from Id.
+	// For GKE K8S clusters - extracted from ID.
 	// This is the default location for the endpoints.
 	Location string
 
@@ -116,9 +130,12 @@ type Cluster struct {
 
 	LastUsed time.Time
 	Dynamic  bool
+
+	h2.Events
 }
 
 // Endpoint represents a connection/association with a cluster.
+// May be a separate pod, or another IP for an existing pod.
 type Endpoint struct {
 	Labels map[string]string
 
@@ -151,10 +168,10 @@ type Endpoint struct {
 // EndpointCon is a multiplexed H2 client for a specific destination instance.
 // Should not be used directly.
 type EndpointCon struct {
-	c        *Cluster
+	Cluster  *Cluster
 	Endpoint *Endpoint
 
-	rt     http.RoundTripper // *http2.ClientConn or custom
+	rt     http.RoundTripper // *http2.ClientConn or custom (wrapper)
 	tlsCon net.Conn
 	// The stream connection - may be a real TCP or not
 	streamCon       net.Conn
@@ -176,8 +193,8 @@ func (c *Cluster) UpdateEndpoints(ep []*Endpoint) {
 func (hb *HBone) AddService(c *Cluster, service ...*Endpoint) *Cluster {
 	hb.m.Lock()
 	hb.Clusters[c.Addr] = c
-	if c.Id != "" {
-		hb.Clusters[c.Id] = c
+	if c.ID != "" {
+		hb.Clusters[c.ID] = c
 	}
 	c.hb = hb
 	if c.ConnectTimeout == 0 {
@@ -232,10 +249,10 @@ func (hb *HBone) Cluster(ctx context.Context, addr string) (*Cluster, error) {
 	return c, nil
 }
 
-// dialTLS creates an outer layer TLS connection with the H2 CONNECT (or POST) address.
+// DialTLS creates an outer layer TLS connection with the H2 CONNECT (or POST) address.
 // Will initiate a TCP connection first - possibly using the SNI gate, and do the handshake.
-func (hc *EndpointCon) dialTLS(ctx context.Context, addr string) (net.Conn, error) {
-	c := hc.c
+func (hc *EndpointCon) DialTLS(ctx context.Context, addr string) (net.Conn, error) {
+	c := hc.Cluster
 	d := &net.Dialer{
 		Timeout:   c.ConnectTimeout,
 		KeepAlive: c.TCPKeepAlive,
@@ -264,7 +281,7 @@ func (hc *EndpointCon) dialTLS(ctx context.Context, addr string) (net.Conn, erro
 	hc.streamCon = conn
 
 	// TODO: skip TLS if trusted network
-	if hc.c.hb.SecureConn(hc.Endpoint) {
+	if hc.Cluster.hb.SecureConn(hc.Endpoint) {
 		hc.tlsCon = conn
 		return conn, nil
 	}
@@ -287,7 +304,7 @@ func (hc *EndpointCon) dialTLS(ctx context.Context, addr string) (net.Conn, erro
 
 	tlsCon := tls.Client(conn, conf)
 
-	err = nio.HandshakeTimeout(tlsCon, hc.c.hb.HandsahakeTimeout, conn)
+	err = nio.HandshakeTimeout(tlsCon, hc.Cluster.hb.HandsahakeTimeout, conn)
 	if err != nil {
 		return nil, err
 	}
@@ -318,6 +335,10 @@ func (c *Cluster) DoRequest(req *http.Request) ([]byte, error) {
 	if err != nil {
 		log.Println("readall", err)
 		return nil, err
+	}
+	if len(data) == 0 {
+		log.Println("readall", err)
+		return nil, io.EOF
 	}
 
 	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
@@ -416,13 +437,24 @@ func (c *Cluster) Dial(ctx context.Context, r *http.Request) (net.Conn, error) {
 }
 
 func (c *Cluster) AddToken(req *http.Request, aut string) error {
+	if c.TokenSource != "" {
+		tp := c.hb.AuthProviders[c.TokenSource]
+		if tp != nil {
+			t, err := tp(req.Context(), aut)
+			if err != nil {
+				return err
+			}
+			req.Header.Add("authorization", "Bearer "+t)
+		}
+	}
 	if c.TokenProvider != nil {
-		t, err := c.TokenProvider(req.Context(), "https://"+aut)
+		t, err := c.TokenProvider(req.Context(), aut)
 		if err != nil {
 			return err
 		}
 		req.Header.Add("authorization", "Bearer "+t)
 	}
+
 	if c.Token != "" {
 		req.Header.Add("authorization", c.Token)
 	}
@@ -436,7 +468,7 @@ func (c *Cluster) dial(ctx context.Context, req *http.Request) (*EndpointCon, ne
 		return nil, nil, err
 	}
 
-	// Hacky dial-using-proxy. Should be handled by rt(). The Dial method takes the result and does
+	// Hacky dial-using-proxy. Should be handled by rt(). The RoundTripStart method takes the result and does
 	// an extra mTLS handshake.
 	//
 	// For http requests calling Roundtrip, the same should happen.
@@ -446,7 +478,7 @@ func (c *Cluster) dial(ctx context.Context, req *http.Request) (*EndpointCon, ne
 		// Tunnel mode, untrusted proxy authentication.
 		req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+epc.Endpoint.HBoneAddress, nil)
 
-		err = c.AddToken(req, epc.Endpoint.HBoneAddress)
+		err = c.AddToken(req, "https://"+epc.Endpoint.HBoneAddress)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -516,13 +548,7 @@ func (c *Cluster) rt(epc *EndpointCon, req *http.Request) (*http.Response, *Endp
 	var resp *http.Response
 	var rterr, err error
 
-	if c.TokenProvider != nil {
-		t, err := c.TokenProvider(req.Context(), "https://"+c.Addr)
-		if err != nil {
-			return nil, nil, err
-		}
-		req.Header.Add("authorization", "Bearer "+t)
-	}
+	c.AddToken(req, "https://"+c.Addr)
 
 	for i := 0; i < 3; i++ {
 
@@ -572,7 +598,7 @@ func (c *Cluster) findMux(ctx context.Context) (*EndpointCon, error) {
 		}
 
 		ep := &EndpointCon{
-			c:        c,
+			Cluster:  c,
 			Endpoint: endp,
 		}
 		c.EndpointCon = append(c.EndpointCon, ep)
@@ -597,7 +623,7 @@ func (c *Cluster) findMux(ctx context.Context) (*EndpointCon, error) {
 	return ep, nil
 }
 
-// Dial a single connection to the host, wrap it with a h2 RoundTripper.
+// RoundTripStart a single connection to the host, wrap it with a h2 RoundTripper.
 // This is bypassing the http2 client - allowing custom LB and mesh options.
 func (ep *EndpointCon) dialH2ClientConn(ctx context.Context) error {
 	// TODO: untrusted proxy support
@@ -616,15 +642,10 @@ func (ep *EndpointCon) dialH2ClientConn(ctx context.Context) error {
 
 	// fallback to cluster address, typical for external
 	if addr == "" {
-		addr = ep.c.Addr
+		addr = ep.Cluster.Addr
 	}
 
-	_, err := ep.dialTLS(ctx, addr)
-	if err != nil {
-		return err
-	}
-
-	c := ep.c
+	c := ep.Cluster
 	if c.InitialWindowSize == 0 {
 		c.InitialWindowSize = 4194304 // 4M - max should bellow 1 << 24,
 	}
@@ -635,24 +656,48 @@ func (ep *EndpointCon) dialH2ClientConn(ctx context.Context) error {
 		c.MaxFrameSize = 262144 // 2^18, 256k
 	}
 	okch := make(chan int, 1)
-	hc, err := h2.NewHTTP2Client(ctx, ep.tlsCon, h2.ConnectOptions{
-		InitialConnWindowSize: c.InitialConnWindowSize,
-
-		InitialWindowSize: c.InitialWindowSize, // 1 << 25,
-		MaxFrameSize:      c.MaxFrameSize,      // 1 << 24,
-	}, func(sf *frame.SettingsFrame) {
-		okch <- 1
-		log.Println("Muxc: Preface received ", sf)
-	}, func(reason h2.GoAwayReason) {
-		ep.rt = nil
-	}, func() {
-		log.Println("Muxc: Close ", addr)
-		ep.rt = nil
-		// TODO: close all associated pending streams ?
-	})
+	hc, err := h2.NewHTTP2Client(ctx,
+		h2.H2Config{
+			InitialConnWindowSize: c.InitialConnWindowSize,
+			InitialWindowSize:     c.InitialWindowSize, // 1 << 25,
+			MaxFrameSize:          c.MaxFrameSize,      // 1 << 24,
+		}, func(reason h2.GoAwayReason) {
+			ep.rt = nil
+		}, func() {
+			log.Println("Muxc: Close ", addr)
+			ep.rt = nil
+			// TODO: close all associated pending streams ?
+		})
 	if err != nil {
 		return err
 	}
+
+	hc.Events.OnEvent(h2.Event_Settings, h2.EventHandlerFunc(func(evt h2.EventType, t *h2.H2Transport, s *h2.H2Stream, f *nio.Buffer) {
+		okch <- 1
+		log.Println("Muxc: Preface received ", s)
+	}))
+
+	hc.Events.Add(ep.Cluster.hb.Events)
+	hc.Events.Add(ep.Cluster.Events)
+
+	// TODO: on-demand discovery using XDS, report discovery start.
+	hc.MuxEvent(h2.Event_Connect_Start)
+
+	hc.MuxConnStart = time.Now()
+
+	_, err = ep.DialTLS(ctx, addr)
+	if err != nil {
+		return err
+	}
+
+	hc.MuxEvent(h2.Event_Connect_Done)
+
+	alpn := ep.tlsCon.(*tls.Conn).ConnectionState().NegotiatedProtocol
+	if alpn != "h2" {
+		log.Println("Invalid alpn")
+	}
+
+	hc.StartConn(ep.tlsCon)
 
 	<-okch
 
@@ -765,7 +810,7 @@ func LocalForwardPort(localAddr, dest string, hb *HBone) error {
 
 			nc, err := hb.DialContext(ctx, "", dest)
 			if err != nil {
-				log.Println("Dial error", dest, err)
+				log.Println("RoundTripStart error", dest, err)
 				a.Close()
 				return
 			}

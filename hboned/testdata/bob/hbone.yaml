@@ -1,0 +1,54 @@
+
+projectid: dmeshgate
+namespace: test
+serviceaccount: default
+location: us-central1
+
+ports:
+  http: "8001"
+
+socksAddr: 127.0.0.1:1082
+hbone: :15208
+hbonec: :15209
+sni: :15203
+adminport: :15200
+
+clusters:
+  istiod.istio-system.svc:15012:
+    addr: "-"
+#  istiod.istio-system.svc:15012:
+#    addr: 34.69.72.163:15012
+#    SNI: istiod.istio-system.svc
+
+  h2r:
+    addr: 127.0.0.1:12441
+
+  example.test.svc:8080:
+    id: example.test.svc:8080
+    addr: 1.2.3.4:8080
+
+  gke_costin-asm1_us-central1-c_big1:
+    # certificate-authority-data:
+    cacert: |
+      -----BEGIN CERTIFICATE-----
+      MIIDDDCCAfSgAwIBAgIRALFiSzMN7EIc3jLdOz83lmYwDQYJKoZIhvcNAQELBQAw
+      LzEtMCsGA1UEAxMkYWQ2YTliMzQtNmUwOS00YTcxLTg0ZjktNTYwOThhZjliZDc2
+      MB4XDTIwMDYxNTE4MDEyNloXDTI1MDYxNDE5MDEyNlowLzEtMCsGA1UEAxMkYWQ2
+      YTliMzQtNmUwOS00YTcxLTg0ZjktNTYwOThhZjliZDc2MIIBIjANBgkqhkiG9w0B
+      AQEFAAOCAQ8AMIIBCgKCAQEAuw6n9CWk2r+Zl6blRSx5WuQXbSivOKBHUT5Y9fS2
+      4M/fPe3hsBFv3KhBMc8tb6q+CvpHhSxcLMw12v+vEc+rIqNb6syhfjd/Z0+WFfmu
+      q0q/xbFWOqBLoMfU933f6hM2/onljh9Qg2eCn336RCkudMrF4L0w6vy0droCeRNt
+      4wTa2cOGhuy4idl6D9r1xAJu1GHQDNKoWyC0tEBqDTANT6B6FJOGYYxt4nJ5SQ1E
+      RMNOoeJ47OYkCOZIyhwYwsxotOHgJg4PYjWgHfte9vdIVIuHL+1hY/B6e/NjHV6h
+      Ti9z2Xwt0JrvD/G5hTCfVHcggbCYJxAAHxCzGHZoNQBN4QIDAQABoyMwITAOBgNV
+      HQ8BAf8EBAMCAgQwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEA
+      ZrOFo/4VLbz88L5mxbP7O8UcYl9dOhooH0uOyS2as6PYRt6SRHFTeGDcLoyGoyAJ
+      6m+9H2mgCyfePj66CD2eLM2Q42iUNqmrL7oiAiNVU1Gic3ZG2nmB0SadoUF9oJiM
+      aW0dCQ0XotR2eCAPM7bTO0rEnGvtJEh2QHUNQsbEPfRUv10fWkznX4dhT8OAYwhY
+      Eors25rGEt94NMB4G7Hyu32aL6iFQQcY9ZZk2qebIdo3GQGHnbdSWz4E/y9VjKne
+      fAiaSs+9EzckUONs5X97Y3m3+w4jpn6Zz9ljxTiYZ7oULX9ki7pliBIJnpzi6OS1
+      XxW6g0LarFWfeOal0M7q0w==
+      -----END CERTIFICATE-----
+    addr: 35.193.24.39:443
+    token: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImFrSDdOSy14VHBXcUVZUGRJMUdRRXQ3dFJFeXhIN3JsNHdHWjFmX2Z6Qk0ifQ.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJrdWJlLXN5c3RlbSIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VjcmV0Lm5hbWUiOiJhZG1pbi10b2tlbi1zZDdtbSIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50Lm5hbWUiOiJhZG1pbiIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50LnVpZCI6IjVlYjcwYWQxLTEyMzQtNDJlMS1iZTY2LWNhNTI1OWVjM2M2NCIsInN1YiI6InN5c3RlbTpzZXJ2aWNlYWNjb3VudDprdWJlLXN5c3RlbTphZG1pbiJ9.PP0jYnnDqZiFQkRjEbbO-9k0Kznm_ihZDOkVH0Gd9FwiUxnb-XmeHIzsPEKbCICRUqU-zCct1rSLW3xr3sN0ZxsaNlpK8V5yfcLexrHymK7lPtbcXDLaukQ8t5vWwNMTfq4mKXjsi6RsbS8yM7JKUoteqqBC8oA4cQZeSuMcrW8GEYygyN5xgemUzEb10d6wP4kNW70arenGYYW5SXHCxwv06sZoPdF0HM7jTyxkWZDfjvu3gzgh-XVn2ukK3UBCxZQsMrc8jPjbeGjNhI-vXa5GlYsvEEFFrDivtx5rQHQPFXxHDaug6yQiEcKvI0imA7F4D9c9hIP8WNOqvHzyIQ
+

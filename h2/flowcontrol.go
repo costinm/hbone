@@ -30,7 +30,7 @@ import (
 // schedule before some of it is written out.
 type writeQuota struct {
 	quota int32
-	// get waits on read from when quota goes less than or equal to zero.
+	// get waits on readBlocking from when quota goes less than or equal to zero.
 	// replenish writes on it when quota goes positive again.
 	ch chan struct{}
 	// done is triggered in error case.
@@ -159,12 +159,12 @@ func (f *inFlow) maybeAdjust(n uint32) uint32 {
 	// estSenderQuota is the receiver's view of the maximum number of bytes the sender
 	// can send without a window update.
 	estSenderQuota := int32(f.limit - (f.pendingData + f.pendingUpdate))
-	// estUntransmittedData is the maximum number of bytes the sends might not have put
+	// estUntransmittedData is the maximum number of bytes the sends might not have Put
 	// on the wire yet. A value of 0 or less means that we have already received all or
-	// more bytes than the application is requesting to read.
+	// more bytes than the application is requesting to readBlocking.
 	estUntransmittedData := int32(n - f.pendingData) // Casting into int32 since it could be negative.
 	// This implies that unless we send a window update, the sender won't be able to send all the bytes
-	// for this message. Therefore we must send an update over the limit since there's an active read
+	// for this message. Therefore we must send an update over the limit since there's an active readBlocking
 	// request from the application.
 	if estUntransmittedData > estSenderQuota {
 		// Sender's window shouldn't go more than 2^31 - 1 as specified in the HTTP spec.

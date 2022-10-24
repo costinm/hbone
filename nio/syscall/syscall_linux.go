@@ -21,6 +21,7 @@
 package syscall
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"syscall"
@@ -66,6 +67,10 @@ func CPUTimeDiff(first *Rusage, latest *Rusage) (float64, float64) {
 
 // SetTCPUserTimeout sets the TCP user timeout on a connection's socket
 func SetTCPUserTimeout(conn net.Conn, timeout time.Duration) error {
+	tlsconn, ok := conn.(*tls.Conn)
+	if ok {
+		conn = tlsconn.NetConn()
+	}
 	tcpconn, ok := conn.(*net.TCPConn)
 	if !ok {
 		// not a TCP connection. exit early

@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/costinm/hbone/h2/hpack"
+	"github.com/costinm/hbone/nio"
 	//"golang.org/x/net/http2/hpack"
 )
 
@@ -122,7 +123,7 @@ var flagName = map[FrameType]map[Flags]string{
 // a frameParser parses a frame given its FrameHeader and payload
 // bytes. The length of payload will always equal fh.Length (which
 // might be 0).
-type frameParser func(fc *frameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error)
+type frameParser func(fc *FrameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error)
 
 var frameParsers = map[FrameType]frameParser{
 	FrameData:         parseDataFrame,
@@ -329,7 +330,7 @@ type Framer struct {
 	debugReadLoggerf  func(string, ...interface{})
 	debugWriteLoggerf func(string, ...interface{})
 
-	frameCache *frameCache // nil if frames aren't reused (default)
+	frameCache *FrameCache // nil if frames aren't reused (default)
 }
 
 func (fr *Framer) maxHeaderListSize() uint32 {
@@ -405,26 +406,19 @@ const (
 	maxFrameSize    = 1<<24 - 1
 )
 
-// SetReuseFrames allows the Framer to reuse Frames.
-// If called on a Framer, Frames returned by calls to ReadFrame are only
-// valid until the next call to ReadFrame.
-func (fr *Framer) SetReuseFrames() {
-	if fr.frameCache != nil {
-		return
-	}
-	fr.frameCache = &frameCache{}
-}
-
 // TODO(HBONE): this is mostly useless, need to return frames after write.
-type frameCache struct {
+type FrameCache struct {
 	dataFrame DataFrame
 }
 
-func (fc *frameCache) getDataFrame() *DataFrame {
+func (fc *FrameCache) getDataFrame() *DataFrame {
 	if fc == nil {
 		return &DataFrame{}
 	}
 	return &fc.dataFrame
+}
+
+func (fc *FrameCache) Recycle(df *DataFrame) {
 }
 
 // NewFramer returns a Framer that writes frames to w and reads them from r.
@@ -504,7 +498,15 @@ func (fr *Framer) ReadFrame() (Frame, error) {
 	if fh.Length > fr.maxReadSize {
 		return nil, ErrFrameTooLarge
 	}
-	payload := fr.getReadBuf(fh.Length)
+
+	var payload []byte
+	if fh.Type == FrameData {
+		payload = nio.GetDataBufferChunk(int64(fh.Length))
+		payload = payload[0:fh.Length]
+	} else {
+		payload = fr.getReadBuf(fh.Length)
+	}
+
 	if _, err := io.ReadFull(fr.r, payload); err != nil {
 		return nil, err
 	}
@@ -596,7 +598,7 @@ func (f *DataFrame) Data() []byte {
 	return f.data
 }
 
-func parseDataFrame(fc *frameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
+func parseDataFrame(fc *FrameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		// DATA frames MUST be associated with a stream. If a
 		// DATA frame is received whose stream identifier
@@ -604,7 +606,7 @@ func parseDataFrame(fc *frameCache, fh FrameHeader, countError func(string), pay
 		// connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
 		countError("frame_data_stream_0")
-		return nil, connError{ErrCodeProtocol, "DATA frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "DATA frame with stream WorkloadID 0"}
 	}
 	f := fc.getDataFrame()
 	f.FrameHeader = fh
@@ -631,8 +633,8 @@ func parseDataFrame(fc *frameCache, fh FrameHeader, countError func(string), pay
 }
 
 var (
-	errStreamID    = errors.New("invalid stream ID")
-	errDepStreamID = errors.New("invalid dependent stream ID")
+	errStreamID    = errors.New("invalid stream WorkloadID")
+	errDepStreamID = errors.New("invalid dependent stream WorkloadID")
 	errPadLength   = errors.New("pad length too large")
 	errPadBytes    = errors.New("padding bytes must all be zeros unless AllowIllegalWrites is enabled")
 )
@@ -687,6 +689,7 @@ func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []by
 	if pad != nil {
 		flags |= FlagDataPadded
 	}
+
 	f.startWrite(FrameData, flags, streamID)
 	if pad != nil {
 		f.wbuf = append(f.wbuf, byte(len(pad)))
@@ -694,6 +697,47 @@ func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []by
 	f.wbuf = append(f.wbuf, data...)
 	f.wbuf = append(f.wbuf, pad...)
 	return f.endWrite()
+}
+
+// WriteDataNC will write a data frame without making a copy.
+// The data is expected to have space in the front for the header.
+func (f *Framer) WriteDataNC(streamID uint32, endStream bool, data []byte, start, end int) error {
+	var flags Flags
+	if endStream {
+		flags |= FlagDataEndStream
+	}
+
+	length := end - start
+
+	data[start-9] = byte(length >> 16)
+	data[start-8] = byte(length >> 8)
+	data[start-7] = byte(length)
+	data[start-6] = byte(FrameData)
+	data[start-5] = byte(flags)
+	data[start-4] = byte(streamID >> 24)
+	data[start-3] = byte(streamID >> 16)
+	data[start-2] = byte(streamID >> 8)
+	data[start-1] = byte(streamID)
+
+	if length >= (1 << 24) {
+		return ErrFrameTooLarge
+	}
+	if f.logWrites {
+		var buf bytes.Buffer
+		ldata := data[start:end]
+		const max = 256
+		if len(ldata) > max {
+			data = ldata[:max]
+		}
+		fmt.Fprintf(&buf, " data=%q", data)
+		f.debugWriteLoggerf("http2: Framer %p: wrote %s", f, buf.String())
+	}
+
+	n, err := f.w.Write(data[start-9 : end])
+	if err == nil && n != end-start+9 {
+		err = io.ErrShortWrite
+	}
+	return err
 }
 
 // A SettingsFrame conveys configuration parameters that affect how
@@ -706,7 +750,7 @@ type SettingsFrame struct {
 	p []byte
 }
 
-func parseSettingsFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseSettingsFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if fh.Flags.Has(FlagSettingsAck) && fh.Length > 0 {
 		// When this (ACK 0x1) bit is set, the payload of the
 		// SETTINGS frame MUST be empty. Receipt of a
@@ -847,7 +891,7 @@ type PingFrame struct {
 
 func (f *PingFrame) IsAck() bool { return f.Flags.Has(FlagPingAck) }
 
-func parsePingFrame(_ *frameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
+func parsePingFrame(_ *FrameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
 	if len(payload) != 8 {
 		countError("frame_ping_length")
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -889,7 +933,7 @@ func (f *GoAwayFrame) DebugData() []byte {
 	return f.debugData
 }
 
-func parseGoAwayFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseGoAwayFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if fh.StreamID != 0 {
 		countError("frame_goaway_has_stream")
 		return nil, ConnectionError(ErrCodeProtocol)
@@ -931,7 +975,7 @@ func (f *UnknownFrame) Payload() []byte {
 	return f.p
 }
 
-func parseUnknownFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseUnknownFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	return &UnknownFrame{fh, p}, nil
 }
 
@@ -942,7 +986,7 @@ type WindowUpdateFrame struct {
 	Increment uint32 // never read with high bit set
 }
 
-func parseWindowUpdateFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseWindowUpdateFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if len(p) != 4 {
 		countError("frame_windowupdate_bad_len")
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -970,7 +1014,7 @@ func parseWindowUpdateFrame(_ *frameCache, fh FrameHeader, countError func(strin
 
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.
 // The increment value must be between 1 and 2,147,483,647, inclusive.
-// If the Stream ID is zero, the window update applies to the
+// If the Stream WorkloadID is zero, the window update applies to the
 // connection as a whole.
 func (f *Framer) WriteWindowUpdate(streamID, incr uint32) error {
 	// "The legal range for the increment to the flow control window is 1 to 2^31-1 (2,147,483,647) octets."
@@ -1010,7 +1054,7 @@ func (f *HeadersFrame) HasPriority() bool {
 	return f.FrameHeader.Flags.Has(FlagHeadersPriority)
 }
 
-func parseHeadersFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
+func parseHeadersFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
 	hf := &HeadersFrame{
 		FrameHeader: fh,
 	}
@@ -1020,7 +1064,7 @@ func parseHeadersFrame(_ *frameCache, fh FrameHeader, countError func(string), p
 		// respond with a connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
 		countError("frame_headers_zero_stream")
-		return nil, connError{ErrCodeProtocol, "HEADERS frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "HEADERS frame with stream WorkloadID 0"}
 	}
 	var padLength uint8
 	if fh.Flags.Has(FlagHeadersPadded) {
@@ -1054,7 +1098,7 @@ func parseHeadersFrame(_ *frameCache, fh FrameHeader, countError func(string), p
 
 // HeadersFrameParam are the parameters for writing a HEADERS frame.
 type HeadersFrameParam struct {
-	// StreamID is the required Stream ID to initiate.
+	// StreamID is the required Stream WorkloadID to initiate.
 	StreamID uint32
 	// BlockFragment is part (or all) of a Header Block.
 	BlockFragment []byte
@@ -1152,10 +1196,10 @@ func (p PriorityParam) IsZero() bool {
 	return p == PriorityParam{}
 }
 
-func parsePriorityFrame(_ *frameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
+func parsePriorityFrame(_ *FrameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		countError("frame_priority_zero_stream")
-		return nil, connError{ErrCodeProtocol, "PRIORITY frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "PRIORITY frame with stream WorkloadID 0"}
 	}
 	if len(payload) != 5 {
 		countError("frame_priority_bad_length")
@@ -1201,7 +1245,7 @@ type RSTStreamFrame struct {
 	ErrCode ErrCode
 }
 
-func parseRSTStreamFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseRSTStreamFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if len(p) != 4 {
 		countError("frame_rststream_bad_len")
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -1233,10 +1277,10 @@ type ContinuationFrame struct {
 	headerFragBuf []byte
 }
 
-func parseContinuationFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+func parseContinuationFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		countError("frame_continuation_zero_stream")
-		return nil, connError{ErrCodeProtocol, "CONTINUATION frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "CONTINUATION frame with stream WorkloadID 0"}
 	}
 	return &ContinuationFrame{fh, p}, nil
 }
@@ -1284,7 +1328,7 @@ func (f *PushPromiseFrame) HeadersEnded() bool {
 	return f.FrameHeader.Flags.Has(FlagPushPromiseEndHeaders)
 }
 
-func parsePushPromise(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
+func parsePushPromise(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (_ Frame, err error) {
 	pp := &PushPromiseFrame{
 		FrameHeader: fh,
 	}
@@ -1326,10 +1370,10 @@ func parsePushPromise(_ *frameCache, fh FrameHeader, countError func(string), p 
 
 // PushPromiseParam are the parameters for writing a PUSH_PROMISE frame.
 type PushPromiseParam struct {
-	// StreamID is the required Stream ID to initiate.
+	// StreamID is the required Stream WorkloadID to initiate.
 	StreamID uint32
 
-	// PromiseID is the required Stream ID which this
+	// PromiseID is the required Stream WorkloadID which this
 	// Push Promises
 	PromiseID uint32
 
