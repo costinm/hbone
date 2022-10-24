@@ -112,7 +112,7 @@ func (ts *K8STokenSource) GetToken(ctx context.Context, aud string) (string, err
 	//    },
 	//    "status": {
 	//        "expirationTimestamp": "2022-07-01T15:55:01Z",
-	//        "token": "ya29.a0ARrdaM_iVZGW8jWHQihYP72gZkOLcy8ZDOKWWNjHn45Xvv9P6K5-RTV_qcaUQBav_d3aijjyrVHSWdsruSEOWDlpoDAd56fXg18hxLVMiie63JJXkJPT9XlStccJuX4KLl-K0WKI1dQwySdQ6x9c-1b3YS108p3-CEL-HKA"
+	//        "token": ".." // ya29 
 	//    }
 	//}
 	return GetTokenRaw(ctx, ts.Cluster, ts.Namespace, ts.KSA, aud)
