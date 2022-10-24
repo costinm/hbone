@@ -28,7 +28,6 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/costinm/hbone"
-	"github.com/costinm/hbone/ext/tel"
 	"github.com/costinm/hbone/hboned/gcp"
 	"github.com/costinm/hbone/hboned/handlers"
 	"github.com/costinm/hbone/nio"
@@ -79,7 +78,7 @@ func main() {
 
 	hb := hbone.New(id, hc)
 
-	otel.InitProm(hb)
+	//otel.InitProm(hb)
 
 	// Initialize token-based auth. This is useful for making calls to GCP APIs
 	// Optional, env specific.

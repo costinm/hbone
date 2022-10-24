@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/costinm/hbone"
-	"github.com/costinm/hbone/ext/tel"
 	"github.com/costinm/hbone/hboned/gcp"
 	"github.com/costinm/hbone/hboned/handlers"
 	"github.com/costinm/hbone/urpc"
@@ -54,7 +53,7 @@ func TestURest(t *testing.T) {
 
 	hb := hbone.New(id, hc)
 
-	otel.InitProm(hb)
+	//otel.InitProm(hb)
 
 	//otel.OTelEnable(hb)
 	//otelC := setup.FileExporter(ctx, os.Stderr)
