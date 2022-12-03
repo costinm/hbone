@@ -1,0 +1,5 @@
+hboned/private_key.pem
+hboned/ca-certificates.crt
+hboned/certificates.pem
+hboned/__debug_bin
+oryxBuildBinary
