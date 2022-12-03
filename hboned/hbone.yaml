@@ -5,13 +5,11 @@
 
 # If using K8S for token auth. If a cert is missing this will also be used
 # with Citadel.
+#
 # If a cert is provisioned, will be extracted from the cert.
 # namespace: test
 # serviceaccount: default
 
-# Extracted from cert if present
-#namespace: default
-#serviceaccount: default
 
 #socksAddr: 127.0.0.1:1080
 #hbone: :15008

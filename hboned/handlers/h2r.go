@@ -1,11 +1,7 @@
 package handlers
 
 import (
-	"context"
 	"fmt"
-	"log"
-	"net"
-	"time"
 
 	"github.com/costinm/hbone"
 )
@@ -54,66 +50,12 @@ func RemoteForward(hb *hbone.HBone, hg, sn, ns string) *hbone.EndpointCon {
 		Cluster: attachC,
 	}
 
-	go func() {
-		_, err := DialH2R(context.Background(), attachE, hg)
-		log.Println("H2R connected", hg, err)
-	}()
+	//go func() {
+	//	_, err := DialH2R(context.Background(), attachE, hg)
+	//	log.Println("H2R connected", hg, err)
+	//}()
 
 	return attachE
-}
-
-// - H2R Server accepts mTLS connection from client, using h2r ALPN
-// - Client opens a H2 _server_ handler on the stream, H2R server acts as
-// a H2 client.
-// - EndpointCon is registered in k8s, using IP of the server holding the connection
-// - SNI requests on the H2R server are routed to existing connection
-// - if a connection is not found on local server, forward based on endpoint.
-// DialH2R connects to an H2R tunnel endpoint, and accepts connections from the tunnel
-// Not blocking.
-func DialH2R(ctx context.Context, hc *hbone.EndpointCon, addr string) (net.Conn, error) {
-	tc, err := hc.DialTLS(ctx, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	go func() {
-		backoff := 50 * time.Millisecond
-		for {
-			t0 := time.Now()
-			// XXX replace with grpc stack
-			//hc.c.hb.h2Server.ServeConn(tc, &http2.ServeConnOpts{
-			//	//Context:    ctx,
-			//	Handler:    &HBoneAcceptedConn{conn: hc.tlsCon, hb: hc.c.hb},
-			//	BaseConfig: &http.Server{},
-			//})
-			if hbone.Debug {
-				log.Println("H2RClient closed, redial", time.Since(t0))
-			}
-			for {
-				if ctx.Err() != nil {
-					log.Println("H2RClient canceled")
-					return
-				}
-				tc, err = hc.DialTLS(ctx, addr)
-				if err != nil {
-					time.Sleep(backoff)
-					backoff = backoff * 2
-				}
-				backoff = 50 * time.Millisecond
-				break
-			}
-			if hbone.Debug {
-				log.Println("H2RClient reconnected", time.Since(t0))
-			}
-		}
-	}()
-
-	tlsCon := tc
-	//if Debug {
-	//	log.Println("H2RClient started ", tlsCon.ConnectionState().ServerName,
-	//		tlsCon.ConnectionState().PeerCertificates[0].URIs)
-	//}
-	return tlsCon, nil
 }
 
 //// GetClientConn is called by http2.Transport, if Transport.RoundTrip is called (

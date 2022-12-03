@@ -20,25 +20,27 @@ package h2
 
 import (
 	"fmt"
-	"log"
 	"math"
 	"sync"
 	"sync/atomic"
 )
 
+// TODO: merge with quick flowController:
+// - SendWindowSize, UpdateSendWindow, AddBytesSent
+// - AddBytesRead, GetWindowUpdate, IsNewlyBlocked
+// UpdateHighestReceived - specific to quic
+
 // writeQuota is a soft limit on the amount of data a stream can
 // schedule before some of it is written out.
 type writeQuota struct {
 	quota int32
-	// get waits on readBlocking from when quota goes less than or equal to zero.
+
+	// waitOrConsumeQuota waits on readBlocking from when quota goes less than or equal to zero.
 	// replenish writes on it when quota goes positive again.
 	ch chan struct{}
+
 	// done is triggered in error case.
 	done <-chan struct{}
-	// replenish is called by loopyWriter to give quota back to.
-	// It is implemented as a field so that it can be updated
-	// by tests.
-	replenish func(n int)
 }
 
 func newWriteQuota(sz int32, done <-chan struct{}) *writeQuota {
@@ -47,23 +49,23 @@ func newWriteQuota(sz int32, done <-chan struct{}) *writeQuota {
 		ch:    make(chan struct{}, 1),
 		done:  done,
 	}
-	w.replenish = w.realReplenish
 	return w
 }
 
-// get blocks until write quota is available for sz bytes.
+// waitOrConsumeQuota blocks until write quota is available.
+// quota may become negative - the send will only use part of the buffer.
 // TODO: write deadline
-// TODO: return a smaller ammount ( what's available), so very large writes can
-// be chunked.
-func (w *writeQuota) get(sz int32) error {
+func (w *writeQuota) waitOrConsumeQuota(sz int32) error {
 	if sz == 0 {
 		return nil
 	}
 	for {
 		if atomic.LoadInt32(&w.quota) > 0 {
+			//  what happens if replensish is called now ? No problem, quota would go further up
 			atomic.AddInt32(&w.quota, -sz)
 			return nil
 		}
+		// Quota was negative.
 		select {
 		case <-w.ch:
 			continue
@@ -76,6 +78,8 @@ func (w *writeQuota) get(sz int32) error {
 func (w *writeQuota) realReplenish(n int) {
 	sz := int32(n)
 	a := atomic.AddInt32(&w.quota, sz)
+	// what happens if consume decrement is called here ? Quota would become negative, but
+	// consume is happy returning, only next consume call will block.
 	b := a - sz
 	if b <= 0 && a > 0 {
 		select {
@@ -129,11 +133,16 @@ func (f *trInFlow) getSize() uint32 {
 // inFlow deals with inbound flow control
 type inFlow struct {
 	mu sync.Mutex
-	// The inbound flow control limit for pending data.
+
+	// The inbound flow control limit for pending data. Initial value is the value from the peer's Settings frame
+	// or default. Rarely it may be changed by the server with separate Settings - but usually caller sends window
+	// updates.
 	limit uint32
+
 	// pendingData is the overall data which have been received but not been
-	// consumed by applications.
+	// consumed by applications. Apps marks it as consumed by calling onRead via transport.UpdateWindow
 	pendingData uint32
+
 	// The amount of data the application has consumed but grpc has not sent
 	// window update for them. Used to reduce window update frequency.
 	pendingUpdate uint32
@@ -185,12 +194,11 @@ func (f *inFlow) maybeAdjust(n uint32) uint32 {
 func (f *inFlow) onData(n uint32) error {
 	f.mu.Lock()
 	f.pendingData += n
+
 	if f.pendingData+f.pendingUpdate > f.limit+f.delta {
-		limit := f.limit
 		rcvd := f.pendingData + f.pendingUpdate
 		f.mu.Unlock()
-		log.Printf("received %d pendingUpdate %d n %d  exceeding the limit %d bytes", rcvd, f.pendingUpdate, n, limit)
-		return fmt.Errorf("received %d-bytes data exceeding the limit %d bytes", rcvd, limit)
+		return fmt.Errorf("received %d-bytes data exceeding the limit", rcvd)
 	}
 	f.mu.Unlock()
 	return nil

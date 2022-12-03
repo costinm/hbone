@@ -1,4 +1,4 @@
-package uxds
+package urpc
 
 import (
 	"context"
@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/costinm/hbone"
-	"github.com/costinm/hbone/nio"
 	"github.com/golang/protobuf/jsonpb"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
@@ -96,7 +95,7 @@ type Config struct {
 type ADSC struct {
 	ctx context.Context
 
-	stream *nio.Stream
+	stream *UGRPC
 
 	// NodeID is the node identity sent to Pilot.
 	nodeID string
@@ -256,7 +255,7 @@ func getPrivateIPIfAvailable() net.IP {
 func (a *ADSC) Close() {
 	a.mutex.Lock()
 	if a.stream != nil {
-		_ = a.stream.CloseWrite()
+		_ = a.stream.Stream.CloseWrite()
 	}
 	a.mutex.Unlock()
 }
@@ -265,20 +264,29 @@ func (a *ADSC) Close() {
 func (a *ADSC) Run() error {
 
 	ctx := a.ctx
-	gstr := NewGRPCStream(ctx, a.Config.Cluster, a.Config.Cluster.Addr, "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources")
+	gstr, err := New(ctx, a.Config.Cluster, a.Config.Cluster.Addr, "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources")
+	if err != nil {
+		return err
+	}
+	a.Config.Cluster.AddToken(gstr.Stream.Request, "istio-ca")
+
 	if a.Config.XDSHeaders != nil {
 		for k, v := range a.Config.XDSHeaders {
-			gstr.Request.Header.Add(k, v)
+			gstr.Stream.Request.Header.Add(k, v)
 		}
 	}
-	gstr.RoundTripStart()
+	_, err = gstr.Stream.Transport().DialStream(gstr.Stream)
+	if err != nil {
+		return err
+	}
+
 	a.stream = gstr
-	gstr.ErrChan = a.errChan
+	//gstr.ErrChan = a.errChan
 
 	go a.handleRecv()
 
 	// wait for firsts message
-	err := <-a.errChan
+	//err := <-a.errChan
 
 	// TD only returns an error after sending the first request.
 	// The ugrpc only starts the stream after the first request.
@@ -286,7 +294,8 @@ func (a *ADSC) Run() error {
 }
 
 func (a *ADSC) handleRecv() {
-	a.stream.RoundTripStart()
+	//a.stream.RoundTripStart()
+
 	// Watch will start watching resources, starting with CDS. Based on the CDS response
 	// it will start watching RDS and CDS.
 	if len(a.Config.InitialDiscoveryRequests) == 0 {
@@ -307,8 +316,12 @@ func (a *ADSC) handleRecv() {
 	}
 	a.Updates <- "init"
 
+	a.stream.Stream.WaitHeaders()
+	// TODO: check 200
+
 	for {
-		raw, err := a.stream.Recv(false)
+		var msg xds.DiscoveryResponse
+		err := a.stream.RecvMsg(&msg)
 		if err != nil {
 			log.Printf("Connection closed for %v: %v", a.nodeID, err)
 			a.Close()
@@ -316,9 +329,8 @@ func (a *ADSC) handleRecv() {
 			a.Updates <- "close"
 			return
 		}
-		var msg xds.DiscoveryResponse
 		// Makes copy of byte[]
-		proto.Unmarshal(raw.Bytes(), &msg)
+		//proto.Unmarshal(raw.Bytes(), &msg)
 
 		if dump {
 			log.Printf("XDS in: %v %s %s %d", msg.TypeUrl, msg.Nonce, msg.VersionInfo, len(msg.Resources))
@@ -662,14 +674,9 @@ func (a *ADSC) send(dr *xds.DiscoveryRequest, reason string) error {
 	if dump {
 		log.Printf("send message for type %v (%v) for %v", dr.TypeUrl, reason, dr.ResourceNames)
 	}
-	b := a.stream.GetWriteFrame()
-	bout, err := proto.MarshalOptions{}.MarshalAppend(b.Bytes(), dr)
-	if err != nil {
-		return err
-	}
-	b.UpdateAppend(bout)
 
-	err = a.stream.Send(b)
+	err := a.stream.SendMsg(dr)
+
 	a.sendCount++
 	return err
 }

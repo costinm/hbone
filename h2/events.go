@@ -106,6 +106,9 @@ func (s *Events) OnEvent(t EventType, eh EventHandler) {
 	if s.eventHandlers == nil {
 		s.eventHandlers = make([]EventHandler, EventLAST)
 	}
+	if eh == nil {
+		return
+	}
 	if s.eventHandlers[t] == nil {
 		s.eventHandlers[t] = eh
 		return

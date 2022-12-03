@@ -26,13 +26,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/pkg/multierror"
-	"github.com/costinm/hbone/nio"
-	"github.com/costinm/hbone/tools/echo/grpcecho/proto"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
-
+	"github.com/costinm/hbone"
+	"github.com/costinm/hbone/h2"
+	grpc "github.com/costinm/hbone/urpc"
+	"github.com/costinm/hbone/urpc/gen/proto"
+	"github.com/hashicorp/go-multierror"
 	"golang.org/x/sync/semaphore"
+	"google.golang.org/grpc/metadata"
 )
 
 //var (
@@ -48,18 +48,48 @@ import (
 //	monitoring.MustRegister(Metrics.HTTPRequests, Metrics.GrpcRequests, Metrics.TCPRequests)
 //}
 
+const ECHO_SERVICE = "/proto.EchoTestService/Echo"
+
 type EchoGrpcHandler struct {
 	Port         int
 	Version      string
 	Cluster      string
 	IstioVersion string
+
+	Mesh *hbone.HBone
 }
 
 // Handle /grpc/ requests, equivalent with forward
 func (h *EchoGrpcHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	s := writer.(*h2.H2Stream)
+	urpc := grpc.NewFromStream(s)
+
+	if strings.HasSuffix(request.URL.Path, "/Echo") {
+		er := &proto.EchoRequest{}
+		err := urpc.RecvMsg(er)
+		if err != nil {
+			return
+		}
+		res, err := h.Echo(s, s, er)
+		if err != nil {
+			return
+		}
+		urpc.SendMsg(res)
+	} else {
+		er := &proto.ForwardEchoRequest{}
+		urpc.RecvMsg(er)
+		res, err := h.ForwardEcho(s, er)
+		if err != nil {
+			return
+		}
+		urpc.SendMsg(res)
+	}
+
+	// TODO: set Trailers
+	urpc.Stream.CloseWrite()
 }
 
-func (h *EchoGrpcHandler) Echo(ctx context.Context, s *nio.Conn, req *proto.EchoRequest) (*proto.EchoResponse, error) {
+func (h *EchoGrpcHandler) Echo(ctx context.Context, s *h2.H2Stream, req *proto.EchoRequest) (*proto.EchoResponse, error) {
 	// Using opencensus or otel or envoy telemetry
 	//defer GrpcRequests.With(common.PortLabel.Value(strconv.Itoa(h.Port))).Increment()
 	body := bytes.Buffer{}
@@ -138,8 +168,6 @@ func (h *EchoGrpcHandler) ForwardEcho(ctx context.Context, req *proto.ForwardEch
 		return nil, err
 	}
 
-	client := proto.NewEchoTestServiceClient(grpcConn)
-
 	// make the timeout apply to the entire set of requests
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(req.TimeoutMicros)*time.Microsecond)
 	var canceled bool
@@ -166,7 +194,7 @@ func (h *EchoGrpcHandler) ForwardEcho(ctx context.Context, req *proto.ForwardEch
 				return fmt.Errorf("request set timed out")
 			}
 			st := time.Now()
-			resp, err := h.makeRequest(ctx, client, req, rid)
+			resp, err := h.makeRequest(ctx, grpcConn, req, rid)
 			rt := time.Since(st)
 			if err != nil {
 				return err
@@ -247,11 +275,10 @@ const (
 	ConnectionTimeout = 2 * time.Second
 )
 
-func (h *EchoGrpcHandler) newClient(ctx context.Context, req *proto.ForwardEchoRequest) (*grpc.ClientConn, error) {
+func (h *EchoGrpcHandler) newClient(ctx context.Context, req *proto.ForwardEchoRequest) (*grpc.UGRPC, error) {
 	// NOTE: XDS load-balancing happens per-ForwardEchoRequest since we create a new client each time
 	rawURL := req.Url
 	var urlScheme string
-	var opts []grpc.DialOption
 	// grpc-go sets incorrect authority header
 	if i := strings.IndexByte(rawURL, ':'); i > 0 {
 		urlScheme = strings.ToLower(rawURL[0:i])
@@ -274,14 +301,15 @@ func (h *EchoGrpcHandler) newClient(ctx context.Context, req *proto.ForwardEchoR
 	//		host = k.Value
 	//	}
 	//}
-	grpcConn, err := grpc.DialContext(ctx, address, opts...)
+	c, err := h.Mesh.Cluster(ctx, address)
+	grpcConn, err := grpc.New(ctx, c, address, "/proto.EchoTestService/Echo")
 	if err != nil {
 		return nil, err
 	}
 	return grpcConn, nil
 }
 
-func (h *EchoGrpcHandler) makeRequest(ctx context.Context, client proto.EchoTestServiceClient, req *proto.ForwardEchoRequest, reqID int) (string, error) {
+func (h *EchoGrpcHandler) makeRequest(ctx context.Context, client *grpc.UGRPC, req *proto.ForwardEchoRequest, reqID int) (string, error) {
 
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(req.TimeoutMicros)*time.Microsecond)
 	defer cancel()
@@ -303,7 +331,8 @@ func (h *EchoGrpcHandler) makeRequest(ctx context.Context, client proto.EchoTest
 	}
 	outBuffer.WriteString(fmt.Sprintf("[%d] grpcecho.Echo(%v)\n", reqID, req))
 
-	resp, err := client.Echo(ctx, grpcReq)
+	resp := &proto.EchoResponse{}
+	err := client.Invoke(grpcReq, resp)
 	if err != nil {
 		return "", err
 	}

@@ -1,10 +1,15 @@
-package uxds
+package urpc
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 
+	"github.com/costinm/hbone"
+	"github.com/costinm/hbone/h2"
 	"github.com/costinm/hbone/nio"
 	"google.golang.org/protobuf/proto"
 )
@@ -45,60 +50,190 @@ import (
 // For response, the caller must handle headers like:
 //   - trailer grpc-status, grpc-message, grpc-status-details-bin, grpc-encoding
 //   - http status codes other than 200 (which is expected for gRPC)
-func NewGRPCStream(ctx context.Context, c http.RoundTripper, host, path string) *nio.Stream {
-	// TODO: non-blocking implementation, to avoid an extra gorutine for Write and RoundTrip.
-	in, out := io.Pipe()
 
-	req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+host+path, in)
+// UGRPC represents a single gRPC transaction - unary or stream request.
+type UGRPC struct {
+	Stream *h2.H2Stream
+
+	// Streaming support
+	// Used for framing responses
+	// lastFrame holds the last received frame. It will be reused by Recv if not nil.
+	// The caller can take ownership of the frame by setting this to nil.
+	lastFrame *nio.Buffer
+	rbuffer   *nio.Buffer
+}
+
+func New(ctx context.Context, c *hbone.Cluster, host, path string) (*UGRPC, error) {
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://"+host+path, nil)
 	req.Header.Add("content-type", "application/grpc")
 	req.Header.Add("te", "trailers") // TODO: can it be removed ?
 
-	//req.Header.Add("grpc-timeout", "10S")
+	h2c := h2.NewStreamReq(req)
 
-	r := &nio.Stream{
-		Out:     out,
-		Request: req,
-	}
+	// Find or dial an h2 transport
+	tr, err := c.FindTransport(ctx)
+	h2c.SetTransport(tr, true)
 
-	r.Cluster = c
-
-	return r
+	return &UGRPC{Stream: h2c}, err
 }
 
-func GRPCHandler(f func(ctx context.Context, args proto.Message) (interface{}, error),
-	preq, pres proto.Message) http.Handler {
-	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		s := nio.NewStreamRequest(request, writer, nil)
-
-		f, err := s.Recv(true)
-		if err != nil {
-			writer.WriteHeader(500)
-			return
-		}
-		pres1 := pres.ProtoReflect().New()
-		err = proto.Unmarshal(f.Bytes(), pres1.(proto.Message))
-
-	})
+func NewFromStream(s *h2.H2Stream) *UGRPC {
+	return &UGRPC{Stream: s}
 }
 
-func SendGPRC(s *nio.Stream, args interface{}, reply interface{}) error {
+// Invoke implements a minimal gRPC protocol.
+func (u *UGRPC) Invoke(args interface{}, reply interface{}) error {
+	s := u.Stream
 
-	s.RoundTripStart()
+	_, err := s.Transport().DialStream(s)
+	//s.RoundTripStart()
 
-	bb := s.GetWriteFrame()
-	bout, _ := proto.MarshalOptions{}.MarshalAppend(bb.Bytes(), args.(proto.Message))
+	pm := args.(proto.Message)
+	m := proto.MarshalOptions{UseCachedSize: true}
+	sz := m.Size(pm)
+	bb := s.GetWriteFrame(sz)
+
+	// Slice = pointer to start position on underlying array, len, capacity - space from end of data to real array end
+	// bb.bytes: realArray[start:end]
+	// bout: either realArray[start:end+sz] or newArray[], similar to append()
+	//
+	// Problem: bb may have a prefix, which is lost if we use start:end. We need 0:end
+	bout, _ := proto.MarshalOptions{}.MarshalAppend(bb.BytesAppend(), pm)
+
 	bb.UpdateAppend(bout)
-	err := s.Send(bb)
+
+	err = s.Send(bb)
 	if err != nil {
 		return err
 	}
 	s.CloseWrite()
 
-	f, err := s.Recv(true)
+	s.WaitHeaders()
+
+	f, err := u.Recv()
 	if err != nil {
 		return err
 	}
 	err = proto.Unmarshal(f.Bytes(), reply.(proto.Message))
+
+	return err
+}
+
+func (u *UGRPC) SendMsg(args interface{}) error {
+	return SendMsg(u.Stream, args)
+}
+
+func (u *UGRPC) RecvMsg(args interface{}) error {
+	f, err := u.Recv()
+	if err != nil {
+		return err
+	}
+	err = proto.Unmarshal(f.Bytes(), args.(proto.Message))
+	return err
+}
+
+func (u *UGRPC) Recv() (*nio.Buffer, error) {
+	hc := u.Stream
+
+	if u.rbuffer == nil {
+		u.rbuffer = nio.GetBuffer(0, 0)
+	}
+	b := u.rbuffer
+
+	if b.Len() > 0 {
+		b.Discard(int(5 + len(u.lastFrame.Bytes())))
+	} else {
+		//log.Println("Header: ", hc.Res.Header)
+		// Initial headers don't include grpc-status - just 200
+		// grpc-encoding - compression
+
+	}
+
+	// TODO: only if an incomplete frame.
+	if !b.IsEmpty() {
+		b.Compact()
+	}
+
+	hc.RcvdPackets++
+
+	var mlen uint32
+	head, err := b.Fill(hc, 5)
+	if err == nil {
+		if head[0] != 0 {
+			return nil, fmt.Errorf("Invalid frame %d", head[0])
+		}
+		mlen = binary.BigEndian.Uint32(head[1:])
+
+		_, err = b.Fill(hc, int(5+mlen))
+	}
+	// At this point, Res should be set.
+
+	if err == io.EOF {
+		// TODO: extract, see http2-client in grpc
+		// grpc-status
+		// grpc-message
+		// grpc-status-details-bin - base64 proto
+		if hc.Response != nil {
+			log.Println("Trailer", hc.Response.Trailer)
+			hc.Response.Body.Close()
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
+	if hc.Response.Trailer.Get("") != "" {
+
+	}
+
+	u.lastFrame = b.Frame(5, int(5+mlen))
+	return u.lastFrame, err
+}
+
+func (u *UGRPC) Recv4() (*nio.Buffer, error) {
+	hc := u.Stream
+
+	if u.rbuffer == nil {
+		u.rbuffer = nio.GetBuffer(0, 0)
+	}
+	b := u.rbuffer
+
+	if b.Len() > 0 {
+		b.Discard(int(4 + len(u.lastFrame.Bytes())))
+	}
+
+	if !b.IsEmpty() {
+		b.Compact()
+	}
+
+	var mlen uint32
+
+	head, err := b.Fill(hc, 4)
+	if err == nil {
+		mlen = binary.BigEndian.Uint32(head[0:])
+
+		_, err = b.Fill(hc, int(4+mlen))
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	hc.RcvdPackets++
+	u.lastFrame = b.Frame(4, int(4+mlen))
+	return u.lastFrame, err
+}
+
+func SendMsg(s *h2.H2Stream, args interface{}) error {
+	pm := args.(proto.Message)
+	m := proto.MarshalOptions{UseCachedSize: true}
+	sz := m.Size(pm)
+	bb := s.GetWriteFrame(sz)
+	bout, _ := m.MarshalAppend(bb.BytesAppend(), pm)
+	bb.UpdateAppend(bout)
+	err := s.Send(bb)
+	if err != nil {
+		return err
+	}
 
 	return err
 }

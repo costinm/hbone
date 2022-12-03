@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -38,12 +39,12 @@ import (
 	"github.com/costinm/hbone/nio"
 )
 
-type bufferPool struct {
+type dataFramePool struct {
 	pool sync.Pool
 }
 
-func newBufferPool() *bufferPool {
-	return &bufferPool{
+func newBufferPool() *dataFramePool {
+	return &dataFramePool{
 		pool: sync.Pool{
 			New: func() interface{} {
 				return new(bytes.Buffer)
@@ -52,11 +53,11 @@ func newBufferPool() *bufferPool {
 	}
 }
 
-func (p *bufferPool) get() *bytes.Buffer {
+func (p *dataFramePool) get() *bytes.Buffer {
 	return p.pool.Get().(*bytes.Buffer)
 }
 
-func (p *bufferPool) put(b *bytes.Buffer) {
+func (p *dataFramePool) put(b *bytes.Buffer) {
 	p.pool.Put(b)
 }
 
@@ -72,31 +73,34 @@ const (
 // H2Strem implements the net.Conn, context.Context interfaces
 // It exposes read and write quota and other low-level H2 concepts.
 type H2Stream struct {
+	// Stream ID - odd for streams initiated from server (push and reverse)
 	Id uint32
 
 	st *H2Transport // nil for client side H2Stream
 	ct *H2Transport // nil for server side H2Stream
 
-	ctx    context.Context // the associated context of the stream
-	cancel context.CancelFunc
+	// the associated context of the stream
+	// All blocking methods should check for ctxDone
+	ctx     context.Context
+	ctxDone <-chan struct{} // same as done chan but for server side. Cache of ctx.Done() (for performance)
+	cancel  context.CancelFunc
 
+	// If set, all data frames will be sent to this method and bypass the reader queue.
+	// User is required to call s.Transport().UpdateWindow(s, uint32(n)) explicitly to receive
+	// more data.
 	OnData func(*frame.DataFrame)
 
-	done chan struct{} // closed at the end of stream to unblock writers. On the client side.
+	// H2Stream implements the Context interface. Closed at the end.
+	// transport.closeStream closes this.
+	done chan struct{} // closed at the end of stream to unblock.
+
 	Events
 
-	ctxDone <-chan struct{} // same as done chan but for server side. Cache of ctx.Done() (for performance)
+	// List of DATA frame bufferss received, channel to waitOrConsumeQuota more (blocking)
+	inFrameList *nio.RecvBufferReader
 
-	Path string // the associated RPC Path of the stream.
-
-	recvCompress string
-	//sendCompress string
-
-	// List of DATA frame bufferss received, channel to get more (blocking)
-	trReader *nio.RecvBufferReader
-
-	fc *inFlow
-	wq *writeQuota
+	inFlow  *inFlow
+	outFlow *writeQuota
 
 	writeDoneChan       chan *dataFrame
 	writeDoneChanClosed uint32
@@ -104,17 +108,14 @@ type H2Stream struct {
 	headerChan       chan struct{} // closed to indicate the end of header metadata.
 	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
 
-	// headerValid indicates whether a valid header was received.  Only
-	// meaningful after headerChan is closed (always call WaitHeaders() before
-	// reading its value).  Not valid on server side.
-	headerValid bool
-
 	// hdrMu protects header and trailer metadata on the server-side.
 	hdrMu sync.Mutex
 
 	Request  *http.Request
 	Response *http.Response
 
+	// Error causing the close of the stream - stream reset, connection errors, etc
+	// trReader.Err contains any read error - including io.EOF, which indicates successful read close.
 	Error error
 
 	noHeaders bool // set if the client never received headers (set only after the stream is done).
@@ -157,11 +158,8 @@ type H2Stream struct {
 // notify the other side that we have buffer space. This is a temporary
 // adjustment.
 func (s *H2Stream) AdjustWindow(n uint32) {
-	if s.st != nil {
-		s.st.adjustWindow(s, n)
-	} else {
-		s.ct.adjustWindow(s, n)
-	}
+	s.Transport().adjustWindow(s, n)
+
 }
 
 // Header is part of the ResponseWriter interface. It returns the
@@ -171,34 +169,31 @@ func (s *H2Stream) Header() http.Header {
 	return s.Response.Header
 }
 
-// TODO: only use for backward compat
+// WriteHeader implements the ResponseWriter interface. Used to send a
+// response back to the initiator.
 func (s *H2Stream) WriteHeader(statusCode int) {
 	if statusCode == 0 {
-		s.Response.Status = strconv.Itoa(statusCode)
-	} else {
 		s.Response.Status = "200"
+	} else {
+		s.Response.Status = strconv.Itoa(statusCode)
 	}
 
 	if !s.isHeaderSent() { // Headers haven't been written yet.
-		if s.st != nil {
-			if err := s.st.WriteHeader(s); err != nil {
-				log.Println("WriteHeader", err)
-				return
-			}
-		} else {
-			s.ct.Dial(s.Request)
+		if err := s.Transport().WriteHeader(s); err != nil {
+			log.Println("WriteHeader", err)
+			return
 		}
 	}
-	// for request it's part of RoundTripStart/RoundTrip
 }
 
 func (s *H2Stream) RequestHeader() http.Header {
 	return s.Request.Header
 }
 
-// RoundTripStart the connection if needed, and send the request
+// Send the request headers.
+// Does not wait for status.
 func (s *H2Stream) Do() error {
-	_, err := s.ct.Dial(s.Request)
+	_, err := s.Transport().Dial(s.Request)
 	return err
 }
 
@@ -209,11 +204,7 @@ func (s *H2Stream) Do() error {
 func (s *H2Stream) CloseError(code uint32) {
 	// On error we remove the stream from active.
 	// In and out are also closed, s is canceled
-	if s.st != nil {
-		s.st.closeStream(s, nil, true, frame.ErrCode(code))
-	} else {
-		s.ct.closeStream(s, nil, true, frame.ErrCode(code))
-	}
+	s.Transport().closeStream(s, nil, true, frame.ErrCode(code))
 }
 
 // Send EOS/FIN.
@@ -221,13 +212,10 @@ func (s *H2Stream) CloseError(code uint32) {
 // Client: send FIN
 // Server: send trailers and FIN
 func (s *H2Stream) CloseWrite() error {
-
-	if s.st == nil {
-		// Client mode, RoundTrip with request Body
-		if nio.Debug {
-			log.Println("Client sends CloseWrite()", s.Id)
+	if !s.updateHeaderSent() { // No headers have been sent.
+		if err := s.Transport().writeResponseHeaders(s); err != nil {
+			return err
 		}
-		return s.ct.Write(s, nil, nil, true)
 	}
 
 	// TODO: use this only if trailer are present
@@ -235,18 +223,12 @@ func (s *H2Stream) CloseWrite() error {
 		if nio.Debug {
 			log.Println("Server sends CloseWrite() with trailer", s.Id)
 		}
-		if !s.updateHeaderSent() { // No headers have been sent.
-			if err := s.st.writeResponseHeaders(s); err != nil {
-				return err
-			}
-		}
-
-		return s.st.writeTrailer(s)
+		return s.Transport().writeTrailer(s)
 	} else {
 		if nio.Debug {
 			log.Println("Server sends CloseWrite()", s.Id)
 		}
-		return s.st.Write(s, nil, nil, true)
+		return s.Transport().Write(s, nil, nil, true)
 	}
 }
 
@@ -286,15 +268,9 @@ func (s *H2Stream) Close() error {
 	// Send a END_STREAM (if not already sent)
 
 	// TODO: if write buffers are not empty, still send RST, empty write buf and unblock.
-	if s.st == nil {
-		log.Println("Client H2Stream Read Close()", s.Id)
+	log.Println("Stream Close()", s.Id)
 
-		s.ct.closeStream(s, nil, false, 0)
-	} else {
-		log.Println("Server stream Close()", s.Id)
-
-		s.st.closeStream(s, nil, false, frame.ErrCode(0))
-	}
+	s.Transport().closeStream(s, nil, false, frame.ErrCode(0))
 
 	if s.readClosed == 0 {
 		s.setReadClosed(2, errStreamRST)
@@ -317,22 +293,18 @@ func (s *H2Stream) Close() error {
 
 // Return the underlying connection ( typically tcp ), for remote addr or other things.
 func (s *H2Stream) Conn() net.Conn {
-	if s.st == nil {
-		return s.ct.conn
+	return s.Transport().conn
+}
+
+func (hc *H2Stream) Transport() *H2Transport {
+	if hc.ct != nil {
+		return hc.ct
 	}
-	return s.st.conn
+	return hc.st
 }
 
 func (s *H2Stream) Write(d []byte) (int, error) {
-	if s.st == nil {
-		// Client mode, RoundTrip with request Body
-		err := s.ct.Write(s, nil, d, false)
-		if err != nil {
-			return 0, err
-		}
-		return len(d), err
-	}
-	err := s.st.Write(s, nil, d, false)
+	err := s.Transport().Write(s, nil, d, false)
 	if err != nil {
 		return 0, err
 	}
@@ -358,7 +330,7 @@ func (s *H2Stream) swapState(st streamState) streamState {
 func (s *H2Stream) setReadClosed(mode uint32, err error) {
 	old := atomic.SwapUint32(&s.readClosed, mode)
 	if old != 0 {
-		log.Println("setReadClose: Double close", s.Error, s.trReader.Err)
+		log.Println("setReadClose: Double close", s.Error, s.inFrameList.Err)
 		return
 	}
 	//if s.trReader.Err == nil {
@@ -393,7 +365,7 @@ func (s *H2Stream) WaitHeaders() {
 	case <-s.ctx.Done():
 		// Close the stream to prevent headers/trailers from changing after
 		// this function returns.
-		s.ct.closeStream(s, ContextErr(s.ctx.Err()), true, frame.ErrCodeCancel)
+		s.Transport().closeStream(s, ContextErr(s.ctx.Err()), true, frame.ErrCodeCancel)
 		// headerChan could possibly not be closed yet if closeStream raced
 		// with operateResponseHeaders; wait until it is closed explicitly here.
 		<-s.headerChan
@@ -408,7 +380,7 @@ func (s *H2Stream) Context() context.Context {
 
 // Called when data frames are received (with a COPY of the data !!)
 func (s *H2Stream) queueReadBuf(m nio.RecvMsg) {
-	s.trReader.Put(m)
+	s.inFrameList.Put(m)
 }
 
 func (s *H2Stream) LocalAddr() net.Addr {
@@ -423,7 +395,7 @@ func (s *H2Stream) SetDeadline(t time.Time) error {
 	return nil
 }
 func (s *H2Stream) SetReadDeadline(t time.Time) error {
-	s.trReader.ReadDeadline = t
+	s.inFrameList.ReadDeadline = t
 	return nil
 }
 func (s *H2Stream) SetWriteDeadline(t time.Time) error {
@@ -439,45 +411,31 @@ func (s *H2Stream) RecycleDataFrame(bb *bytes.Buffer) {
 // Recv returns the next data frame buffer and updates the window.
 // The buffer should be recycled when done, or written to a different stream.
 // Post write the buffers are recycled automatically.
-func (s *H2Stream) Recv() (bb *bytes.Buffer, err error) {
-	bb, err = s.trReader.Recv()
+func (s *H2Stream) RecvRaw() (bb *bytes.Buffer, err error) {
+	bb, err = s.inFrameList.Recv()
 	if bb != nil {
-		if s.ct != nil {
-			s.ct.UpdateWindow(s, uint32(bb.Len()))
-		} else {
-			s.st.UpdateWindow(s, uint32(bb.Len()))
-		}
+		s.Transport().UpdateWindow(s, uint32(bb.Len()))
 	}
 	return
 }
 
 // Read reads all p bytes from the wire for this stream.
 func (s *H2Stream) Read(p []byte) (n int, err error) {
-	n, err = s.trReader.Read(p)
+	n, err = s.inFrameList.Read(p)
 	if n > 0 {
-		if s.ct != nil {
-			s.ct.UpdateWindow(s, uint32(n))
-		} else {
-			s.st.UpdateWindow(s, uint32(n))
-		}
+		s.Transport().UpdateWindow(s, uint32(n))
 	}
 	return
 }
 
 func (s *H2Stream) readOnly(p []byte) (n int, err error) {
-	n, err = s.trReader.Read(p)
+	n, err = s.inFrameList.Read(p)
 	return
 }
 
 // BytesReceived indicates whether any bytes have been received on this stream.
 func (s *H2Stream) BytesReceived() bool {
 	return atomic.LoadUint32(&s.bytesReceived) == 1
-}
-
-// Unprocessed indicates whether the server did not process this stream --
-// i.e. it sent a refused stream or GOAWAY including this stream WorkloadID.
-func (s *H2Stream) Unprocessed() bool {
-	return atomic.LoadUint32(&s.unprocessed) == 1
 }
 
 // GoString is implemented by H2Stream so context.String() won't
@@ -517,6 +475,12 @@ func (ctx *H2Stream) Err() error {
 	case <-ctx.done:
 		return context.Canceled
 	default:
+		if ctx.Error != nil {
+			return ctx.Error
+		}
+		if ctx.inFrameList.Err != io.EOF {
+			return ctx.inFrameList.Err
+		}
 		return nil
 	}
 }
@@ -528,10 +492,10 @@ func (ctx *H2Stream) Err() error {
 // This method is present to make RequestCtx implement the context interface.
 // This method is the same as calling ctx.UserValue(key)
 func (ctx *H2Stream) Value(key interface{}) interface{} {
-	if keyString, ok := key.(string); ok {
+	if keyString, ok := key.(string); ok && ctx.userValues != nil {
 		return ctx.userValues[keyString]
 	}
-	return nil
+	return ctx.ctx.Value(key)
 }
 
 func (ctx *H2Stream) SetValue(key string, val interface{}) interface{} {
@@ -730,8 +694,8 @@ const (
 	GoAwayTooManyPings GoAwayReason = 2
 )
 
-// channelzData is used to store channelz related data for HTTP2ClientMux and HTTP2ServerMux.
-// These fields cannot be embedded in the original structs (e.g. HTTP2ClientMux), since to do atomic
+// channelzData is used to store channelz related data for H2ClientTransport and HTTP2ServerMux.
+// These fields cannot be embedded in the original structs (e.g. H2ClientTransport), since to do atomic
 // operation on int64 variable on 32-bit machine, user is responsible to enforce memory alignment.
 // Here, by grouping those int64 fields inside a struct, we are enforcing the alignment.
 type channelzData struct {
@@ -941,3 +905,56 @@ const (
 
 	_maxCode = 17
 )
+
+//func (hc *Stream) Close() error {
+//	// TODO: send trailers if server !!!
+//	//hc.W.Close()
+//	if cw, ok := hc.Out.(io.Closer); ok {
+//		cw.Close()
+//	}
+//	if cw, ok := hc.In.(io.Closer); ok {
+//		return cw.Close()
+//	}
+//
+//	return nil
+//}
+
+// Return a buffer with reserved front space to be used for appending.
+// If using functions like proto.Marshal, b.UpdateForAppend should be called
+// with the new []byte. App should not touch the prefix.
+func (hc *H2Stream) GetWriteFrame(sz int) *nio.Buffer {
+	b := nio.GetBuffer(5+9, sz)
+	return b
+}
+
+// Send is an alternative to Write(), where the buffer ownership is passed to
+// the stream and the method does not wait for the buffer to be sent.
+func (hc *H2Stream) SendRaw(b []byte, start, end int, last bool) error {
+	return hc.Transport().Send(hc, b, start, end, last)
+}
+
+// Framed sending/receiving.
+func (hc *H2Stream) Send(b *nio.Buffer) error {
+
+	hc.SentPackets++
+
+	frameLen := b.Len()
+
+	b.SetUnint32BE(b.Start()-4, uint32(frameLen))
+	b.SetByte(b.Start()-5, 0)
+
+	_, err := hc.Write(b.Buffer()[b.Start()-5 : b.End()])
+	//hc.Flush()
+
+	b.Recycle()
+
+	return err
+}
+
+func (s *H2Stream) SetTransport(tr *H2Transport, client bool) {
+	if client {
+		s.ct = tr
+	} else {
+		s.st = tr
+	}
+}

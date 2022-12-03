@@ -2,6 +2,7 @@ package echo
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/costinm/hbone/h2"
 	"github.com/costinm/hbone/nio"
 )
 
@@ -23,7 +25,41 @@ type EchoHandler struct {
 // Similar with echo TCP - but can't close
 func (e *EchoHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writer.WriteHeader(200)
+	//writer.(http.Flusher).Flush()
 	e.handleStreams(request.Body, writer)
+}
+
+// StreamInfo tracks informations about one stream.
+type StreamInfo struct {
+	LocalAddr  net.Addr
+	RemoteAddr net.Addr
+
+	Meta http.Header
+
+	RemoteID string
+
+	ALPN string
+
+	Dest string
+
+	Type string
+}
+
+func GetStreamInfo(str net.Conn) *StreamInfo {
+	si := &StreamInfo{
+		LocalAddr:  str.LocalAddr(),
+		RemoteAddr: str.RemoteAddr(),
+	}
+	if s, ok := str.(*h2.H2Stream); ok {
+		if s.Request != nil {
+			si.Meta = s.Request.Header
+		}
+		if tc, ok := s.Transport().Conn().(*tls.Conn); ok {
+			si.ALPN = tc.ConnectionState().NegotiatedProtocol
+		}
+	}
+
+	return si
 }
 
 func (e *EchoHandler) handle(str net.Conn) {
@@ -42,6 +78,7 @@ func (e *EchoHandler) handleStreams(in io.Reader, out io.Writer) {
 	//b1, _ := json.Marshal(si)
 
 	b := &bytes.Buffer{}
+
 	b.WriteString("Hello world\n")
 
 	time.Sleep(e.WaitFirst)

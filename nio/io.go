@@ -1,11 +1,15 @@
 package nio
 
 import (
+	"context"
 	"crypto/tls"
+	"expvar"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -74,6 +78,23 @@ func CanSplice(in io.Reader, out io.Writer) bool {
 // Copy may be called in a go routine, for one of the streams in the
 // connection - the stats and error are returned on a channel.
 func (s *ReaderCopier) Copy(ch chan int, close bool) {
+	if ch != nil {
+		defer func() {
+			ch <- int(0)
+		}()
+	}
+
+	if CanSplice(s.In, s.Out) {
+		n, err := s.Out.(io.ReaderFrom).ReadFrom(s.In)
+		s.Written += n
+		if err != nil {
+			s.rstWriter(err)
+			s.Err = err
+		}
+		VarzReadFromC.Add(1)
+		return
+	}
+
 	buf1 := bufferPoolCopy.Get().([]byte)
 	defer bufferPoolCopy.Put(buf1)
 	bufCap := cap(buf1)
@@ -96,11 +117,6 @@ func (s *ReaderCopier) Copy(ch chan int, close bool) {
 	//if rt, ok := dst.(io.ReaderFrom); ok {
 	//	return rt.ReadFrom(src)
 	//}
-	if ch != nil {
-		defer func() {
-			ch <- int(0)
-		}()
-	}
 	if s.ID == "" {
 		s.ID = strconv.Itoa(int(atomic.AddUint32(&StreamId, 1)))
 	}
@@ -290,33 +306,64 @@ func (tlsHandshakeTimeoutError) Error() string   { return "net/http: TLS handsha
 
 // HandshakeTimeout wraps tlsConn.Handshake with a timeout, to prevent hanging connection.
 func HandshakeTimeout(tlsConn *tls.Conn, d time.Duration, plainConn net.Conn) error {
-	errc := make(chan error, 2)
-	var timer *time.Timer // for canceling TLS handshake
-	if d == 0 {
-		d = 3 * time.Second
-	}
-	timer = time.AfterFunc(d, func() {
-		errc <- tlsHandshakeTimeoutError{}
-	})
-	go func() {
-		err := tlsConn.Handshake()
-		if timer != nil {
-			timer.Stop()
-		}
-		errc <- err
-	}()
-	if err := <-errc; err != nil {
-		if plainConn != nil {
-			plainConn.Close()
-		} else {
-			tlsConn.Close()
-		}
-		return err
-	}
-	return nil
+	ctx, cf := context.WithTimeout(context.Background(), d)
+	defer cf()
+
+	return tlsConn.HandshakeContext(ctx)
+
+	//errc := make(chan error, 2)
+	//var timer *time.Timer // for canceling TLS handshake
+	//if d == 0 {
+	//	d = 3 * time.Second
+	//}
+	//timer = time.AfterFunc(d, func() {
+	//	errc <- tlsHandshakeTimeoutError{}
+	//})
+	//go func() {
+	//	err := tlsConn.Handshake()
+	//	if timer != nil {
+	//		timer.Stop()
+	//	}
+	//	errc <- err
+	//}()
+	//if err := <-errc; err != nil {
+	//	if plainConn != nil {
+	//		plainConn.Close()
+	//	} else {
+	//		tlsConn.Close()
+	//	}
+	//	return err
+	//}
+	//return nil
 }
 
-func ListenAndServeTCP(addr string, f func(conn net.Conn)) (net.Listener, error) {
+func ListenAndServe(addr string, f func(conn net.Conn)) (net.Listener, error) {
+	if os.Getenv("NO_FIXED_PORTS") != "" {
+		addr = ":0"
+	}
+	if strings.HasPrefix(addr, "/") ||
+		strings.HasPrefix(addr, "@") {
+		if strings.HasPrefix(addr, "/") {
+			if _, err := os.Stat(addr); err == nil {
+				os.Remove(addr)
+			}
+		}
+		us, err := net.ListenUnix("unix",
+			&net.UnixAddr{
+				Name: addr,
+				Net:  "unix",
+			})
+		if err != nil {
+			return nil, err
+		}
+		go ServeListener(us, f)
+		return us, err
+	}
+
+	if !strings.Contains(addr, ":") {
+		addr = ":" + addr
+	}
+
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -327,12 +374,16 @@ func ListenAndServeTCP(addr string, f func(conn net.Conn)) (net.Listener, error)
 }
 
 func ServeListener(l net.Listener, f func(conn net.Conn)) error {
+	varzAccepted := expvar.NewInt(fmt.Sprintf("io_accept_total{addr=%q}", l.Addr().String()))
+	varzAcceptErr := expvar.NewInt(fmt.Sprintf("io_accept_err_total{addr=%q}", l.Addr().String()))
 	for {
 		remoteConn, err := l.Accept()
+		varzAccepted.Add(1)
 		if err != nil {
 			if ne, ok := err.(interface {
 				Temporary() bool
 			}); ok && ne.Temporary() {
+				varzAcceptErr.Add(1)
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}

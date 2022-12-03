@@ -1,21 +1,51 @@
+id:
+  # Derived from the public key
+  # id: GYDMH5NWKZNCBWLR73D5E5Q7SBM4YUSHHMRBOKUDSPC2H3FG4S4Q
+  namespace: test
+  serviceaccount: default
+  location: us-central1
+  trustDomain: dmeshgate.id.goog
+  labels:
+    projectid: dmeshgate
 
-projectid: dmeshgate
+
+# Replaced by ID
 namespace: test
 serviceaccount: default
+projectid: dmeshgate
 location: us-central1
 
-socksAddr: 127.0.0.1:1180
-hbone: :15108
-hbonec: :15109
-sni: :15103
-adminport: :15100
 
-# TODO: Duration or use sec
-#connecttimeout: 5s
+listeners:
+  15108:
+    protocol: hbone
+  15120:
+    protocol: metrics
+  15109:
+    protocol: hbonec
+  15103:
+    protocol: sni
+  15106:
+    protocol: tproxy
+  "127.0.0.1:15100":
+    protocol: admin
+  1180:
+    protocol: socks
+  6113:
+    protocol: tcp-echo
+  6114:
+    protocol: grpc-echo
+  "@hbonec-alice":
+    protocol: hbonec
+  "/tmp/hbonec-alice":
+    protocol: hbonec
 
 # localforward are ports on localhost, forwarded to clusters or addresses.
+# For convenience, egress defines localhost listeners ( not intercepted by tproxy !)
+# The value is a URL or hostOrService:port.
+# egress:
 localforward:
-  # Proxy to Istiod, similar to agent
+  # proxy to Istiod, similar to agent
   19999: istiod.istio-system.svc:15012
 
   # mTLS iperf3
@@ -24,11 +54,39 @@ localforward:
   # Plain text iperf3
   15202: bob.bob.svc:5202
 
-# Ports define external listening ports.
-ports:
-  http: "8080"
+  6411: GJU4ACOW36Q3IBL45T2TRQ63M6FNQYEJMLPJNDJETIOVIEFD7MGQ:5201
 
+  6415: echo://
+
+# ---------------- Networks ----------------------
+
+# Network CIDR ranges
+networks:
+  vpc:
+    - 10.1.10.0/24
+    - "fd::/8"
+  gateways:
+    - 10.1.12.0/24
+  mesh:
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+  # Remaining is egress (internet)
+
+# -------------------- Egress -------------------------
+
+connecttimeout: 5s
+
+
+# discovery:
+# clusters:
+# egeress:
+# out:
+# mesh:
 clusters:
+  GJU4ACOW36Q3IBL45T2TRQ63M6FNQYEJMLPJNDJETIOVIEFD7MGQ:
+    addr: 127.0.0.1:6007
+    labels:
+      h2r: 1
   bob.bob.svc:5201:
     addr: 127.0.0.1:5201
     endpoints:
@@ -41,6 +99,9 @@ clusters:
       - address: 127.0.0.1:5201
         hboneaddress: 127.0.0.1:15209
         secure: true
+
+  istiod.istio-system.svc:15012:
+    addr: "-"
 
   # If not set, will be loaded from mesh-env in default k8s cluster
   # The addr should be a gateway address with SNI routing support or hbone

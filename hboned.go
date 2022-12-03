@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,77 +21,86 @@ import (
 	"github.com/costinm/hbone/h2"
 	"github.com/costinm/hbone/nio"
 	"github.com/costinm/hbone/nio/syscall"
+	"github.com/costinm/meshauth"
 )
-
-// Auth is the interface expected by hbone for mTLS support.
-type Auth interface {
-	GenerateTLSConfigServer() *tls.Config
-	GenerateTLSConfigClient(name string) *tls.Config
-	GenerateTLSConfigClientRoots(name string, pool *x509.CertPool) *tls.Config
-}
 
 // Debug for dev support, will log verbose info.
 // Avoiding dependency on logging - eventually a trace interface will be provided
 // so any logger can be used.
 var Debug = false
 
-// MeshSettings has common settings for all clients
+// MeshSettings holds the settings for a mesh node.
 type MeshSettings struct {
+	// Identity of the node. If empty, will be detected from env (provisioning)
+	ID *meshauth.MeshAuthCfg `json:"id,omitempty"`
+	// Auth plugs-in mTLS support. The generated configs should perform basic mesh
+	// authentication.
+	Auth Auth
+
+	// Ports is the equivalent of container ports in k8s.
+	// Name follows the same conventions as Istio and should match the port name in the Service.
+	// Port "*" means 'any' port - if set, allows connections to any port by number.
+	// env variables named: PORT_name=value, with the default PORT_http=8080
+	// TODO: refine the 'wildcard' to indicate http1/2 protocol
+	// TODO: this can be populated from a WorkloadGroup object, loaded from XDS or mesh env.
+	Ports map[string]string
 
 	// Hub or user project WorkloadID. If set, will be used to lookup clusters.
 	//ProjectId      string
 	Namespace      string
 	ServiceAccount string
 
+	// Domain is in MeshAuth
+
 	// Location where the workload is running, to select local clusters.
 	//Location string
 
-	ConnectTimeout time.Duration
+	// Defaults for the mesh
+	ConnectTimeout Duration `yaml:"connecttimeout",json:"connecttimeout"`
 	TCPUserTimeout time.Duration
+	// Timeout used for TLS handshakes. If not set, 3 seconds is used.
+	HandsahakeTimeout time.Duration
 
 	// Clients by name. The key is primarily a hostname:port, matching Istio/K8S Service name and ports.
 	// TODO: do we need the port ? With ztunnel all endpoins can be reached, and the service selector applies
 	// to all ports.
-	Clusters map[string]*Cluster
+	Clusters map[string]*Cluster `json:clusters,omitempty"`
 
-	// Ports is the equivalent of container ports in k8s.
-	// Name follows the same conventions as Istio and should match the port name in the Service.
-	// Port "*" means 'any' port - if set, allows connections to any port by number.
-	// Currently this is loaded from env variables named PORT_name=value, with the default PORT_http=8080
-	// TODO: refine the 'wildcard' to indicate http1/2 protocol
-	// TODO: this can be populated from a WorkloadGroup object, loaded from XDS or mesh env.
-	Ports map[string]string
+	// Additional port listeners.
+	// Routes: listen on 127.0.0.1:port
+	// Ingress: listen on 0.0.0.0:port (or actual IP)
+	//
+	// Port proxies: will register a listener for each port, forwarding to the
+	// given address.
+	Listeners map[string]*Listener `json:"listeners,omitempty"`
 
-	// Timeout used for TLS handshakes. If not set, 3 seconds is used.
-	HandsahakeTimeout time.Duration
-
-	// Auth plugs-in mTLS support. The generated configs should perform basic mesh
-	// authentication.
-	Auth Auth
-
+	// Static and dynamic settings
 	Env map[string]string
 
 	// Internal ports
 
+	// Local ports, forwarding to mesh services.
+	LocalForward map[int]string
+
+	// BasePort is the first port used for the virtual/control ports.
+	// For Istio interop, it defaults to 15000 and uses same offsets.
+	// This port is used for admin/debug/local MDS, bound to localhost, http protocol
+	BasePort int `json:"basePort,omitempty"`
+
 	// Default to 0.0.0.0:15008
 	HBone string
 
-	// Reverse tunnel to this address if set
-	RemoteTunnel string
-
 	// If set, hbonec is enabled on this address
-	// TrustedIPRanges should be used instead.
 	HBoneC string
 
 	// Default to localhost:1080
 	SocksAddr string
 
-	// SNI port, default to 15003
+	// SNI router port, default to 15003
 	SNI string
 
 	AdminPort string
 
-	LocalForward map[int]string
 	// Envoy/Istio
 
 	// ServiceCluster is mapped to Istio canonical service and envoy --serviceCluster
@@ -105,6 +115,41 @@ type MeshSettings struct {
 	// ServiceNode is mapped to node name and envoy --service-node
 	// It will show up in x-envoy-downstream-service-node
 	ServiceNode string
+
+	// AccessLog enables logging HTTP and stream close stats (sort of access log)
+	// Setting it to "-" disables.
+	// TODO: can be a well-known cluster, address ,etc
+	AccessLog string `json:"accessLog,omitempty"`
+}
+
+type Duration struct {
+	time.Duration
+}
+
+func (ms Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(ms.String())
+}
+
+func (ms *Duration) UnmarshalJSON(data []byte) error {
+	var v interface{}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	switch value := v.(type) {
+	case float64:
+		*ms = Duration{Duration: time.Duration(value)}
+		return nil
+	case string:
+		var err error
+		s, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		*ms = Duration{Duration: s}
+		return nil
+	default:
+		return errors.New("invalid duration")
+	}
 }
 
 func (ms *MeshSettings) GetEnv(k, def string) string {
@@ -156,7 +201,12 @@ type HBone struct {
 	// hb is the connection pool, gets notified when con is closed.
 	//h2t *http2.Transport
 
-	Mux http.ServeMux
+	// Mux is used for HTTP and gRPC handler exposed externally.
+	// The HTTP server on localhost:15000 uses http.DefaultMux - which is used by pprof
+	// and others by default.
+	Mux *http.ServeMux
+
+	Handlers map[string]Handler
 
 	// EndpointResolver hooks into the Dial process and return the configured
 	// EndpointCon object. This integrates with the XDS/config plane, with
@@ -173,6 +223,19 @@ type HBone struct {
 	http1CChan chan net.Conn
 
 	Http11Transport *http.Transport
+}
+
+// Handler is a handler for net.Conn with metadata.
+// Lighter alternative to http.Handler - or accept loops.
+type Handler interface {
+	HandleConn(net.Conn) error
+}
+
+// Wrap a function as a stream handler.
+type HandlerFunc func(conn net.Conn) error
+
+func (c HandlerFunc) HandleConn(conn net.Conn) error {
+	return c(conn)
 }
 
 type noAuth struct {
@@ -232,6 +295,8 @@ func NewMesh(ms *MeshSettings) *HBone {
 		H2RConn:      map[*h2.H2Transport]*EndpointCon{},
 		//h2t:           h2,
 		Client:        http.DefaultClient,
+		Handlers:      map[string]Handler{},
+		Mux:           http.NewServeMux(),
 		AuthProviders: map[string]func(context.Context, string) (string, error){},
 		//&http2.Transport{
 		//	ReadIdleTimeout: 10000 * time.Second,
@@ -267,8 +332,8 @@ func NewMesh(ms *MeshSettings) *HBone {
 			c.hb = hb
 		}
 	}
-	if ms.ConnectTimeout == 0 {
-		ms.ConnectTimeout = 5 * time.Second
+	if ms.ConnectTimeout.Duration == 0 {
+		ms.ConnectTimeout.Duration = 5 * time.Second
 	}
 
 	// Init the HTTP reverse proxy, for apps listening for HTTP/1.1 on 8080
@@ -331,7 +396,7 @@ func (hb *HBone) HandleAcceptedH2C(conn net.Conn) {
 }
 
 func (hb *HBone) startH2ServerMux(conn net.Conn, startT time.Time) {
-	st, err := h2.NewServerTransport(conn, &h2.ServerConfig{
+	st, err := h2.NewServerConnection(conn, &h2.ServerConfig{
 		//MaxFrameSize:          1 << 22,
 		//InitialConnWindowSize: 1 << 26,
 		//InitialWindowSize:     1 << 25,
@@ -342,7 +407,7 @@ func (hb *HBone) startH2ServerMux(conn net.Conn, startT time.Time) {
 		return
 	}
 
-	st.MuxConnStart = startT
+	st.StartTime = startT
 
 	st.Handle = func(stream *h2.H2Stream) {
 		hb.handleH2Stream(st, stream)
@@ -393,6 +458,7 @@ func (hb *HBone) handleH2Stream(st *h2.H2Transport, stream *h2.H2Stream) {
 
 			err = nio.HandshakeTimeout(tls, hb.HandsahakeTimeout, nil)
 			if err != nil {
+				stream.Close()
 				log.Println("HBD-MTLS: error inner mTLS ", err)
 				return
 			}
@@ -620,7 +686,7 @@ type Listener struct {
 	// Port can have multiple protocols:
 	// If missing or other value, this is a dedicated port, specific to a single
 	// destination.
-	Protocol string `json:"proto,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
 
 	// ForwardTo where to forward the proxied connections.
 	// Used for accepting on a dedicated port. Will be set as Dest in
@@ -629,7 +695,7 @@ type Listener struct {
 	ForwardTo string `json:"forwardTo,omitempty"`
 
 	// Must block until the connection is fully handled !
-	Handler nio.Handler `json:-`
+	//Handler ugate.Handler `json:-`
 
 	// ALPN to announce, for TLS listeners
 	ALPN []string
@@ -639,7 +705,7 @@ type Listener struct {
 	Certs map[string]string
 
 	NetListener net.Listener `json:-`
-	PortHandler nio.Handler  `json:-`
+	//PortHandler ugate.Handler `json:-`
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
@@ -651,4 +717,27 @@ func (l *Listener) Close() error {
 }
 func (l *Listener) Addr() net.Addr {
 	return l.NetListener.Addr()
+}
+
+// Dealing with capture
+
+// HanldeTUN is called when a TCP egress connection is intercepted via TProxy or TUN (gVisor or lwip)
+// target is the destination address, la is the local address (the connection will have it reversed).
+func (hb *HBone) HandleTUN(nc net.Conn, target *net.TCPAddr, la *net.TCPAddr) {
+	log.Println("TProxy TCP ", target, la)
+	dest := target.String()
+
+	rc, err := hb.Dial("tcp", dest)
+	if err != nil {
+		nc.Close()
+		return
+	}
+	Proxy(rc, nc, nc, dest)
+	return
+}
+
+func (hb *HBone) HandleUdp(dstAddr net.IP, dstPort uint16,
+	localAddr net.IP, localPort uint16,
+	data []byte) {
+	log.Println("TProxy UDP ", dstAddr, dstPort, localAddr, localPort, len(data))
 }

@@ -52,7 +52,7 @@ push: _oci_image
 
 proto-gen: PATH:=${HOME}/go/bin:${PATH}
 proto-gen:
-	cd proto && buf generate
+	cd urpc/proto && buf generate
 
 
 perf-test-setup:

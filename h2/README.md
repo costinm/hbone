@@ -28,7 +28,7 @@ Ideally the framer can also be optimized and an event based, non-blocking low le
 - P0 implement deadlines properly, use an idle timer for streams too
 - Read() seems to return one frame at a time - despite having more info. Should also report buffered in/iot
 
-# Internals
+# Internals of gRPC stack
 
 ## API
 
@@ -61,9 +61,6 @@ Client:
 reuse
 - Read - io semantics, partial reads instead of readfull.
 
-## Added
-
-- WIP: frame size. Std stack allows setting it for server - but not in client.
 
 ## Code
 
@@ -88,3 +85,21 @@ The http2 core implementation:
 - has a databuffer - pool of chunks of different sizes
 - client conn pool handling for http
 - supports priorities - not used in hbone
+
+# H2 notes - from H3 perspective
+
+- At start, 64K flow window for both stream and connection. 
+- receiver can increase both using WINDOW_UPDATE, cleaner than SETTINGS
+- adjusting frame size doesn't seem very useful, increases bench but may be more harmful
+  default is 16k
+
+H2 frame header is 9B, QUIC is varint tag,len
+
+QUIC 
+- stream ID second bit is 2Way or 1Way
+- Sender: STREAM, STREAM_DATA_BLOCKED, RESET_STREAM
+- Receiver: MAX_STREAM_DATA, STOP_SENDING
+- Also MAX_DATA for connection
+
+Packets include a set of frames
+Connections may migrate or use multiple paths - based on connection ID.

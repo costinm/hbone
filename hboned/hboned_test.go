@@ -42,42 +42,45 @@ func TestURest(t *testing.T) {
 	defer cf()
 
 	// No certificate by default, but the test may be run with different params
-	hc := &hbone.MeshSettings{}
-	err := handlers.LoadMeshConfig(hc, "")
+	aliceCfg := &hbone.MeshSettings{}
+	err := handlers.LoadMeshConfig(aliceCfg, "")
 	if err != nil {
 		panic(err)
 	}
 
-	id := auth.NewMeshAuth()
+	aliceID := auth.NewMeshAuth(nil)
+
 	// TODO: test FromEnv with different options
 
-	hb := hbone.New(id, hc)
+	alice := hbone.New(aliceID, aliceCfg)
 
 	//otel.InitProm(hb)
-
 	//otel.OTelEnable(hb)
 	//otelC := setup.FileExporter(ctx, os.Stderr)
 	//defer otelC()
 
-	gcp.InitDefaultTokenSource(ctx, hb)
+	gcp.InitDefaultTokenSource(ctx, alice)
 
 	// Init credentials and discovery server.
-	dk, err := k8s.InitK8S(ctx, hb)
+	k8sService, err := k8s.InitK8S(ctx, alice)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	istiodC := handlers.InitXDSCluster(hb)
+	istiodC := handlers.InitXDSCluster(alice)
 	if istiodC == nil {
 		t.Fatal("No Istiod cluster")
 	}
-	err = uxds.GetCertificate(ctx, id, istiodC)
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	t.Run("get-cert", func(t *testing.T) {
+		err = urpc.GetCertificate(ctx, aliceID, istiodC)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	t.Run("xdsc-clusters", func(t *testing.T) {
-		err = xdsTest(t, ctx, istiodC, hb)
+		err = xdsTest(t, ctx, istiodC, alice)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -85,16 +88,16 @@ func TestURest(t *testing.T) {
 
 	// Test for 'system' streams
 	t.Run("xdsc-system", func(t *testing.T) {
-		urstSys := hbone.New(nil, nil)
-		gcp.InitDefaultTokenSource(ctx, urstSys)
+		system := hbone.New(nil, nil)
+		gcp.InitDefaultTokenSource(ctx, system)
 
 		catokenSystem := &k8s.K8STokenSource{
-			Cluster:     dk,
+			Cluster:     k8sService,
 			AudOverride: "istio-ca",
 			Namespace:   "istio-system",
 			KSA:         "default"}
 
-		istiodSystem := urstSys.AddService(&hbone.Cluster{
+		istiodSystem := system.AddService(&hbone.Cluster{
 			Addr:          istiodC.Addr,
 			TokenProvider: catokenSystem.GetToken,
 			ID:            "istiod",
@@ -103,9 +106,9 @@ func TestURest(t *testing.T) {
 		})
 
 		turl := "istio.io/debug"
-		xdsc, err := uxds.DialContext(ctx, "", &uxds.Config{
+		systemXDS, err := urpc.DialContext(ctx, "", &urpc.Config{
 			Cluster: istiodSystem,
-			HBone:   urstSys,
+			HBone:   system,
 			Meta: map[string]interface{}{
 				"SERVICE_ACCOUNT": "default",
 				"NAMESPACE":       "istio-system",
@@ -120,7 +123,7 @@ func TestURest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = xdsc.Send(&xds.DiscoveryRequest{
+		err = systemXDS.Send(&xds.DiscoveryRequest{
 			TypeUrl:       turl,
 			ResourceNames: []string{"syncz"},
 		})
@@ -128,31 +131,31 @@ func TestURest(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err = xdsc.Wait(turl, 3*time.Second)
+		_, err = systemXDS.Wait(turl, 3*time.Second)
 
 		if err != nil {
 			t.Fatal(err)
 		}
-		dr := xdsc.Received[turl]
+		dr := systemXDS.Received[turl]
 		log.Println(dr.Resources)
 	})
 
 	// Used for GCP tokens and calls.
 	//projectNumber := hb.GetEnv("PROJECT_NUMBER", "")
-	projectId := hb.GetEnv("PROJECT_ID", "")
-	clusterLocation := hb.GetEnv("CLUSTER_LOCATION", "")
-	clusterName := hb.GetEnv("CLUSTER_NAME", "")
+	projectId := alice.GetEnv("PROJECT_ID", "")
+	clusterLocation := alice.GetEnv("CLUSTER_LOCATION", "")
+	clusterName := alice.GetEnv("CLUSTER_NAME", "")
 
 	//hb.ProjectId = projectId
 
 	t.Run("meshca-cert", func(t *testing.T) {
-		meshCAID := auth.NewMeshAuth()
+		meshCAID := auth.NewMeshAuth(nil)
 
-		meshca := hb.AddService(&hbone.Cluster{
+		meshca := alice.AddService(&hbone.Cluster{
 			Addr:        "meshca.googleapis.com:443",
 			TokenSource: "sts",
 		})
-		err := uxds.GetCertificate(ctx, meshCAID, meshca)
+		err := urpc.GetCertificate(ctx, meshCAID, meshca)
 
 		if err != nil {
 			t.Fatal(err)
@@ -160,19 +163,19 @@ func TestURest(t *testing.T) {
 		log.Println("Cert: ", meshCAID.String())
 	})
 
-	tok1, err := hb.AuthProviders["gsa"](ctx, "https://example.com")
+	tok1, err := alice.AuthProviders["gsa"](ctx, "https://example.com")
 	if err != nil {
 		t.Fatal("Failed to load k8s", err)
 	}
 	tok1J := auth.DecodeJWT(tok1)
 	log.Println("Tok:", tok1J)
 
-	tok, err := hb.AuthProviders["gsa"](ctx, "")
+	tok, err := alice.AuthProviders["gsa"](ctx, "")
 	if err != nil {
 		t.Fatal("Failed to load k8s", err)
 	}
 	t.Run("hublist", func(t *testing.T) {
-		cd, err := gcp.Hub2RestClusters(ctx, hb, tok, projectId)
+		cd, err := gcp.Hub2RestClusters(ctx, alice, tok, projectId)
 		if err != nil {
 			log.Println("SA doesn't have permission", tok1J.Email)
 			t.Fatal(err)
@@ -185,7 +188,7 @@ func TestURest(t *testing.T) {
 	})
 
 	t.Run("gkelist", func(t *testing.T) {
-		cd, err := gcp.GKE2RestCluster(ctx, hb, tok, projectId)
+		cd, err := gcp.GKE2RestCluster(ctx, alice, tok, projectId)
 		if err != nil {
 			if strings.HasPrefix(err.Error(), "403") {
 				t.Skip("Account not authorized for GKE")
@@ -204,14 +207,14 @@ func TestURest(t *testing.T) {
 			TrustDomain: projectId + ".svc.id.goog",
 			ClusterAddress: fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
 				projectId, clusterLocation, clusterName),
-			TokenSource: &k8s.K8STokenSource{Cluster: dk},
+			TokenSource: &k8s.K8STokenSource{Cluster: k8sService},
 		}, "k8s-default@"+projectId+".iam.gserviceaccount.com") // use the default KSA
 
 		tokA, err := ts.GetToken(context.Background(), "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		cd, err := gcp.GKE2RestCluster(ctx, hb, tokA, projectId)
+		cd, err := gcp.GKE2RestCluster(ctx, alice, tokA, projectId)
 		if err != nil {
 			if strings.HasPrefix(err.Error(), "403") {
 				t.Skip("Account not authorized for GKE")
@@ -225,15 +228,40 @@ func TestURest(t *testing.T) {
 	})
 
 	t.Run("secret", func(t *testing.T) {
-		tok, err := hb.AuthProviders["gcp"](ctx, "")
+		tok, err := alice.AuthProviders["gcp"](ctx, "")
 		if err != nil {
 			t.Fatal("Failed to load k8s", err)
 		}
-		cd, err := gcp.GcpSecret(ctx, hb, tok, projectId, "ca", "1")
+		cd, err := gcp.GcpSecret(ctx, alice, tok, projectId, "ca", "1")
 		if err != nil {
 			t.Fatal(err)
 		}
 		log.Println(string(cd))
+	})
+
+	t.Run("watch", func(t *testing.T) {
+		req := k8s.WatchRequest(ctx, k8sService, "istio-system", "configmap", "")
+		k8sService.AddToken(req, "https://"+k8sService.Addr)
+
+		// Find or dial an h2 transport
+		tr, err := k8sService.DialRequest(req)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.WaitHeaders()
+		if tr.Response.Status != "200" {
+			t.Fatal("Response statuds ", tr.Response.Status, tr.Response.Header)
+		}
+		fr := urpc.NewFromStream(tr)
+		for {
+			bb, err := fr.Recv4()
+			if err != nil {
+				t.Fatal(err)
+			}
+			log.Println(string(bb.Bytes()))
+
+		}
 	})
 
 }
@@ -241,10 +269,10 @@ func TestURest(t *testing.T) {
 var marshal = &jsonpb.Marshaler{OrigName: true, Indent: "  "}
 
 func xdsTest(t *testing.T, ctx context.Context, istiodC *hbone.Cluster, ns *hbone.HBone) error {
-	xdsc, err := uxds.DialContext(ctx, "", &uxds.Config{
+	xdsc, err := urpc.DialContext(ctx, "", &urpc.Config{
 		Cluster: istiodC,
 		HBone:   ns,
-		ResponseHandler: func(con *uxds.ADSC, r *xds.DiscoveryResponse) {
+		ResponseHandler: func(con *urpc.ADSC, r *xds.DiscoveryResponse) {
 			log.Println("DR:", r.TypeUrl, r.VersionInfo, r.Nonce, len(r.Resources))
 			for _, l := range r.Resources {
 				b, err := marshal.MarshalToString(l)

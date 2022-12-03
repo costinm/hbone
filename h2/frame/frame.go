@@ -606,7 +606,7 @@ func parseDataFrame(fc *FrameCache, fh FrameHeader, countError func(string), pay
 		// connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
 		countError("frame_data_stream_0")
-		return nil, connError{ErrCodeProtocol, "DATA frame with stream WorkloadID 0"}
+		return nil, connError{ErrCodeProtocol, "DATA frame with stream ID 0"}
 	}
 	f := fc.getDataFrame()
 	f.FrameHeader = fh
@@ -633,8 +633,8 @@ func parseDataFrame(fc *FrameCache, fh FrameHeader, countError func(string), pay
 }
 
 var (
-	errStreamID    = errors.New("invalid stream WorkloadID")
-	errDepStreamID = errors.New("invalid dependent stream WorkloadID")
+	errStreamID    = errors.New("invalid stream ID")
+	errDepStreamID = errors.New("invalid dependent stream ID")
 	errPadLength   = errors.New("pad length too large")
 	errPadBytes    = errors.New("padding bytes must all be zeros unless AllowIllegalWrites is enabled")
 )
@@ -725,12 +725,12 @@ func (f *Framer) WriteDataNC(streamID uint32, endStream bool, data []byte, start
 	if f.logWrites {
 		var buf bytes.Buffer
 		ldata := data[start:end]
-		const max = 256
+		const max = 64
 		if len(ldata) > max {
-			data = ldata[:max]
+			ldata = ldata[:max]
 		}
-		fmt.Fprintf(&buf, " data=%q", data)
-		f.debugWriteLoggerf("http2: Framer %p: wrote %s", f, buf.String())
+		fmt.Fprintf(&buf, " data=%q", ldata)
+		f.debugWriteLoggerf("http2: Framer %p: wrote %d %s", f, length, buf.String())
 	}
 
 	n, err := f.w.Write(data[start-9 : end])
@@ -1014,7 +1014,7 @@ func parseWindowUpdateFrame(_ *FrameCache, fh FrameHeader, countError func(strin
 
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.
 // The increment value must be between 1 and 2,147,483,647, inclusive.
-// If the Stream WorkloadID is zero, the window update applies to the
+// If the Stream ID is zero, the window update applies to the
 // connection as a whole.
 func (f *Framer) WriteWindowUpdate(streamID, incr uint32) error {
 	// "The legal range for the increment to the flow control window is 1 to 2^31-1 (2,147,483,647) octets."
@@ -1064,7 +1064,7 @@ func parseHeadersFrame(_ *FrameCache, fh FrameHeader, countError func(string), p
 		// respond with a connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
 		countError("frame_headers_zero_stream")
-		return nil, connError{ErrCodeProtocol, "HEADERS frame with stream WorkloadID 0"}
+		return nil, connError{ErrCodeProtocol, "HEADERS frame with stream ID 0"}
 	}
 	var padLength uint8
 	if fh.Flags.Has(FlagHeadersPadded) {
@@ -1098,7 +1098,7 @@ func parseHeadersFrame(_ *FrameCache, fh FrameHeader, countError func(string), p
 
 // HeadersFrameParam are the parameters for writing a HEADERS frame.
 type HeadersFrameParam struct {
-	// StreamID is the required Stream WorkloadID to initiate.
+	// StreamID is the required Stream ID to initiate.
 	StreamID uint32
 	// BlockFragment is part (or all) of a Header Block.
 	BlockFragment []byte
@@ -1199,7 +1199,7 @@ func (p PriorityParam) IsZero() bool {
 func parsePriorityFrame(_ *FrameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		countError("frame_priority_zero_stream")
-		return nil, connError{ErrCodeProtocol, "PRIORITY frame with stream WorkloadID 0"}
+		return nil, connError{ErrCodeProtocol, "PRIORITY frame with stream ID 0"}
 	}
 	if len(payload) != 5 {
 		countError("frame_priority_bad_length")
@@ -1280,7 +1280,7 @@ type ContinuationFrame struct {
 func parseContinuationFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		countError("frame_continuation_zero_stream")
-		return nil, connError{ErrCodeProtocol, "CONTINUATION frame with stream WorkloadID 0"}
+		return nil, connError{ErrCodeProtocol, "CONTINUATION frame with stream ID 0"}
 	}
 	return &ContinuationFrame{fh, p}, nil
 }
@@ -1370,10 +1370,10 @@ func parsePushPromise(_ *FrameCache, fh FrameHeader, countError func(string), p 
 
 // PushPromiseParam are the parameters for writing a PUSH_PROMISE frame.
 type PushPromiseParam struct {
-	// StreamID is the required Stream WorkloadID to initiate.
+	// StreamID is the required Stream ID to initiate.
 	StreamID uint32
 
-	// PromiseID is the required Stream WorkloadID which this
+	// PromiseID is the required Stream ID which this
 	// Push Promises
 	PromiseID uint32
 
@@ -1524,7 +1524,7 @@ func (mh *MetaHeadersFrame) checkPseudos() error {
 	pf := mh.PseudoFields()
 	for i, hf := range pf {
 		switch hf.Name {
-		case ":method", ":path", ":scheme", ":authority":
+		case ":method", ":path", ":scheme", ":authority", ":protocol":
 			isRequest = true
 		case ":status":
 			isResponse = true

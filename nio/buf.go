@@ -47,9 +47,18 @@ type Buffer struct {
 	// frames int
 }
 
-func NewBuffer() *Buffer {
-	buf1 := bufferPoolCopy.Get().([]byte)
-	return &Buffer{buf: buf1}
+// Default buffer size for the io pool
+var bufSize = 32 * 1024
+
+func GetBuffer(prefix, size int) *Buffer {
+	if size == 0 {
+		size = bufSize
+	}
+	return &Buffer{
+		buf: GetDataBufferChunk(int64(size)),
+		off: prefix,
+		end: prefix,
+	}
 }
 
 // Return a subset (view) of a real read buffer
@@ -64,8 +73,16 @@ func (b *Buffer) WriteUnint32(i uint32) {
 	b.end += 4
 }
 
+func (b *Buffer) SetUnint32BE(pos int, i uint32) {
+	binary.BigEndian.PutUint32(b.buf[pos:], i)
+}
+
 func (b *Buffer) SetUnint32(pos int, i uint32) {
 	binary.LittleEndian.PutUint32(b.buf[pos:], i)
+}
+
+func (b *Buffer) SetByte(pos int, i byte) {
+	b.buf[pos] = i
 }
 
 func (b *Buffer) WriteVarint(i int64) {
@@ -92,12 +109,22 @@ func (b *Buffer) Out() []byte {
 	return b.buf[b.end:cap(b.buf)]
 }
 
+func (b *Buffer) Start() int {
+	return b.off
+}
+func (b *Buffer) End() int {
+	return b.end
+}
+
 // UpdateAppend should be called if any append operation may resize and replace
 // the buffer - for example protobuf case.
 func (b *Buffer) UpdateAppend(bout []byte) {
 	// TODO: if buffer is different, recycle the old one
-	b.buf = bout
-	b.end = len(bout)
+
+	// Start doesn't change
+
+	b.end = len(bout) // that includes the prefix - after append or realloc
+	b.buf = bout[:cap(bout)]
 }
 
 // ========= Buffer management
@@ -141,6 +168,13 @@ func (b *Buffer) Grow(n int) {
 
 // Size return the number of unread bytes in the buffer.
 func (b *Buffer) Size() int {
+	if b == nil {
+		return 0
+	}
+	return b.end - b.off
+}
+
+func (b *Buffer) Len() int {
 	if b == nil {
 		return 0
 	}
@@ -198,6 +232,14 @@ func (b *Buffer) Bytes() []byte {
 	return b.buf[b.off:b.end]
 }
 
+func (b *Buffer) Buffer() []byte {
+	return b.buf
+}
+
+func (b *Buffer) BytesAppend() []byte {
+	return b.buf[0:b.end]
+}
+
 // ========= Read support: will move end and possibly grow.
 
 func (s *Buffer) Fill(r io.Reader, i int) ([]byte, error) {
@@ -222,7 +264,7 @@ func (s *Buffer) Fill(r io.Reader, i int) ([]byte, error) {
 	}
 
 	if i > cap(s.buf)-s.off {
-		s.grow(i - s.end)
+		s.grow(i - s.off)
 	}
 
 	// Fill
@@ -299,8 +341,8 @@ type BufferReader struct {
 // NewBufferReader returns a buffer associated with a reader.
 // Read will first consume the buffer.
 func NewBufferReader(in io.Reader) *BufferReader {
-	buf1 := bufferPoolCopy.Get().([]byte)
-	return &BufferReader{Buffer: &Buffer{buf: buf1}, Reader: in}
+	b := GetBuffer(0, 0)
+	return &BufferReader{Buffer: b, Reader: in}
 }
 
 // Discard will move the start with n bytes.

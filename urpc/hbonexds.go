@@ -1,4 +1,4 @@
-package uxds
+package urpc
 
 import (
 	"context"
@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/costinm/hbone"
-	"github.com/costinm/hbone/nio"
 	meshca "github.com/costinm/hbone/urpc/gen/google/security/meshca/v1"
 	istioca "github.com/costinm/hbone/urpc/gen/istio/v1/auth"
 	auth "github.com/costinm/meshauth"
@@ -98,7 +97,7 @@ func HandleEDS(hb *hbone.HBone, eds map[string]*xds.ClusterLoadAssignment) {
 func GetCertificate(ctx context.Context, id *auth.MeshAuth, ca *hbone.Cluster) error {
 	keyPEM, csr, err := id.NewCSR("spiffe://cluster.local/ns/default/sa/default")
 
-	var ress *nio.Stream
+	var ress *UGRPC
 
 	var res istioca.IstioCertificateResponse
 
@@ -109,11 +108,12 @@ func GetCertificate(ctx context.Context, id *auth.MeshAuth, ca *hbone.Cluster) e
 		req.RequestId = uuid.New().String()
 		path := "/google.security.meshca.v1.MeshCertificateService/CreateCertificate"
 
-		ress = NewGRPCStream(ctx, ca, ca.Addr, path)
+		ress, err = New(ctx, ca, ca.Addr, path)
+		ca.AddToken(ress.Stream.Request, "") // federated access token, no audience
 
-		ress.Request.Header.Add("x-goog-request-params", "location=locations/us-central1-c")
+		ress.Stream.Request.Header.Add("x-goog-request-params", "location=locations/us-central1-c")
 
-		err = SendGPRC(ress, &req, &res)
+		err = ress.Invoke(&req, &res)
 
 	} else {
 		// TODO: Add ClusterID header
@@ -122,15 +122,16 @@ func GetCertificate(ctx context.Context, id *auth.MeshAuth, ca *hbone.Cluster) e
 		req.Csr = string(csr)
 		path := "/istio.v1.auth.IstioCertificateService/CreateCertificate"
 
-		ress = NewGRPCStream(ctx, ca, ca.Addr, path)
+		ress, _ = New(ctx, ca, ca.Addr, path)
+		ca.AddToken(ress.Stream.Request, "istio-ca")
 
-		err = SendGPRC(ress, &req, &res)
+		err = ress.Invoke(&req, &res)
 	}
 
 	if err != nil {
 		return err
 	}
 
-	err = id.SetKeysPEM(keyPEM, res.CertChain)
+	err = id.SetCertPEM(keyPEM, res.CertChain)
 	return err
 }

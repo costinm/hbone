@@ -29,16 +29,20 @@ var (
 	}
 )
 
+// Get a raw buffer with approximate size. Used by framer.
 func GetDataBufferChunk(size int64) []byte {
 	i := 0
 	for ; i < len(dataChunkSizeClasses)-1; i++ {
 		if size <= int64(dataChunkSizeClasses[i]) {
-			break
+			return dataChunkPools[i].Get().([]byte)
 		}
 	}
-	return dataChunkPools[i].Get().([]byte)
+
+	return make([]byte, size)
 }
 
+// Return a chunk to the pool.
+// Called after write is completed or the buffer is no longer needed.
 func PutDataBufferChunk(p []byte) {
 	for i, n := range dataChunkSizeClasses {
 		if len(p) == n {
@@ -46,25 +50,17 @@ func PutDataBufferChunk(p []byte) {
 			return
 		}
 	}
+	// odd buffers sizes will go to GC
 }
 
 // Old style buffer pool
 
 var (
 	// createBuffer to get a buffer. io.Copy uses 32k.
-	// experimental use shows ~20k max read with Firefox.
 	bufferPoolCopy = sync.Pool{New: func() interface{} {
 		return make([]byte, 16*64*1024) // 1M
 	}}
 )
-
-// TODO: add an owner ( reader or conn)
-func GetBuffer() *Buffer {
-	return ioPool.GetBuffer()
-}
-
-// Default buffer size for the io pool
-var bufSize = 32 * 1024
 
 var ioPool = &BufferPool{
 	pool: sync.Pool{New: func() interface{} {

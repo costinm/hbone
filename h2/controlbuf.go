@@ -108,8 +108,8 @@ func (*registerStream) isTransportResponseFrame() bool { return false }
 type headerFrame struct {
 	streamID   uint32
 	hf         []hpack.HeaderField
-	endStream  bool               // Valid on server side.
-	initStream func(uint32) error // Used only on the client side.
+	endStream  bool // Valid on server side.
+	initStream func(uint32) error
 	onWrite    func()
 	wq         *writeQuota    // write quota for the stream created.
 	cleanup    *cleanupStream // Valid on the server side.
@@ -212,9 +212,10 @@ const (
 )
 
 type outStream struct {
-	id               uint32
-	state            outStreamState
-	itl              *itemList
+	id    uint32
+	state outStreamState
+	itl   *itemList
+
 	bytesOutStanding int
 	wq               *writeQuota
 
@@ -581,7 +582,7 @@ func (l *loopyWriter) outgoingWindowUpdateHandler(w *outgoingWindowUpdate) error
 }
 
 func (l *loopyWriter) incomingWindowUpdateHandler(w *incomingWindowUpdate) error {
-	// Otherwise update the quota.
+	// connection
 	if w.streamID == 0 {
 		l.sendQuota += w.increment
 		return nil
@@ -620,8 +621,9 @@ func (l *loopyWriter) registerStreamHandler(h *registerStream) error {
 	return nil
 }
 
+// Write the Header
 func (l *loopyWriter) headerHandler(h *headerFrame) error {
-	if l.side == serverSide {
+	if l.side == serverSide && h.streamID%2 == 1 {
 		str, ok := l.estdStreams[h.streamID]
 		if !ok {
 			log.Printf("transport: loopy doesn't recognize the stream: %d", h.streamID)
@@ -643,6 +645,7 @@ func (l *loopyWriter) headerHandler(h *headerFrame) error {
 		}
 		return l.cleanupStreamHandler(h.cleanup)
 	}
+
 	// Case 2: Client wants to originate stream.
 	str := &outStream{
 		id:    h.streamID,
@@ -650,14 +653,8 @@ func (l *loopyWriter) headerHandler(h *headerFrame) error {
 		itl:   &itemList{},
 		wq:    h.wq,
 	}
-	str.itl.enqueue(h)
-	return l.originateStream(str)
-}
-
-func (l *loopyWriter) originateStream(str *outStream) error {
-	hdr := str.itl.dequeue().(*headerFrame)
-	if hdr.initStream != nil {
-		if err := hdr.initStream(str.id); err != nil {
+	if h.initStream != nil { // request headers - register the stream.
+		if err := h.initStream(str.id); err != nil {
 			if err == ErrConnClosing {
 				return err
 			}
@@ -665,7 +662,7 @@ func (l *loopyWriter) originateStream(str *outStream) error {
 			return nil
 		}
 	}
-	if err := l.writeHeader(str.id, hdr.endStream, hdr.hf, hdr.onWrite); err != nil {
+	if err := l.writeHeader(str.id, h.endStream, h.hf, h.onWrite); err != nil {
 		return err
 	}
 	l.estdStreams[str.id] = str
@@ -716,6 +713,9 @@ func (l *loopyWriter) writeHeader(streamID uint32, endStream bool, hf []hpack.He
 	return nil
 }
 
+// Called only if quota is available on a stream, will enqueue the data to
+// the stream, and move the stream into the 'activeStreams' queue.
+// It will move out when empty.
 func (l *loopyWriter) preprocessData(df *dataFrame) error {
 	str, ok := l.estdStreams[df.streamID]
 	if !ok {
@@ -861,7 +861,12 @@ func (l *loopyWriter) processData() (bool, error) {
 	// A data item is represented by a dataFrame, since it later translates into
 	// multiple HTTP2 data frames.
 
-	if len(dataItem.d) == 0 { // Empty data frame
+	dataSize := len(dataItem.d)
+	if dataItem.end != 0 {
+		dataSize = dataItem.end - dataItem.start // prefix
+	}
+
+	if dataSize == 0 { // Empty data frame
 		// Client sends out empty data frame with endStream = true
 		if err := l.framer.fr.WriteData(dataItem.streamID, dataItem.endStream, nil); err != nil {
 			return false, err
@@ -904,17 +909,17 @@ func (l *loopyWriter) processData() (bool, error) {
 		maxSize = int(l.sendQuota)
 	}
 	// Compute how much of the header and data we can send within quota and max frame length
-	dSize := min(maxSize, len(dataItem.d))
+	dSize := min(maxSize, dataSize)
 	buf = dataItem.d
 
 	size := dSize
 
 	// Now that outgoing flow controls are checked we can replenish str's write quota
-	str.wq.replenish(size)
+	str.wq.realReplenish(size)
 
 	var endStream bool
 	// If this is the last data message on this stream and all of it can be written in this iteration.
-	if dataItem.endStream && len(dataItem.d) <= size {
+	if dataItem.endStream && dataSize <= size {
 		endStream = true
 	}
 
@@ -940,7 +945,7 @@ func (l *loopyWriter) processData() (bool, error) {
 			}
 		}
 	} else {
-
+		// Blocking write style
 		if err := l.framer.fr.WriteData(dataItem.streamID, endStream, buf[:size]); err != nil {
 			return false, err
 		}

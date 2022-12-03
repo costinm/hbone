@@ -1,3 +1,16 @@
+# Expvar
+
+Goals: 
+- Represent prometheus/otel metrics and labels using Expvar interface, with minimal dependencies.
+- Export using prom text format - no deps
+- Maybe: export in otel/ometrics proto format
+- Access to metric values from code and tests.
+
+How: 
+- handler to export expvar in metrics format
+- use prom naming scheme for expvar metrics
+- labels as Map values
+
 # Getting the stats
 
 ```
@@ -41,6 +54,9 @@ Model:
 
 # Open Telemetry
 
+The library is still very heavy - why does it need go-logr and yaml deps ? 
+
+
 - library uses interfaces, individual go modules
 - 'contrib' has detectors - for example get region, etc. For GKE uses env NAMESPACE, HOSTNAME, CONTAINER_NAME - and "cluster_name" metadata.
 - 'contrib' instrumentations - http, etc.
@@ -66,6 +82,13 @@ attributes from context. This is independent of the generation of Measurement.
 
 
 # Prometheus
+
+The client library for prom in go is one of the most convoluted and unnecesarily complex
+code I've seen ( or written :-). The prom server doesn't use or care about descriptions
+and all the channels are over complex.
+
+VictoriaMetrics is a much simpler implementation, with few external deps. Still a bit 
+too much. Has a good historgram and summary impl as well.
 
 github.com/prometheus/client_golang/prometheus
 

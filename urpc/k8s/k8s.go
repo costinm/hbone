@@ -13,7 +13,7 @@ import (
 
 	"github.com/costinm/hbone"
 	auth "github.com/costinm/meshauth"
-	"gopkg.in/yaml.v3"
+	"sigs.k8s.io/yaml"
 )
 
 // To keep things simple and dependency-free, this is a copy of few structs
@@ -34,6 +34,28 @@ func Request(ctx context.Context, uk8s *hbone.Cluster, ns, kind, name string, po
 	} else {
 		req, _ = http.NewRequestWithContext(ctx, "POST", "https://"+uk8s.Addr+uk8s.Path+path, bytes.NewReader(postdata))
 	}
+	ct := "application/json"
+	req.Header.Add("content-type", ct)
+
+	return req
+}
+
+func ListRequest(ctx context.Context, uk8s *hbone.Cluster, ns, kind string) *http.Request {
+	path := fmt.Sprintf("/api/v1/namespaces/%s/%ss",
+		ns, kind)
+	var req *http.Request
+	req, _ = http.NewRequestWithContext(ctx, "GET", "https://"+uk8s.Addr+uk8s.Path+path, nil)
+	ct := "application/json"
+	req.Header.Add("content-type", ct)
+
+	return req
+}
+
+func WatchRequest(ctx context.Context, uk8s *hbone.Cluster, ns, kind, name string) *http.Request {
+	path := fmt.Sprintf("/api/v1/namespaces/%s/%ss?watch=1",
+		ns, kind)
+	var req *http.Request
+	req, _ = http.NewRequestWithContext(ctx, "GET", "https://"+uk8s.Addr+uk8s.Path+path, nil)
 	ct := "application/json"
 	req.Header.Add("content-type", ct)
 
@@ -112,7 +134,7 @@ func (ts *K8STokenSource) GetToken(ctx context.Context, aud string) (string, err
 	//    },
 	//    "status": {
 	//        "expirationTimestamp": "2022-07-01T15:55:01Z",
-	//        "token": ".." // ya29 
+	//        "token": ".." // ya29
 	//    }
 	//}
 	return GetTokenRaw(ctx, ts.Cluster, ts.Namespace, ts.KSA, aud)
