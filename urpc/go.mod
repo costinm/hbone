@@ -4,7 +4,7 @@ go 1.18
 
 replace github.com/costinm/hbone => ./..
 
-replace github.com/costinm/meshauth => ../../meshauth
+//replace github.com/costinm/meshauth => ../../meshauth
 
 require (
 	github.com/costinm/hbone v0.0.0-00010101000000-000000000000

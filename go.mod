@@ -2,7 +2,7 @@ module github.com/costinm/hbone
 
 go 1.19
 
-replace github.com/costinm/meshauth => ../meshauth
+//replace github.com/costinm/meshauth => ../meshauth
 
 require golang.org/x/sys v0.1.0
 

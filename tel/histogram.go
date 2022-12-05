@@ -1,6 +1,7 @@
 package tel
 
-// Based on victoriametrics
+// Based on victoriametrics - but using expvar API
+
 import (
 	"fmt"
 	"io"
@@ -140,20 +141,6 @@ func (h *Histogram) VisitNonZeroBuckets(f func(vmrange string, count uint64)) {
 	h.mu.Unlock()
 }
 
-// NewHistogram creates and returns new histogram with the given name.
-//
-// name must be valid Prometheus-compatible metric with possible labels.
-// For instance,
-//
-//   - foo
-//   - foo{bar="baz"}
-//   - foo{bar="baz",aaa="b"}
-//
-// The returned histogram is safe to use from concurrent goroutines.
-func NewHistogram(name string) *Histogram {
-	return &Histogram{}
-}
-
 // UpdateDuration updates request duration based on the given startTime.
 func (h *Histogram) UpdateDuration(startTime time.Time) {
 	d := time.Since(startTime).Seconds()
@@ -201,6 +188,7 @@ func (h *Histogram) marshalTo(prefix string, w io.Writer) {
 	if countTotal == 0 {
 		return
 	}
+
 	name, labels := splitMetricName(prefix)
 	sum := h.getSum()
 	if float64(int64(sum)) == sum {

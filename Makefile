@@ -3,9 +3,9 @@ ROOT_DIR?=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 BASE_DIR?=$(shell basename $(ROOT_DIR))
 
 # Artifacts outside of the source tree by default
-OUT?=${ROOT_DIR}/../out/${BASE_DIR}
+OUT?=${ROOT_DIR}/out/${BASE_DIR}
 
-GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 time  go build -ldflags '-s -w -extldflags "-static"' -o ${OUT}
+GOSTATIC=CGO_ENABLED=0  GOOS=linux GOARCH=amd64 go build -ldflags '-s -w -extldflags "-static"' -o ${OUT}/
 
 DOCKER_REPO?=gcr.io/dmeshgate/${BASE_DIR}
 
@@ -46,7 +46,7 @@ _push:
 
 build:
 	#NAME=hbone $(MAKE) .go-build
-	(cd cmd/hbone && ${GOSTATIC} .)
+	(cd hboned && ${GOSTATIC} .)
 
 push: _oci_image
 

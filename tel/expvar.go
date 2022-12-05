@@ -35,7 +35,7 @@ import (
 //  namespace_NAME_type
 // - seconds
 // - bytes
-// - _total - all counters, rest are gauges or complex types.
+// - _total - all counters - rest are gauges or complex types.
 // - sum, count, bucket - in histo and summaries
 // - seconds_total
 // - info
@@ -58,6 +58,15 @@ import (
 // _bucket metric, type counter, and le=xx label
 
 // TODO: periodic clean of unused labels. Need special kind of map.
+
+func Get(name string, labels ...string) *expvar.Float {
+	c1 := expvar.Get("example_counter_total")
+	if c1 == nil {
+		c1 = &expvar.Float{}
+		expvar.Publish("example_counter_total", c1)
+	}
+	return c1.(*expvar.Float)
+}
 
 // Given an expvar, extract the int value.
 func MetricValue(name string) int64 {
@@ -133,12 +142,12 @@ func HandleMetrics(w http.ResponseWriter, req *http.Request) {
 		//# TYPE node_memory_used_bytes gauge
 		if m, ok := kv.Value.(*expvar.Map); ok {
 			m.Do(func(kv1 expvar.KeyValue) {
-				v := kv.Value
-				switch v.(type) {
+				v := kv1.Value
+				switch a := v.(type) {
 				case (*expvar.Int):
-					fmt.Fprintf(w, "%s{%s} %d\n", kv.Key, kv1.Key, v.(*expvar.Int).Value())
+					fmt.Fprintf(w, "%s{%s} %d\n", kv.Key, kv1.Key, a.Value())
 				case (*expvar.Float):
-					fmt.Fprintf(w, "%s{%s} %f\n", kv.Key, kv1.Key, v.(*expvar.Float).Value())
+					fmt.Fprintf(w, "%s{%s} %f\n", kv.Key, kv1.Key, a.Value())
 				default:
 					//fmt.Fprintf(w, "%s{%s} %q\n", kv.Key, kv1.Key, kv1.Value.String())
 				}
