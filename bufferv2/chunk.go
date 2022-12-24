@@ -16,9 +16,9 @@ package bufferv2
 
 import (
 	"fmt"
+	"sync"
 
-	"gvisor.dev/gvisor/pkg/bits"
-	"gvisor.dev/gvisor/pkg/sync"
+	"github.com/costinm/hbone/bufferv2/bits"
 )
 
 const (

@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"io"
 
-	"gvisor.dev/gvisor/pkg/sync"
+	"sync"
 )
 
 // ReadSize is the default amount that a View's size is increased by when an

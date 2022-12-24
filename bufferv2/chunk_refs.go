@@ -3,8 +3,8 @@ package bufferv2
 import (
 	"fmt"
 
-	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/refs"
+	"github.com/costinm/hbone/bufferv2/atomicbitops"
+	"github.com/costinm/hbone/bufferv2/refs"
 )
 
 // enableLogging indicates whether reference-related events should be logged (with

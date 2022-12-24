@@ -1,4 +1,4 @@
-// Copyright 2022 The gVisor Authors.
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package bufferv2
+//go:build amd64
+// +build amd64
 
-// saveData is invoked by stateify.
-func (b *Buffer) saveData() []byte {
-	return b.Flatten()
-}
+TEXT ·TrailingZeros64(SB),$0-16
+  BSFQ  x+0(FP), AX
+  JNZ   end
+  MOVQ  $64, AX
+end:
+  MOVQ  AX, ret+8(FP)
+  RET
 
-// loadData is invoked by stateify.
-func (b *Buffer) loadData(data []byte) {
-	*b = MakeWithData(data)
-}
+TEXT ·MostSignificantOne64(SB),$0-16
+  BSRQ  x+0(FP), AX
+  JNZ   end
+  MOVQ  $64, AX
+end:
+  MOVQ  AX, ret+8(FP)
+  RET
