@@ -87,15 +87,15 @@ authentication if needed.
 
 ## P1
 
-[] Docker and helm
-[] Callbacks for events,
-[] hook to k8s slice
-[] Timeouts/deadlines/keepalives
-[] Move to separate git repo
+- [ ] Docker and helm
+- [ ] Callbacks for events,
+- [ ] hook to k8s slice
+- [ ] Timeouts/deadlines/keepalives
+- [ ] Move to separate git repo
 
 ## P2
 
-[] convert sshd to use h2r (still over mTLS, but not exposed on the public address)
+- [ ] convert sshd to use h2r (still over mTLS, but not exposed on the public address)
 
 # uREST 
 
