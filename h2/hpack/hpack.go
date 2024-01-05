@@ -325,7 +325,7 @@ func (d *Decoder) parseHeaderFieldRepr() error {
 		// http://http2.github.io/http2-spec/compression.html#rfc.section.6.2.3
 		return d.parseFieldLiteral(4, indexedNever)
 	case b&224 == 32:
-		// 6.3 Dynamic Table Size Update
+		// 6.3 Dynamic Table Size Record
 		// Top three bits are '001'.
 		// http://http2.github.io/http2-spec/compression.html#rfc.section.6.3
 		return d.parseDynamicTableSizeUpdate()

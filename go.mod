@@ -1,12 +1,12 @@
 module github.com/costinm/hbone
 
-go 1.19
+go 1.21
 
-//replace github.com/costinm/meshauth => ../meshauth
+toolchain go1.21.3
 
-require golang.org/x/sys v0.1.0
+replace github.com/costinm/ugate/nio => ../ugate/nio
 
 require (
-	github.com/costinm/meshauth v0.0.0-20221013185453-bb5aae6632f8
-	golang.org/x/net v0.1.0
+	github.com/costinm/ugate/nio v0.0.0-00010101000000-000000000000
+	golang.org/x/exp v0.0.0-20240103183307-be819d1f06fc
 )

@@ -36,7 +36,7 @@ import (
 	"github.com/costinm/hbone/h2/frame"
 	"github.com/costinm/hbone/h2/grpcutil"
 	"github.com/costinm/hbone/h2/hpack"
-	"github.com/costinm/hbone/nio"
+	"github.com/costinm/ugate/nio"
 )
 
 // clientConnectionCounter counts the number of connections a client has
@@ -390,7 +390,8 @@ func (t *H2ClientTransport) StartConn(conn net.Conn) (err error) {
 	return nil
 }
 
-func (t *H2Transport) createHeaderFields(ctx context.Context, r *http.Request) ([]hpack.HeaderField, error) {
+// Create the header frame for a request.
+func (t *H2Transport) CreateHeader(ctx context.Context, r *http.Request) ([]hpack.HeaderField, error) {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
 	// Make the slice of certain predictable size to reduce allocations made by append.
@@ -507,6 +508,7 @@ func (t *H2Transport) writeRequestHeaders(s *H2Stream, headerFields []hpack.Head
 		wq:         s.outFlow,
 	}
 	firstTry := true
+
 	var ch chan struct{}
 	checkForStreamQuota := func(it interface{}) bool {
 		if t.IsServer() {
@@ -514,7 +516,7 @@ func (t *H2Transport) writeRequestHeaders(s *H2Stream, headerFields []hpack.Head
 			h := it.(*headerFrame)
 			h.streamID = t.nextID
 			t.nextID += 2
-			s.Id = h.streamID
+			s.MuxID = h.streamID
 			s.inFlow = &inFlow{limit: uint32(t.initialWindowSize)}
 			return true
 		}
@@ -532,8 +534,10 @@ func (t *H2Transport) writeRequestHeaders(s *H2Stream, headerFields []hpack.Head
 		h := it.(*headerFrame)
 		h.streamID = t.nextID
 		t.nextID += 2
-		s.Id = h.streamID
+		s.MuxID = h.streamID
+
 		s.inFlow = &inFlow{limit: uint32(t.initialWindowSize)}
+
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
 			case t.streamsQuotaAvailable <- struct{}{}:
@@ -574,6 +578,8 @@ func (t *H2Transport) writeRequestHeaders(s *H2Stream, headerFields []hpack.Head
 		if success {
 			break
 		}
+
+		// No quota - wait for quota
 		if hdrListSizeErr != nil {
 			return &NewStreamError{Err: hdrListSizeErr}
 		}
@@ -606,7 +612,7 @@ func (t *H2Transport) writeRequestHeaders(s *H2Stream, headerFields []hpack.Head
 // progress.
 func (t *H2Transport) closeStream(s *H2Stream, err error, rst bool, rstCode frame.ErrCode) {
 
-	if s.swapState(streamDone) == streamDone {
+	if atomic.SwapUint32((*uint32)(&s.streamDone), uint32(1)) == 1 {
 		// If it was already done, return.  If multiple closeStream calls
 		// happen simultaneously, wait for the first to finish.
 		<-s.done
@@ -626,12 +632,11 @@ func (t *H2Transport) closeStream(s *H2Stream, err error, rst bool, rstCode fram
 
 	// If headerChan isn't closed, then close it.
 	if s.headerChan != nil && atomic.CompareAndSwapUint32(&s.headerChanClosed, 0, 1) {
-		s.noHeaders = true
 		close(s.headerChan)
 	}
 
 	cleanup := &cleanupStream{
-		streamID: s.Id,
+		streamID: s.MuxID,
 		onWrite: func() {
 			t.deleteStream(s)
 		},
@@ -669,7 +674,7 @@ func (t *H2Transport) closeStream(s *H2Stream, err error, rst bool, rstCode fram
 	if s.done != nil {
 		close(s.done)
 	}
-	s.StreamEvent(EventStreamClosed)
+	//s.StreamEvent(EventStreamClosed)
 }
 
 func (t *H2Transport) getStream(f frame.Frame) *H2Stream {
@@ -685,7 +690,7 @@ func (t *H2Transport) getStream(f frame.Frame) *H2Stream {
 
 func (t *H2Transport) adjustWindow(s *H2Stream, n uint32) {
 	if w := s.inFlow.maybeAdjust(n); w > 0 {
-		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.Id, increment: w})
+		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.MuxID, increment: w})
 	}
 }
 
@@ -694,7 +699,7 @@ func (t *H2Transport) adjustWindow(s *H2Stream, n uint32) {
 // exceeds the corresponding threshold.
 func (t *H2Transport) UpdateWindow(s *H2Stream, n uint32) {
 	if w := s.inFlow.onRead(n); w > 0 {
-		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.Id, increment: w})
+		t.controlBuf.put(&outgoingWindowUpdate{streamID: s.MuxID, increment: w})
 	}
 }
 
@@ -774,31 +779,27 @@ func (t *H2Transport) handleData(f *frame.DataFrame) {
 		}
 		if f.Header().Flags.Has(frame.FlagDataPadded) {
 			if w := s.inFlow.onRead(size - uint32(len(f.Data()))); w > 0 {
-				t.controlBuf.put(&outgoingWindowUpdate{s.Id, w})
+				t.controlBuf.put(&outgoingWindowUpdate{s.MuxID, w})
 			}
 		}
 
 		if s.OnData != nil {
 			s.OnData(f)
-			if f.StreamEnded() {
-				s.setReadClosed(1, io.EOF)
+		} else {
+			// Old code - with data frame reuse immediately:
+			// TODO(bradfitz, zhaoq): A copy is required here because there is no
+			// guarantee f.Data() is consumed before the arrival of next frame.
+			// Can this copy be eliminated?
+			if len(f.Data()) > 0 {
+				//buffer := t.dataFramePool.waitOrConsumeQuota()
+				//buffer.Reset()
+				//buffer.Write(f.Data())
+
+				s.RcvdBytes += len(f.Data())
+				s.RcvdPackets++
+				s.LastRead = time.Now()
+				s.inFrameList.Put(nio.RecvMsg{Buffer: bytes.NewBuffer(f.Data())})
 			}
-			return
-		}
-
-		// Old code - with data frame reuse immediately:
-		// TODO(bradfitz, zhaoq): A copy is required here because there is no
-		// guarantee f.Data() is consumed before the arrival of next frame.
-		// Can this copy be eliminated?
-		if len(f.Data()) > 0 {
-			//buffer := t.dataFramePool.waitOrConsumeQuota()
-			//buffer.Reset()
-			//buffer.Write(f.Data())
-
-			s.RcvdBytes += len(f.Data())
-			s.RcvdPackets++
-			s.LastRead = time.Now()
-			s.inFrameList.Put(nio.RecvMsg{Buffer: bytes.NewBuffer(f.Data())})
 		}
 	}
 	if f.StreamEnded() {
@@ -960,7 +961,7 @@ func (t *H2ClientTransport) handleGoAway(f *frame.GoAwayFrame) {
 		t.setGoAwayReason(f)
 		close(t.goAway)
 		t.controlBuf.put(&incomingGoAway{})
-		// Notify the clientconn about the GOAWAY before we set the state to
+		// Notify the clientconn about the GOAWAY before we set the streamDone to
 		// draining, to allow the client to stop attempting to create streams
 		// before disallowing new streams on this connection.
 		t.MuxEvent(Event_GoAway)
@@ -1043,7 +1044,7 @@ func (t *H2Transport) operateResponseHeaders(f *frame.MetaHeadersFrame) {
 		return
 	}
 	endStream := f.StreamEnded()
-	atomic.StoreUint32(&s.bytesReceived, 1)
+
 	initialHeader := atomic.LoadUint32(&s.headerChanClosed) == 0
 
 	if !initialHeader && !endStream {
@@ -1111,10 +1112,6 @@ func (t *H2Transport) operateResponseHeaders(f *frame.MetaHeadersFrame) {
 
 // reader runs as a separate goroutine in charge of reading data from network
 // connection.
-//
-// TODO(zhaoq): currently one reader per transport. Investigate whether this is
-// optimal.
-// TODO(zhaoq): Check the validity of the incoming frame sequence.
 func (t *H2ClientTransport) reader() {
 	defer close(t.readerDone)
 	// Check the validity of server preface.

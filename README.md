@@ -1,3 +1,21 @@
+# HTTP/2 attempted optimizations
+
+This package contains an in-progress (but extremely slow) attempt to improve the Golang H2 stack.
+
+It is a fork for grpc stack, with few extensions around using the protocol as a transport instead of strictly HTTP stack, and without the compatibility requirements with HTTP/1.1 APIs.
+
+At the moment I believe for most use cases SSH is a better secure L4 transport for small devices / on prem and most of the cloud - since almost everything has SSH already. For high throughput and
+low latency - native support for HTTP with mTLS or H3, WebRTC, etc is a better option.
+
+Making small changes to native applications or libraries seems more long-term efficient.
+
+SSH (or any capture-based automated transport security) is good enough for most operations - it is 
+commonly used for rsync and filesystems - and it can be a good signaling and automation protocol to
+bootsrap/simplify the use of native protocols.
+
+-----------------------
+Old content: 
+
 # HTTP Based Overlay Network Environment
 
 There are already many VPN, VPC and tunneling protocols in broad use, using UDP, custom TCP protocols, SSH or even HTTP
@@ -64,126 +82,3 @@ will be set as expected to the hostname of the proxy.
 A new 'X-tun' header will include the original address - sent as :authority 
 in the basic CONNECT mode. 
 
-### Legacy
-
-TODO:
-- regular HTTP CONNECT proxy support
-
-## SNI routing
-
-This is compatible with Istio East-West gateway, accepting without handshake the mTLS connections on 15443 and using the
-ClientHello info to find the ServerName (SNI). The old Istio clients should treat it as any regular Istio gateway.
-
-The HBONE SNI gateway will forward the mTLS connection using mtls-over-H2 to an external address, including JWT
-authentication if needed.
-
-## H2R - Reverse connections support (remote accept)
-
-# Execution environment
-
-# CLI
-
-# TODO
-
-## P1
-
-[] Docker and helm
-[] Callbacks for events,
-[] hook to k8s slice
-[] Timeouts/deadlines/keepalives
-[] Move to separate git repo
-
-## P2
-
-[] convert sshd to use h2r (still over mTLS, but not exposed on the public address)
-
-# uREST 
-
-It is extremely common for applications to make REST or gRPC requests - this 
-package is focused on implementing the mesh and HBONE protocols, and provides 
-some minimal support for gRPC and K8S calls without extra dependencies and using
-the same code.
-
-It is based on/inspired from kelseyhightower/konfig - which uses the 'raw' 
-K8S protocol to avoid a big dependency. Google, K8S and many other APIs have
-a raw representation and don't require complex client libraries and depdencies.
-No code generation or protos are used - raw JSON in []byte is used, caller 
-can handle marshalling.
-
-For gRPC only the basic framing and protocol are support - exposed as frames
-containing []byte. Caller or generated code can handle marshalling.
-
-This is intended for apps that make few small requests and want to keep 
-size small, or want to take advantage of HBONE and mesh auto-setup. Also
-for low-level testing.
-
-# Other projects
-
-- https://github.com/xnuter/http-tunnel
-- IPFS / libP2P - one of the supported transports is a modified H2, also Quic. Reinvents cert format.
-- Syncthing - reverse tunnels, custom protocol, certs
-- Tor - of course.
-- BitTorrent
-- [Konectivity](https://github.com/kubernetes-sigs/apiserver-network-proxy.git)
-  Narrow use case of 'reverse connections' for Nodes (agents) getting calls from the APIserver via proxy, when the
-  APIserver doesn't have direct connectivity to the node.
-
-  gRPC or HTTP CONNECT based on the agent-proxy connection, and gRPC for APIserver to proxy.
-
-   ``` 
-   service AgentService {
-     // Agent Identifier?
-     rpc Connect(stream Packet) returns (stream Packet) {}
-   }
-   service ProxyService {
-     rpc Proxy(stream Packet) returns (stream Packet) {}
-   }
-   
-   Packet can be Data, Dial Req/Res, Close Req/Res
-   ```
-
-# Gost
-
-[gost](https://github.com/ginuerzh/gost/blob/master/README_en.md) provides multiple integration points, focuses on
-similar TCP proxy modes.
-
-Usage:
-
-```shell
-
-# socks+http proxy
-gost -L=:8080
-
-
-```
-
-# gRPC framing support
-
-HBone provides a low-level H2-based overlay network. The gRPC protocol
-defines a framing (1 byte TAG 4 byte LEN) and a set of headers. This library
-does not make a distinction between unary or stream - just like http library
-doesn't make distinction between HEAD, GET and POST, input/output are a
-stream of zero, 1 or more frames.
-
-To integrate with XDS servers we need at least minimal protobuf support. The micro XDS
-implementation is based on HBone raw protocol, but we need to understand a minimal
-set of config options.
-
-Taking a full dependency on gRPC is another option - it may allow using
-the optimized H2 stack by tunneling over gRPC, still H2 but with the extra
-5-byte framing.
-
-The minimal gRPC implementation supports the basic protocol - without
-generated stubs or any high level feature. It is intended for proxy
-and sniffing - for future support for GRPCRoute and content filtering.
-Both proto and byte frames are suported.
-
-## Codec
-
-At low level, gRPC frames are parsed as Buffers, using the nio model to
-minimize copy. This is useful for proxy or filtering without unmarshal.
-
-For most practical uses gRPC needs translation to protos - this is done
-automatically to avoid buffer allocations. "google.golang.org/protobuf/prot"
-library is used - the old one is deprecated ( but still a dependency since
-the new library is using some). 

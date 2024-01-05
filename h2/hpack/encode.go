@@ -17,14 +17,14 @@ type Encoder struct {
 	dynTab dynamicTable
 	// minSize is the minimum table size set by
 	// SetMaxDynamicTableSize after the previous Header Table Size
-	// Update.
+	// Record.
 	minSize uint32
 	// maxSizeLimit is the maximum table size this encoder
 	// supports. This will protect the encoder from too large
 	// size.
 	maxSizeLimit uint32
 	// tableSizeUpdate indicates whether "Header Table Size
-	// Update" is required.
+	// Record" is required.
 	tableSizeUpdate bool
 	w               io.Writer
 	buf             []byte
@@ -45,7 +45,7 @@ func NewEncoder(w io.Writer) *Encoder {
 }
 
 // WriteField encodes f into a single Write to e's underlying Writer.
-// This function may also produce bytes for "Header Table Size Update"
+// This function may also produce bytes for "Header Table Size Record"
 // if necessary. If produced, it is done before encoding f.
 func (e *Encoder) WriteField(f HeaderField) error {
 	e.buf = e.buf[:0]
@@ -121,7 +121,7 @@ func (e *Encoder) SetMaxDynamicTableSize(v uint32) {
 // 4096, which is the same size of the default dynamic header table
 // size described in HPACK specification. If the current maximum
 // dynamic header table size is strictly greater than v, "Header Table
-// Size Update" will be done in the next WriteField call and the
+// Size Record" will be done in the next WriteField call and the
 // maximum dynamic header table size is truncated to v.
 func (e *Encoder) SetMaxDynamicTableSizeLimit(v uint32) {
 	e.maxSizeLimit = v
@@ -178,7 +178,7 @@ func appendIndexedName(dst []byte, f HeaderField, i uint64, indexing bool) []byt
 	return appendHpackString(dst, f.Value)
 }
 
-// appendTableSize appends v, as encoded in "Header Table Size Update"
+// appendTableSize appends v, as encoded in "Header Table Size Record"
 // representation, to dst and returns the extended buffer.
 func appendTableSize(dst []byte, v uint32) []byte {
 	first := len(dst)

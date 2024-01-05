@@ -1,82 +1,18 @@
 package h2
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"testing"
 
-	"github.com/costinm/hbone/nio"
+	"github.com/costinm/ugate/nio"
 )
 
 // Most of the testing is done in the hbone package.
-type ClientServerTransport struct {
-	Listener        net.Listener
-	ClientTransport *H2ClientTransport
-	ServerTransport *H2Transport
-
-	AcceptedStreams chan *H2Stream
-}
-
-func (p *ClientServerTransport) InitPair() error {
-	p.AcceptedStreams = make(chan *H2Stream)
-
-	// accepted server transports
-	svChan := make(chan *H2Transport)
-
-	// Setup a H2 server on a listener
-	l, err := nio.ListenAndServe(":0", func(conn net.Conn) {
-		// Server event handlers
-		se := &Events{}
-		se.OnEvent(Event_Settings, EventHandlerFunc(func(evt EventType, t *H2Transport, s *H2Stream, f *nio.Buffer) {
-			log.Println("SCONNECT START ", "maxStreams", t.maxStreams,
-				"frameSize", t.FrameSize, "maxSendHeaderListSize", t.maxSendHeaderListSize)
-		}))
-		t, err := NewServerConnection(conn, &ServerConfig{}, se)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		t.Handle = func(stream *H2Stream) {
-			p.AcceptedStreams <- stream
-		}
-		go t.HandleStreams()
-
-		svChan <- t
-	})
-	if err != nil {
-		return err
-	}
-	p.Listener = l
-
-	// Create a H2 Client connection to the server
-	//ctx, cf := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
-
-	// Create the WebTransport for the client.
-	ct, err := NewConnection(context.Background(), H2Config{})
-
-	ct.Events.OnEvent(Event_Settings, EventHandlerFunc(func(evt EventType, t *H2Transport, s *H2Stream, f *nio.Buffer) {
-		log.Println("CONNECT START ", "maxStreams", t.maxStreams,
-			"frameSize", t.FrameSize, "maxSendHeaderListSize", t.maxSendHeaderListSize)
-	}))
-	ct.Handle = func(stream *H2Stream) {
-		log.Println("Accepted stream ", stream)
-		p.AcceptedStreams <- stream
-	}
-
-	ctcp, err := net.Dial("tcp", l.Addr().String())
-	ct.StartConn(ctcp)
-
-	// Get the accepted transport corresponding the client transport.
-	st := <-svChan
-
-	p.ClientTransport = ct
-	p.ServerTransport = st
-	return err
-}
 
 func BenchmarkH2(b *testing.B) {
 	pair := &ClientServerTransport{}
@@ -93,7 +29,32 @@ func BenchmarkH2(b *testing.B) {
 					"origin":    {"example.com"}},
 				Host: "example.com", // currently required
 			})
-			_, err := pair.ClientTransport.DialStream(clientStream)
+			err := pair.ClientTransport.DialStream(clientStream)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			serverStream := <-pair.AcceptedStreams
+
+			serverStream.WriteHeader(200)
+
+			clientStream.WaitHeaders()
+
+			serverStream.CloseWrite()
+
+		}
+	})
+
+	b.Run("NoDataClose", func(b *testing.B) {
+		for n := 0; n < b.N; n++ {
+			clientStream := NewStreamReq(&http.Request{
+				Method: "CONNECT",
+				Header: map[string][]string{
+					":protocol": {"webtransport"},
+					"origin":    {"example.com"}},
+				Host: "example.com", // currently required
+			})
+			err := pair.ClientTransport.DialStream(clientStream)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -117,7 +78,7 @@ func BenchmarkH2(b *testing.B) {
 				"origin":    {"example.com"}},
 			Host: "example.com", // currently required
 		})
-		_, err := pair.ClientTransport.DialStream(clientStream)
+		err := pair.ClientTransport.DialStream(clientStream)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -141,7 +102,7 @@ func BenchmarkH2(b *testing.B) {
 				"origin":    {"example.com"}},
 			Host: "example.com", // currently required
 		})
-		_, err := pair.ClientTransport.DialStream(clientStream)
+		err := pair.ClientTransport.DialStream(clientStream)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -160,9 +121,51 @@ func BenchmarkH2(b *testing.B) {
 }
 
 func TestH2(t *testing.T) {
-	pair := &ClientServerTransport{}
-	pair.InitPair()
+	pair := NewClientServerTransport()
+	defer pair.Listener.Close()
 
+	t.Run("Example-RoundTripper", func(t *testing.T) {
+		cs, ss, err := pair.TcpPair()
+		defer cs.Close()
+		defer ss.Close()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		go func() {
+			// Got a client and server stream.
+			se := &Events{}
+			// Blocks until it gets the handshake done
+			s, err := NewServerConnection(ss, &ServerConfig{}, se)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Handle = func(stream *H2Stream) {
+				log.Println("Stream", "stream", stream.Request)
+				stream.SendRaw([]byte("123456789hello"), 9, 14, true)
+				//stream.Close()
+			}
+			// blocking
+			s.HandleStreams()
+		}()
+
+		// Client side
+		c, err := NewConnection(context.Background(), H2Config{})
+		c.StartConn(cs)
+
+		// c is a client connection, s is a server connection.
+		req, _ := http.NewRequest("POST", "/test", bytes.NewReader([]byte("hello")))
+		// Blocking
+		res, err := c.RoundTrip(req)
+		log.Println(res, err)
+		hres := res.Body.(*H2Stream)
+		resb := make([]byte, 1024)
+		nr, err := hres.Read(resb)
+		log.Println("Res: ", resb[0:nr])
+	})
+
+	pair.InitPair()
 	defer pair.Listener.Close()
 
 	t.Run("ClientToServer", func(t *testing.T) {
@@ -173,7 +176,7 @@ func TestH2(t *testing.T) {
 				"origin":    {"example.com"}},
 			Host: "example.com", // currently required
 		})
-		_, err := pair.ClientTransport.DialStream(s1cs)
+		err := pair.ClientTransport.DialStream(s1cs)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,7 +189,7 @@ func TestH2(t *testing.T) {
 		s2sc := NewStreamReq(&http.Request{
 			URL: &url.URL{Path: "/", Host: "example.com"},
 		})
-		_, err := pair.ServerTransport.DialStream(s2sc)
+		err := pair.ServerTransport.DialStream(s2sc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +207,7 @@ func TestH2(t *testing.T) {
 				"origin":    {"example.com"}},
 			Host: "example.com", // currently required
 		})
-		_, err := pair.ClientTransport.DialStream(clientStream)
+		err := pair.ClientTransport.DialStream(clientStream)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -217,9 +220,6 @@ func TestH2(t *testing.T) {
 
 		for n := 0; n < 101; n++ {
 			bufw := nio.GetDataBufferChunk(int64(wsize + 9))
-			for i := 0; i < 256; i++ {
-				bufw[i] = byte(i)
-			}
 			serverStream.SendRaw(bufw, 9, 9+wsize, n == 99)
 
 			err = consume(clientStream, wsize)
@@ -266,8 +266,8 @@ func checkSttreams(t *testing.T, serverStream *H2Stream, clientStream *H2Stream,
 
 	// At this point session is established.
 
-	if clientStream.Id != serverStream.Id {
-		t.Fatal("Invalid id", clientStream.Id, serverStream.Id)
+	if clientStream.MuxID != serverStream.MuxID {
+		t.Fatal("Invalid id", clientStream.MuxID, serverStream.MuxID)
 	}
 	if clientStream.Response.Status != "200" {
 		t.Fatal("Invalid status", clientStream.Response)

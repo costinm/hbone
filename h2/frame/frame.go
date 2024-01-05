@@ -9,13 +9,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"golang.org/x/exp/slog"
 	"io"
 	"log"
 	"strings"
 	"sync"
 
 	"github.com/costinm/hbone/h2/hpack"
-	"github.com/costinm/hbone/nio"
+	"github.com/costinm/ugate/nio"
 	//"golang.org/x/net/http2/hpack"
 )
 
@@ -288,7 +289,14 @@ type Framer struct {
 
 	maxWriteSize uint32 // zero means unlimited; TODO: implement
 
-	w    io.Writer
+	w io.Writer
+
+	// wmu is held while writing.
+	// Acquire BEFORE mu when holding both, to avoid blocking mu on network writes.
+	// Only acquire both at the same time when changing peer settings.
+	wmu sync.Mutex
+
+	// wbuf is used to serialize frame when needed.
 	wbuf []byte
 
 	// AllowIllegalWrites permits the Framer's Write methods to
@@ -329,6 +337,8 @@ type Framer struct {
 	debugFramerBuf    *bytes.Buffer
 	debugReadLoggerf  func(string, ...interface{})
 	debugWriteLoggerf func(string, ...interface{})
+
+	debugLog slog.Logger
 
 	frameCache *FrameCache // nil if frames aren't reused (default)
 }
@@ -606,7 +616,7 @@ func parseDataFrame(fc *FrameCache, fh FrameHeader, countError func(string), pay
 		// connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
 		countError("frame_data_stream_0")
-		return nil, connError{ErrCodeProtocol, "DATA frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "DATA frame with stream muxID 0"}
 	}
 	f := fc.getDataFrame()
 	f.FrameHeader = fh
@@ -633,8 +643,8 @@ func parseDataFrame(fc *FrameCache, fh FrameHeader, countError func(string), pay
 }
 
 var (
-	errStreamID    = errors.New("invalid stream ID")
-	errDepStreamID = errors.New("invalid dependent stream ID")
+	errStreamID    = errors.New("invalid stream muxID")
+	errDepStreamID = errors.New("invalid dependent stream muxID")
 	errPadLength   = errors.New("pad length too large")
 	errPadBytes    = errors.New("padding bytes must all be zeros unless AllowIllegalWrites is enabled")
 )
@@ -666,6 +676,9 @@ func (f *Framer) WriteData(streamID uint32, endStream bool, data []byte) error {
 // It is the caller's responsibility not to violate the maximum frame size
 // and to not call other Write methods concurrently.
 func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []byte) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	if !validStreamID(streamID) && !f.AllowIllegalWrites {
 		return errStreamID
 	}
@@ -702,6 +715,9 @@ func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []by
 // WriteDataNC will write a data frame without making a copy.
 // The data is expected to have space in the front for the header.
 func (f *Framer) WriteDataNC(streamID uint32, endStream bool, data []byte, start, end int) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	var flags Flags
 	if endStream {
 		flags |= FlagDataEndStream
@@ -863,6 +879,9 @@ func (f *SettingsFrame) ForeachSetting(fn func(Setting) error) error {
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WriteSettings(settings ...Setting) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	f.startWrite(FrameSettings, 0, 0)
 	for _, s := range settings {
 		f.writeUint16(uint16(s.ID))
@@ -876,6 +895,9 @@ func (f *Framer) WriteSettings(settings ...Setting) error {
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WriteSettingsAck() error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	f.startWrite(FrameSettings, FlagSettingsAck, 0)
 	return f.endWrite()
 }
@@ -906,6 +928,9 @@ func parsePingFrame(_ *FrameCache, fh FrameHeader, countError func(string), payl
 }
 
 func (f *Framer) WritePing(ack bool, data [8]byte) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	var flags Flags
 	if ack {
 		flags = FlagPingAck
@@ -951,6 +976,9 @@ func parseGoAwayFrame(_ *FrameCache, fh FrameHeader, countError func(string), p 
 }
 
 func (f *Framer) WriteGoAway(maxStreamID uint32, code ErrCode, debugData []byte) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	f.startWrite(FrameGoAway, 0, 0)
 	f.writeUint32(maxStreamID & (1<<31 - 1))
 	f.writeUint32(uint32(code))
@@ -1014,9 +1042,12 @@ func parseWindowUpdateFrame(_ *FrameCache, fh FrameHeader, countError func(strin
 
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.
 // The increment value must be between 1 and 2,147,483,647, inclusive.
-// If the Stream ID is zero, the window update applies to the
+// If the Stream muxID is zero, the window update applies to the
 // connection as a whole.
 func (f *Framer) WriteWindowUpdate(streamID, incr uint32) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	// "The legal range for the increment to the flow control window is 1 to 2^31-1 (2,147,483,647) octets."
 	if (incr < 1 || incr > 2147483647) && !f.AllowIllegalWrites {
 		return errors.New("illegal window increment value")
@@ -1064,7 +1095,7 @@ func parseHeadersFrame(_ *FrameCache, fh FrameHeader, countError func(string), p
 		// respond with a connection error (Section 5.4.1) of type
 		// PROTOCOL_ERROR.
 		countError("frame_headers_zero_stream")
-		return nil, connError{ErrCodeProtocol, "HEADERS frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "HEADERS frame with stream muxID 0"}
 	}
 	var padLength uint8
 	if fh.Flags.Has(FlagHeadersPadded) {
@@ -1098,7 +1129,7 @@ func parseHeadersFrame(_ *FrameCache, fh FrameHeader, countError func(string), p
 
 // HeadersFrameParam are the parameters for writing a HEADERS frame.
 type HeadersFrameParam struct {
-	// StreamID is the required Stream ID to initiate.
+	// StreamID is the required Stream muxID to initiate.
 	StreamID uint32
 	// BlockFragment is part (or all) of a Header Block.
 	BlockFragment []byte
@@ -1132,6 +1163,9 @@ type HeadersFrameParam struct {
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WriteHeaders(p HeadersFrameParam) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	if !validStreamID(p.StreamID) && !f.AllowIllegalWrites {
 		return errStreamID
 	}
@@ -1199,7 +1233,7 @@ func (p PriorityParam) IsZero() bool {
 func parsePriorityFrame(_ *FrameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		countError("frame_priority_zero_stream")
-		return nil, connError{ErrCodeProtocol, "PRIORITY frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "PRIORITY frame with stream muxID 0"}
 	}
 	if len(payload) != 5 {
 		countError("frame_priority_bad_length")
@@ -1222,6 +1256,9 @@ func parsePriorityFrame(_ *FrameCache, fh FrameHeader, countError func(string), 
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WritePriority(streamID uint32, p PriorityParam) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	if !validStreamID(streamID) && !f.AllowIllegalWrites {
 		return errStreamID
 	}
@@ -1262,6 +1299,9 @@ func parseRSTStreamFrame(_ *FrameCache, fh FrameHeader, countError func(string),
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WriteRSTStream(streamID uint32, code ErrCode) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	if !validStreamID(streamID) && !f.AllowIllegalWrites {
 		return errStreamID
 	}
@@ -1280,7 +1320,7 @@ type ContinuationFrame struct {
 func parseContinuationFrame(_ *FrameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
 	if fh.StreamID == 0 {
 		countError("frame_continuation_zero_stream")
-		return nil, connError{ErrCodeProtocol, "CONTINUATION frame with stream ID 0"}
+		return nil, connError{ErrCodeProtocol, "CONTINUATION frame with stream muxID 0"}
 	}
 	return &ContinuationFrame{fh, p}, nil
 }
@@ -1299,6 +1339,9 @@ func (f *ContinuationFrame) HeadersEnded() bool {
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WriteContinuation(streamID uint32, endHeaders bool, headerBlockFragment []byte) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	if !validStreamID(streamID) && !f.AllowIllegalWrites {
 		return errStreamID
 	}
@@ -1370,10 +1413,10 @@ func parsePushPromise(_ *FrameCache, fh FrameHeader, countError func(string), p 
 
 // PushPromiseParam are the parameters for writing a PUSH_PROMISE frame.
 type PushPromiseParam struct {
-	// StreamID is the required Stream ID to initiate.
+	// StreamID is the required Stream muxID to initiate.
 	StreamID uint32
 
-	// PromiseID is the required Stream ID which this
+	// PromiseID is the required Stream muxID which this
 	// Push Promises
 	PromiseID uint32
 
@@ -1398,6 +1441,9 @@ type PushPromiseParam struct {
 // It will perform exactly one Write to the underlying Writer.
 // It is the caller's responsibility to not call other Write methods concurrently.
 func (f *Framer) WritePushPromise(p PushPromiseParam) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	if !validStreamID(p.StreamID) && !f.AllowIllegalWrites {
 		return errStreamID
 	}
@@ -1424,6 +1470,9 @@ func (f *Framer) WritePushPromise(p PushPromiseParam) error {
 // WriteRawFrame writes a raw frame. This can be used to write
 // extension frames unknown to this package.
 func (f *Framer) WriteRawFrame(t FrameType, flags Flags, streamID uint32, payload []byte) error {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+
 	f.startWrite(t, flags, streamID)
 	f.writeBytes(payload)
 	return f.endWrite()

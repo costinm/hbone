@@ -6,7 +6,7 @@ import (
 	"net/http"
 
 	http2 "github.com/costinm/hbone/h2/frame"
-	"github.com/costinm/hbone/nio"
+	"github.com/costinm/ugate/nio"
 )
 
 func (t *H2Transport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -26,7 +26,7 @@ func (t *H2Transport) RoundTrip(request *http.Request) (*http.Response, error) {
 func (t *H2Transport) Dial(request *http.Request) (*http.Response, error) {
 	s := NewStreamReq(request)
 	s.SetTransport(t, true)
-	_, err := t.DialStream(s)
+	err := t.DialStream(s)
 
 	if err != nil {
 		return nil, err
@@ -78,9 +78,9 @@ func NewStreamReq(req *http.Request) *H2Stream {
 }
 
 // dial associates a H2Stream with a mux and sends the request.
-// Will send headers, but not wait for headers.
-func (t *H2Transport) DialStream(s *H2Stream) (*http.Response, error) {
-	s.ct = t
+// Will send headers, but not wait for res headers.
+func (t *H2Transport) DialStream(s *H2Stream) error {
+	s.transport = t
 	s.done = make(chan struct{})
 	s.writeDoneChan = make(chan *dataFrame)
 	s.headerChan = make(chan struct{})
@@ -90,29 +90,31 @@ func (t *H2Transport) DialStream(s *H2Stream) (*http.Response, error) {
 	// The client side stream context should have exactly the same life cycle with the user provided context.
 	// That means, s.ctx should be readBlocking-only. And s.ctx is done iff ctx is done.
 	// So we use the original context here instead of creating a copy.
-	s.inFrameList = nio.NewRecvBuffer(
-		s.ctx.Done(), t.bufferPool.put, func(err error) {
-			t.closeStream(s, err, true, http2.ErrCodeCancel)
-		})
+	if s.OnData == nil {
+		s.inFrameList = nio.NewRecvBuffer(
+			s.ctx.Done(), t.bufferPool.put, func(err error) {
+				t.closeStream(s, err, true, http2.ErrCodeCancel)
+			})
+	}
 
 	t.streamEvent(EventStreamRequestStart, s)
-	headerFields, err := t.createHeaderFields(s.ctx, s.Request)
+
+	headerFields, err := t.CreateHeader(s.ctx, s.Request)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	err = t.writeRequestHeaders(s, headerFields)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	s.updateHeaderSent()
 
 	t.streamEvent(EventStreamStart, s)
-	// TODO: special header or method to indicate the Body of Request supports optimized
-	// copy ( no io.Pipe !!)
+
 	if s.Request.Body != nil {
 		go func() {
 			s1 := &nio.ReaderCopier{
-				ID:  fmt.Sprintf("req-body-%d", s.Id),
+				ID:  fmt.Sprintf("req-body-%d", s.MuxID),
 				Out: s,
 				In:  s.Request.Body,
 			}
@@ -125,5 +127,5 @@ func (t *H2Transport) DialStream(s *H2Stream) (*http.Response, error) {
 		}()
 	}
 
-	return s.Response, nil
+	return nil
 }

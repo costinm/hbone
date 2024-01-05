@@ -1,6 +1,6 @@
 package h2
 
-import "github.com/costinm/hbone/nio"
+import "github.com/costinm/ugate/nio"
 
 type EventType int
 
@@ -82,22 +82,22 @@ func (e *Events) GetHandler(t EventType) EventHandler {
 	return eh
 }
 
-func (s *H2Stream) StreamDataEvent(t EventType) {
-	eh := s.GetHandler(t)
-	if eh == nil {
-		return
-	}
+//func (s *H2Stream) StreamDataEvent(t EventType) {
+//	eh := s.GetHandler(t)
+//	if eh == nil {
+//		return
+//	}
+//
+//	eh.HandleEvent(t, nil, s, nil)
+//}
 
-	eh.HandleEvent(t, nil, s, nil)
-}
-
-func (s *H2Stream) StreamEvent(t EventType) {
-	eh := s.GetHandler(t)
-	if eh == nil {
-		return
-	}
-	eh.HandleEvent(t, nil, s, nil)
-}
+//func (s *H2Stream) StreamEvent(t EventType) {
+//	eh := s.GetHandler(t)
+//	if eh == nil {
+//		return
+//	}
+//	eh.HandleEvent(t, nil, s, nil)
+//}
 
 func (s *Events) OnEvent(t EventType, eh EventHandler) {
 	if t > EventLAST {

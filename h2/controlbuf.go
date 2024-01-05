@@ -276,7 +276,7 @@ func (l *outStreamList) dequeue() *outStream {
 // controlBuffer is a way to pass information to loopy.
 // Information is passed as specific struct types called control frames.
 // A control frame not only represents data, messages or headers to be sent out
-// but can also be used to instruct loopy to update its internal state.
+// but can also be used to instruct loopy to update its internal streamDone.
 // It shouldn't be confused with an HTTP2 frame, although some of the control frames
 // like dataFrame and headerFrame do go out on wire as HTTP2 frames.
 type controlBuffer struct {
@@ -457,9 +457,11 @@ const (
 // processing a stream, loopy writes out data bytes from this stream capped by the min
 // of http2MaxFrameLen, connection-level flow control and stream-level flow control.
 type loopyWriter struct {
-	mux       *H2Transport
-	side      side
-	cbuf      *controlBuffer
+	mux  *H2Transport
+	side side
+
+	cbuf *controlBuffer
+
 	sendQuota uint32
 	oiws      uint32 // outbound initial window size.
 	// estdStreams is map of all established streams that are not cleaned-up yet.
@@ -506,7 +508,7 @@ const minBatchSize = 1000
 
 // run should be run in a separate goroutine.
 // It reads control frames from controlBuf and processes them by:
-// 1. Updating loopy's internal state, or/and
+// 1. Updating loopy's internal streamDone, or/and
 // 2. Writing out HTTP2 frames on the wire.
 //
 // Loopy keeps all active streams with data to send in a linked-list.
@@ -541,6 +543,8 @@ func (l *loopyWriter) run() (err error) {
 		}
 		gosched := true
 	hasdata:
+		// Any other pending frames - want to write them all in one batch instead of multiple writes.
+		// TODO: is this optimization worth it ?
 		for {
 			it, err := l.cbuf.get(false)
 			if err != nil {
@@ -565,7 +569,7 @@ func (l *loopyWriter) run() (err error) {
 			}
 			if gosched {
 				gosched = false
-				if l.framer.writer.offset < minBatchSize {
+				if l.framer.writer.offset < minBatchSize { // 1000
 					runtime.Gosched()
 					continue hasdata
 				}
@@ -624,6 +628,7 @@ func (l *loopyWriter) registerStreamHandler(h *registerStream) error {
 // Write the Header
 func (l *loopyWriter) headerHandler(h *headerFrame) error {
 	if l.side == serverSide && h.streamID%2 == 1 {
+		// real server sending regular response on an established server stream.
 		str, ok := l.estdStreams[h.streamID]
 		if !ok {
 			log.Printf("transport: loopy doesn't recognize the stream: %d", h.streamID)
@@ -923,44 +928,44 @@ func (l *loopyWriter) processData() (bool, error) {
 		endStream = true
 	}
 
-	// Update keepalive timers.
+	// Record keepalive timers.
 	if dataItem.onEachWrite != nil {
 		dataItem.onEachWrite()
 	}
 
-	if dataItem.end != 0 {
-		if err := l.framer.fr.WriteDataNC(dataItem.streamID, endStream, dataItem.d,
-			dataItem.start, dataItem.start+size); err != nil {
-			return false, err
-		}
-		dataItem.start = dataItem.start + size
+	//if dataItem.end != 0 {
+	//	if err := l.framer.fr.WriteDataNC(dataItem.streamID, endStream, dataItem.d,
+	//		dataItem.start, dataItem.start+size); err != nil {
+	//		return false, err
+	//	}
+	//	dataItem.start = dataItem.start + size
+	//
+	//	str.bytesOutStanding += size
+	//	l.sendQuota -= uint32(size)
+	//
+	//	if dataItem.start >= dataItem.end { // All the data from that message was written out.
+	//		str.itl.dequeue()
+	//		if dataItem.onDoneFunc != nil {
+	//			dataItem.onDoneFunc(dataItem.d)
+	//		}
+	//	}
+	//} else {
+	// Blocking write style
+	if err := l.framer.fr.WriteData(dataItem.streamID, endStream, buf[:size]); err != nil {
+		return false, err
+	}
+	dataItem.d = dataItem.d[dSize:]
 
-		str.bytesOutStanding += size
-		l.sendQuota -= uint32(size)
+	str.bytesOutStanding += size
+	l.sendQuota -= uint32(size)
 
-		if dataItem.start >= dataItem.end { // All the data from that message was written out.
-			str.itl.dequeue()
-			if dataItem.onDoneFunc != nil {
-				dataItem.onDoneFunc(dataItem.d)
-			}
-		}
-	} else {
-		// Blocking write style
-		if err := l.framer.fr.WriteData(dataItem.streamID, endStream, buf[:size]); err != nil {
-			return false, err
-		}
-		dataItem.d = dataItem.d[dSize:]
-
-		str.bytesOutStanding += size
-		l.sendQuota -= uint32(size)
-
-		if len(dataItem.d) == 0 { // All the data from that message was written out.
-			str.itl.dequeue()
-			if dataItem.onDone != nil {
-				dataItem.onDone <- dataItem
-			}
+	if len(dataItem.d) == 0 { // All the data from that message was written out.
+		str.itl.dequeue()
+		if dataItem.onDone != nil {
+			dataItem.onDone <- dataItem
 		}
 	}
+	//	}
 
 	if str.itl.isEmpty() {
 		str.state = empty

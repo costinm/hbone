@@ -24,6 +24,7 @@ package h2
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -36,7 +37,7 @@ import (
 	"time"
 
 	"github.com/costinm/hbone/h2/frame"
-	"github.com/costinm/hbone/nio"
+	"github.com/costinm/ugate/nio"
 )
 
 type dataFramePool struct {
@@ -61,42 +62,30 @@ func (p *dataFramePool) put(b *bytes.Buffer) {
 	p.pool.Put(b)
 }
 
-type streamState uint32
-
-const (
-	streamActive streamState = iota
-	streamDone               // the entire stream is finished.
-)
-
 // H2Stream represents an H2 stream.
 //
-// H2Strem implements the net.Conn, context.Context interfaces
+// H2Stream implements the net.Conn, context.Context interfaces
 // It exposes read and write quota and other low-level H2 concepts.
 type H2Stream struct {
-	// Stream ID - odd for streams initiated from server (push and reverse)
-	Id uint32
+	nio.StreamState
 
-	st *H2Transport // nil for client side H2Stream
-	ct *H2Transport // nil for server side H2Stream
+	// connection and mux used by the stream.
+	transport *H2Transport
 
 	// the associated context of the stream
 	// All blocking methods should check for ctxDone
 	ctx     context.Context
 	ctxDone <-chan struct{} // same as done chan but for server side. Cache of ctx.Done() (for performance)
 	cancel  context.CancelFunc
-
-	// If set, all data frames will be sent to this method and bypass the reader queue.
-	// User is required to call s.Transport().UpdateWindow(s, uint32(n)) explicitly to receive
-	// more data.
-	OnData func(*frame.DataFrame)
-
 	// H2Stream implements the Context interface. Closed at the end.
 	// transport.closeStream closes this.
 	done chan struct{} // closed at the end of stream to unblock.
 
-	Events
-
-	// List of DATA frame bufferss received, channel to waitOrConsumeQuota more (blocking)
+	// If set, all data frames will be sent to this method and bypass the reader queue.
+	// User is required to call s.Transport().UpdateWindow(s, uint32(n)) explicitly to receive
+	// more data. This may happen later, when space is available.
+	OnData func(*frame.DataFrame)
+	// List of DATA frame bufferss received
 	inFrameList *nio.RecvBufferReader
 
 	inFlow  *inFlow
@@ -104,9 +93,20 @@ type H2Stream struct {
 
 	writeDoneChan       chan *dataFrame
 	writeDoneChanClosed uint32
+	writeDeadline       time.Time
 
 	headerChan       chan struct{} // closed to indicate the end of header metadata.
 	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
+
+	// On the server-side, headerSent is atomically set to 1 when the headers are sent out.
+	headerSent uint32
+	streamDone uint32
+	// Set when FIN or RST received. No frame should be received after.
+	// Also set after a trailer header
+	readClosed uint32
+	// Set when FIN or RST were sent. No frame should be written after.
+	// Also set after sending a trailer.
+	writeClosed uint32
 
 	// hdrMu protects header and trailer metadata on the server-side.
 	hdrMu sync.Mutex
@@ -118,35 +118,11 @@ type H2Stream struct {
 	// trReader.Err contains any read error - including io.EOF, which indicates successful read close.
 	Error error
 
-	noHeaders bool // set if the client never received headers (set only after the stream is done).
-
-	// On the server-side, headerSent is atomically set to 1 when the headers are sent out.
-	headerSent uint32
-
-	// Old state - doesn't work if readBlocking/write can be closed independently.
-	state streamState
-
-	// A stream may still be in used when readBlocking and write are closed - client or server may process
-	// headers.
-
-	// Set when FIN or RST received. No frame should be received after.
-	// Also set after a trailer header
-	readClosed uint32
-
-	// Set when FIN or RST were sent. No frame should be written after.
-	// Also set after sending a trailer.
-	writeClosed uint32
-
-	bytesReceived uint32 // indicates whether any bytes have been received on this stream
-	unprocessed   uint32 // set if the server sends a refused stream or GOAWAY including this stream
-
-	writeDeadline time.Time
+	unprocessed uint32 // set if the server sends a refused stream or GOAWAY including this stream
 
 	// grpc is set if the stream is working in grpc mode, based on content type.
 	// Close will use trailer instead of end data, ordering of headers.
 	grpc bool
-
-	nio.Stats
 
 	// Values exposed as part of Context interface.
 	userValues map[string]interface{}
@@ -169,6 +145,26 @@ func (s *H2Stream) Header() http.Header {
 	return s.Response.Header
 }
 
+func (s *H2Stream) RequestHeader() http.Header {
+	return s.Request.Header
+}
+
+func (s *H2Stream) TransportConn() net.Conn {
+	return s.Transport().Conn()
+}
+
+func (s *H2Stream) TLSConnectionState() *tls.ConnectionState {
+	if tc, ok := s.TransportConn().(*tls.Conn); ok {
+		cs := tc.ConnectionState()
+		return &cs
+	}
+	return nil
+}
+
+func (s *H2Stream) State() *nio.StreamState {
+	return &s.StreamState
+}
+
 // WriteHeader implements the ResponseWriter interface. Used to send a
 // response back to the initiator.
 func (s *H2Stream) WriteHeader(statusCode int) {
@@ -184,10 +180,6 @@ func (s *H2Stream) WriteHeader(statusCode int) {
 			return
 		}
 	}
-}
-
-func (s *H2Stream) RequestHeader() http.Header {
-	return s.Request.Header
 }
 
 // Send the request headers.
@@ -221,12 +213,12 @@ func (s *H2Stream) CloseWrite() error {
 	// TODO: use this only if trailer are present
 	if len(s.Response.Trailer) > 0 {
 		if nio.Debug {
-			log.Println("Server sends CloseWrite() with trailer", s.Id)
+			log.Println("Server sends CloseWrite() with trailer", s.MuxID)
 		}
 		return s.Transport().writeTrailer(s)
 	} else {
 		if nio.Debug {
-			log.Println("Server sends CloseWrite()", s.Id)
+			log.Println("Server sends CloseWrite()", s.MuxID)
 		}
 		return s.Transport().Write(s, nil, nil, true)
 	}
@@ -268,8 +260,6 @@ func (s *H2Stream) Close() error {
 	// Send a END_STREAM (if not already sent)
 
 	// TODO: if write buffers are not empty, still send RST, empty write buf and unblock.
-	log.Println("Stream Close()", s.Id)
-
 	s.Transport().closeStream(s, nil, false, frame.ErrCode(0))
 
 	if s.readClosed == 0 {
@@ -297,10 +287,7 @@ func (s *H2Stream) Conn() net.Conn {
 }
 
 func (hc *H2Stream) Transport() *H2Transport {
-	if hc.ct != nil {
-		return hc.ct
-	}
-	return hc.st
+	return hc.transport
 }
 
 func (s *H2Stream) Write(d []byte) (int, error) {
@@ -321,16 +308,11 @@ func (s *H2Stream) updateHeaderSent() bool {
 	return atomic.SwapUint32(&s.headerSent, 1) == 1
 }
 
-func (s *H2Stream) swapState(st streamState) streamState {
-	return streamState(atomic.SwapUint32((*uint32)(&s.state), uint32(st)))
-}
-
 // setReadClosed marks the readBlocking part of the stream as closed.
 // It will not unblock readBlocking - you need to queue a frame to do so.
 func (s *H2Stream) setReadClosed(mode uint32, err error) {
 	old := atomic.SwapUint32(&s.readClosed, mode)
 	if old != 0 {
-		log.Println("setReadClose: Double close", s.Error, s.inFrameList.Err)
 		return
 	}
 	//if s.trReader.Err == nil {
@@ -349,10 +331,6 @@ func (s *H2Stream) getWriteClosed() uint32 {
 
 func (s *H2Stream) getReadClosed() uint32 {
 	return atomic.LoadUint32((*uint32)(&s.readClosed))
-}
-
-func (s *H2Stream) getState() streamState {
-	return streamState(atomic.LoadUint32((*uint32)(&s.state)))
 }
 
 func (s *H2Stream) WaitHeaders() {
@@ -380,7 +358,9 @@ func (s *H2Stream) Context() context.Context {
 
 // Called when data frames are received (with a COPY of the data !!)
 func (s *H2Stream) queueReadBuf(m nio.RecvMsg) {
-	s.inFrameList.Put(m)
+	if s.inFrameList != nil {
+		s.inFrameList.Put(m)
+	}
 }
 
 func (s *H2Stream) LocalAddr() net.Addr {
@@ -395,6 +375,9 @@ func (s *H2Stream) SetDeadline(t time.Time) error {
 	return nil
 }
 func (s *H2Stream) SetReadDeadline(t time.Time) error {
+	if s.inFrameList == nil {
+		return nil // callback, not blocking read.
+	}
 	s.inFrameList.ReadDeadline = t
 	return nil
 }
@@ -412,6 +395,9 @@ func (s *H2Stream) RecycleDataFrame(bb *bytes.Buffer) {
 // The buffer should be recycled when done, or written to a different stream.
 // Post write the buffers are recycled automatically.
 func (s *H2Stream) RecvRaw() (bb *bytes.Buffer, err error) {
+	if s.inFrameList == nil {
+		return nil, errors.New("Callback based read")
+	}
 	bb, err = s.inFrameList.Recv()
 	if bb != nil {
 		s.Transport().UpdateWindow(s, uint32(bb.Len()))
@@ -421,6 +407,9 @@ func (s *H2Stream) RecvRaw() (bb *bytes.Buffer, err error) {
 
 // Read reads all p bytes from the wire for this stream.
 func (s *H2Stream) Read(p []byte) (n int, err error) {
+	if s.inFrameList == nil {
+		return 0, errors.New("Callback based read")
+	}
 	n, err = s.inFrameList.Read(p)
 	if n > 0 {
 		s.Transport().UpdateWindow(s, uint32(n))
@@ -429,13 +418,11 @@ func (s *H2Stream) Read(p []byte) (n int, err error) {
 }
 
 func (s *H2Stream) readOnly(p []byte) (n int, err error) {
+	if s.inFrameList == nil {
+		return 0, errors.New("Callback based read")
+	}
 	n, err = s.inFrameList.Read(p)
 	return
-}
-
-// BytesReceived indicates whether any bytes have been received on this stream.
-func (s *H2Stream) BytesReceived() bool {
-	return atomic.LoadUint32(&s.bytesReceived) == 1
 }
 
 // GoString is implemented by H2Stream so context.String() won't
@@ -478,7 +465,7 @@ func (ctx *H2Stream) Err() error {
 		if ctx.Error != nil {
 			return ctx.Error
 		}
-		if ctx.inFrameList.Err != io.EOF {
+		if ctx.inFrameList != nil && ctx.inFrameList.Err != io.EOF {
 			return ctx.inFrameList.Err
 		}
 		return nil
@@ -761,14 +748,14 @@ const (
 
 	// InvalidArgument indicates client specified an invalid argument.
 	// Note that this differs from FailedPrecondition. It indicates arguments
-	// that are problematic regardless of the state of the system
+	// that are problematic regardless of the streamDone of the system
 	// (e.g., a malformed file name).
 	//
 	// This error code will not be generated by the gRPC framework.
 	InvalidArgument Code = 3
 
 	// DeadlineExceeded means operation expired before completion.
-	// For operations that change the state of the system, this error may be
+	// For operations that change the streamDone of the system, this error may be
 	// returned even if the operation has completed successfully. For
 	// example, a successful response from a server could have been delayed
 	// long enough for the deadline to expire.
@@ -809,7 +796,7 @@ const (
 	ResourceExhausted Code = 8
 
 	// FailedPrecondition indicates operation was rejected because the
-	// system is not in a state required for the operation's execution.
+	// system is not in a streamDone required for the operation's execution.
 	// For example, directory to be deleted may be non-empty, an rmdir
 	// operation is applied to a non-directory, etc.
 	//
@@ -819,12 +806,12 @@ const (
 	//  (b) Use Aborted if the client should retry at a higher-level
 	//      (e.g., restarting a readBlocking-modify-write sequence).
 	//  (c) Use FailedPrecondition if the client should not retry until
-	//      the system state has been explicitly fixed. E.g., if an "rmdir"
+	//      the system streamDone has been explicitly fixed. E.g., if an "rmdir"
 	//      fails because the directory is non-empty, FailedPrecondition
 	//      should be returned since the client should not retry unless
 	//      they have first fixed up the directory by deleting files from it.
 	//  (d) Use FailedPrecondition if the client performs conditional
-	//      REST Get/Update/Delete on a resource and the resource on the
+	//      REST Get/Record/Delete on a resource and the resource on the
 	//      server does not match the condition. E.g., conflicting
 	//      readBlocking-modify-write on the same resource.
 	//
@@ -845,7 +832,7 @@ const (
 	// E.g., seeking or reading past end of file.
 	//
 	// Unlike InvalidArgument, this error indicates a problem that may
-	// be fixed if the system state changes. For example, a 32-bit file
+	// be fixed if the system streamDone changes. For example, a 32-bit file
 	// system will generate InvalidArgument if asked to readBlocking at an
 	// offset that is not in the range [0,2^32-1], but it will generate
 	// OutOfRange if asked to readBlocking from an offset past the current
@@ -909,7 +896,7 @@ const (
 //func (hc *Stream) Close() error {
 //	// TODO: send trailers if server !!!
 //	//hc.W.Close()
-//	if cw, ok := hc.Out.(io.Closer); ok {
+//	if cw, ok := hc.RequestInPipe.(io.Closer); ok {
 //		cw.Close()
 //	}
 //	if cw, ok := hc.In.(io.Closer); ok {
@@ -952,9 +939,5 @@ func (hc *H2Stream) Send(b *nio.Buffer) error {
 }
 
 func (s *H2Stream) SetTransport(tr *H2Transport, client bool) {
-	if client {
-		s.ct = tr
-	} else {
-		s.st = tr
-	}
+	s.transport = tr
 }

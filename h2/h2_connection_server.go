@@ -34,12 +34,12 @@ import (
 
 	"github.com/costinm/hbone/h2/frame"
 	"github.com/costinm/hbone/h2/hpack"
-	"github.com/costinm/hbone/nio"
+	"github.com/costinm/ugate/nio"
 )
 
 var (
 	// ErrIllegalHeaderWrite indicates that setting header is illegal because of
-	// the stream's state.
+	// the stream's streamDone.
 	ErrIllegalHeaderWrite = errors.New("transport: SendHeader called multiple times")
 	// ErrHeaderListSizeLimitViolation indicates that the header list size is larger
 	// than the limit set by peer.
@@ -282,8 +282,8 @@ func (t *H2Transport) operateAcceptHeaders(rfr *frame.MetaHeadersFrame) error {
 
 	hreq, _ := http.NewRequestWithContext(t.ctx, "POST", "https:///", nil)
 	s := &H2Stream{
-		Id:            streamID,
-		st:            t,
+		StreamState:   nio.StreamState{MuxID: streamID},
+		transport:     t,
 		writeDoneChan: make(chan *dataFrame),
 		inFlow:        &inFlow{limit: uint32(t.initialWindowSize)},
 		Request:       hreq,
@@ -353,14 +353,17 @@ func (t *H2Transport) operateAcceptHeaders(rfr *frame.MetaHeadersFrame) error {
 		})
 		return nil
 	}
-
-	if rfr.StreamEnded() {
-		s.setReadClosed(1, io.EOF)
-	}
 	if timeoutSet {
 		s.ctx, s.cancel = context.WithTimeout(t.ctx, timeout)
 	} else {
 		s.ctx, s.cancel = context.WithCancel(t.ctx)
+	}
+	s.ctxDone = s.ctx.Done()
+	s.outFlow = newWriteQuota(defaultWriteQuota, s.ctxDone)
+	s.inFrameList = nio.NewRecvBuffer(s.ctxDone, t.bufferPool.put, nil)
+
+	if rfr.StreamEnded() {
+		s.setReadClosed(1, io.EOF)
 	}
 	t.mu.Lock()
 	if t.closing {
@@ -392,12 +395,9 @@ func (t *H2Transport) operateAcceptHeaders(rfr *frame.MetaHeadersFrame) error {
 	} else {
 		s.ctx, s.cancel = context.WithCancel(context.Background())
 	}
-	s.ctxDone = s.ctx.Done()
-	s.outFlow = newWriteQuota(defaultWriteQuota, s.ctxDone)
-	s.inFrameList = nio.NewRecvBuffer(s.ctxDone, t.bufferPool.put, nil)
 	// Register the stream with loopy.
 	t.controlBuf.put(&registerStream{
-		streamID: s.Id,
+		streamID: s.MuxID,
 		wq:       s.outFlow,
 	})
 	if t.Handle != nil {
@@ -625,7 +625,7 @@ func (t *H2Transport) WriteHeader(s *H2Stream) error {
 		return ErrIllegalHeaderWrite
 	}
 
-	if s.getState() == streamDone {
+	if atomic.LoadUint32((*uint32)(&s.streamDone)) == 1 {
 		return t.streamContextErr(s)
 	}
 
@@ -653,7 +653,7 @@ func (t *H2Transport) writeResponseHeaders(s *H2Stream) error {
 	headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: status})
 	headerFields = appendHeaderFieldsFromMD(headerFields, s.Response.Header)
 	success, err := t.controlBuf.executeAndPut(t.checkForHeaderListSize, &headerFrame{
-		streamID:  s.Id,
+		streamID:  s.MuxID,
 		hf:        headerFields,
 		endStream: false,
 		onWrite:   t.setResetPingStrikes,
@@ -684,7 +684,7 @@ func (t *H2Transport) writeTrailer(s *H2Stream) error {
 	headerFields = appendHeaderFieldsFromMD(headerFields, s.Response.Trailer)
 
 	trailingHeader = &headerFrame{
-		streamID:  s.Id,
+		streamID:  s.MuxID,
 		hf:        headerFields,
 		endStream: true,
 		onWrite:   t.setResetPingStrikes,
@@ -704,7 +704,7 @@ func (t *H2Transport) writeTrailer(s *H2Stream) error {
 	// rst := s.getState() == streamActive
 
 	trailingHeader.cleanup = &cleanupStream{
-		streamID: s.Id,
+		streamID: s.MuxID,
 		rst:      false,
 	}
 	t.controlBuf.put(trailingHeader)
@@ -734,7 +734,7 @@ func (t *H2Transport) Send(s *H2Stream, b []byte, start, end int, last bool) err
 
 	data := b
 	df := &dataFrame{
-		streamID:    s.Id,
+		streamID:    s.MuxID,
 		endStream:   last,
 		end:         end,
 		start:       start,
@@ -743,9 +743,6 @@ func (t *H2Transport) Send(s *H2Stream, b []byte, start, end int, last bool) err
 	}
 	df.onDoneFunc = func(i []byte) {
 		nio.PutDataBufferChunk(b)
-		if last {
-			s.writeDoneChan <- df
-		}
 	}
 
 	if data != nil { // If it's not an empty data frame, check quota.
@@ -753,8 +750,7 @@ func (t *H2Transport) Send(s *H2Stream, b []byte, start, end int, last bool) err
 		if end != 0 {
 			dataLen = end - start
 		}
-		if err := s.outFlow.
-			waitOrConsumeQuota(int32(dataLen)); err != nil {
+		if err := s.outFlow.waitOrConsumeQuota(int32(dataLen)); err != nil {
 			return t.streamContextErr(s)
 		}
 	}
@@ -764,9 +760,6 @@ func (t *H2Transport) Send(s *H2Stream, b []byte, start, end int, last bool) err
 		return err
 	}
 
-	if last {
-		<-s.writeDoneChan
-	}
 	return s.Error
 }
 
@@ -789,7 +782,7 @@ func (t *H2Transport) Write(s *H2Stream, hdr []byte, data []byte, last bool) err
 	}
 
 	df := &dataFrame{
-		streamID:    s.Id,
+		streamID:    s.MuxID,
 		endStream:   last,
 		d:           data,
 		onEachWrite: t.setResetPingStrikes,
@@ -919,7 +912,7 @@ func (t *H2Transport) Close(err error) {
 		t.Error = err
 	}
 
-	// Call t.onClose before setting the state to closing to prevent the client
+	// Call t.onClose before setting the streamDone to closing to prevent the client
 	// from attempting to create new streams ASAP.
 	t.MuxEvent(Event_ConnClose)
 	streams := t.activeStreams
@@ -954,8 +947,8 @@ func (t *H2Transport) deleteStream(s *H2Stream) {
 	closeMux := false
 	if s.getWriteClosed() != 0 && s.getReadClosed() != 0 && t.activeStreams != nil {
 		t.mu.Lock()
-		if _, ok := t.activeStreams[s.Id]; ok {
-			delete(t.activeStreams, s.Id)
+		if _, ok := t.activeStreams[s.MuxID]; ok {
+			delete(t.activeStreams, s.MuxID)
 			if len(t.activeStreams) == 0 {
 				t.idle = time.Now()
 				closeMux = true

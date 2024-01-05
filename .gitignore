@@ -3,3 +3,10 @@ hboned/ca-certificates.crt
 hboned/certificates.pem
 hboned/__debug_bin
 oryxBuildBinary
+hboned/testdata/alice/ca-certificates.crt
+hboned/testdata/alice/certificates.pem
+hboned/testdata/alice/private_key.pem
+hboned/testdata/bob/ca-certificates.crt
+hboned/testdata/bob/certificates.pem
+hboned/testdata/bob/private_key.pem
+out/hbone
